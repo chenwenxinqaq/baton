@@ -1,0 +1,2737 @@
+#!/usr/bin/env python3
+"""Unified Memory & Skills Web Console: browse, create, and edit memories, manage skills, and control agents."""
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import date, datetime
+import errno
+import fcntl
+from hashlib import sha256
+from html import escape
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+from string import Template
+import sys
+from tempfile import NamedTemporaryFile
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+
+
+APP = Path(__file__).resolve().parent
+ROOT_DIR = APP.parent
+if str(ROOT_DIR / "mcp") not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR / "mcp"))
+if str(ROOT_DIR / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR / "scripts"))
+
+from library_paths import data_root
+import server as mcp_server  # noqa: E402
+
+LAYERS = {
+    "L0": ("操作约束", "feedback", "操作红线、只读范围与环境授权边界"),
+    "L1": ("可复用方法", "reference", "经实践验证的排障、评测、验证与交付方法"),
+    "L2": ("协作偏好", "feedback", "回答口径、评审顺序与个人协作习惯"),
+    "L3": ("项目状态", "project", "版本、部署、基线对齐与恢复入口快照"),
+    "L4": ("事故归档", "reference", "已定位根因的故障、修复措施与复验记录"),
+}
+LAYER_SHORT = {
+    "L0": "约束",
+    "L1": "方法",
+    "L2": "偏好",
+    "L3": "项目",
+    "L4": "归档",
+}
+SKILL_CATS = {
+    "infra": ("核心/基建", "L3", "记忆维护与技能管理"),
+    "general": ("通用辅助", "L2", "使用者安装的通用技能"),
+}
+ALLOWED_LAYER_TYPES = {
+    "L0": {"feedback", "reference"},
+    "L1": {"reference"},
+    "L2": {"feedback"},
+    "L3": {"project"},
+    "L4": {"reference"},
+}
+VALID_TOPIC_TYPES = {"user", "feedback", "project", "reference"}
+STATES = {"active": "生效中", "archived": "已归档"}
+SOURCES = {"all": "全部来源", "index": "现有记忆", "user": "用户管理"}
+ENTRY_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
+TOPIC_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+ASCII_TOKEN_RE = re.compile(r"[a-z0-9]+")
+INDEX_LAYER = re.compile(r"^## (L[0-4])(?:\s|$)")
+INDEX_LINK = re.compile(
+    r"^\s*[-*+]\s+\[(.+?)\]\((?:<([^>]+)>|([^\s()]+))\)(?:\s+[—–-]\s+(.+))?$"
+)
+INLINE_TOKEN_RE = re.compile(
+    r"(`[^`]+`)|(\*\*[^*]+\*\*)|(\[(.+?)\]\(([^)\s]+)\))"
+)
+ORDERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+(.+)$")
+UNORDERED_ITEM_RE = re.compile(r"^\s*[-*+]\s+(.+)$")
+TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+
+MAX_POST = 1_200_000
+MAX_TITLE_CHARS = 120
+MAX_DESC_CHARS = 800
+MAX_BODY_CHARS = 120_000
+CUR_ATTR = ' aria-current="page"'
+
+
+PAGE_TEMPLATE = Template((APP / "page.html").read_text(encoding="utf-8"))
+
+
+def load_template():
+    return PAGE_TEMPLATE
+
+
+def load_style():
+    return (APP / "style.css").read_bytes()
+
+
+def load_script():
+    return (APP / "app.js").read_bytes()
+
+
+class InvalidEntry(ValueError):
+    """An entry could not be saved or decoded."""
+
+
+class StaleEntry(Exception):
+    """The file was edited after this form opened."""
+
+
+@dataclass(frozen=True)
+class IndexedTopic:
+    title: str
+    description: str
+    layer: str
+    path: str
+    created_at: str = ""
+    updated_at: str = ""
+    created_epoch: float = 0.0
+    updated_epoch: float = 0.0
+
+
+@dataclass(frozen=True)
+class TopicEntry:
+    path: str = ""
+    slug: str = ""
+    meta_name: str = ""
+    title: str = ""
+    description: str = ""
+    file_description: str = ""
+    layer: str = "L1"
+    entry_type: str = "reference"
+    created_at: str = ""
+    updated_at: str = ""
+    body: str = ""
+    revision: str = ""
+
+
+@dataclass(frozen=True)
+class Entry:
+    name: str = ""
+    title: str = ""
+    description: str = ""
+    layer: str = "L2"
+    entry_type: str = ""
+    body: str = ""
+    status: str = "active"
+    created_at: str = ""
+    updated_at: str = ""
+    created_epoch: float = 0.0
+    updated_epoch: float = 0.0
+    revision: str = ""
+
+    def resolved_type(self):
+        allowed = ALLOWED_LAYER_TYPES.get(self.layer, {"feedback"})
+        if self.entry_type in allowed:
+            return self.entry_type
+        return LAYERS[self.layer][1]
+
+    def markdown(self):
+        metadata = {
+            "name": self.name,
+            "title": self.title,
+            "description": self.description,
+            "type": self.resolved_type(),
+            "layer": self.layer,
+            "status": self.status,
+            "created_at": self.created_at or self.updated_at,
+            "updated_at": self.updated_at,
+        }
+        fields = "\n".join(
+            f"{key}: {json.dumps(value, ensure_ascii=False)}"
+            for key, value in metadata.items()
+        )
+        return f"---\n{fields}\n---\n\n{self.body}\n"
+
+    @classmethod
+    def from_file(cls, name, raw):
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+        opening, boundary, body = text.removeprefix("---\n").partition("\n---\n")
+        if not text.startswith("---\n") or not boundary:
+            raise InvalidEntry("缺少条目头部。")
+        fields = {}
+        for line in opening.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator or key in fields:
+                raise InvalidEntry("条目头部格式无效。")
+            fields[key] = json.loads(value)
+        required = {"name", "title", "description", "type", "layer", "status", "updated_at"}
+        allowed_keys = required | {"created_at"}
+        if not (required <= fields.keys() <= allowed_keys) or any(not isinstance(v, str) for v in fields.values()):
+            raise InvalidEntry("条目头部字段不匹配。")
+        if fields["name"] != name or fields["layer"] not in LAYERS or fields["status"] not in STATES:
+            raise InvalidEntry("条目名称、层级或状态无效。")
+        entry_type = fields.pop("type")
+        if entry_type not in ALLOWED_LAYER_TYPES[fields["layer"]]:
+            raise InvalidEntry("条目类型与层级不匹配。")
+        upd_str = fields["updated_at"]
+        cre_str = fields.pop("created_at", "") or upd_str
+        upd_dt, _ = mcp_server.parse_timestamp(upd_str)
+        cre_dt, _ = mcp_server.parse_timestamp(cre_str)
+        if cre_dt > upd_dt:
+            cre_dt = upd_dt
+        return cls(
+            **fields,
+            created_at=cre_str,
+            created_epoch=cre_dt.timestamp(),
+            updated_epoch=upd_dt.timestamp(),
+            entry_type=entry_type,
+            body=body.removeprefix("\n").removesuffix("\n"),
+            revision=sha256(raw).hexdigest(),
+        )
+
+
+def parse_index_markdown(markdown):
+    """Parse L0-L4 indexed topics from MEMORY.md text."""
+    topics = {}
+    layer = ""
+    for line in markdown.splitlines():
+        if line.startswith("#"):
+            heading = INDEX_LAYER.match(line)
+            layer = heading[1] if heading else ""
+        match = INDEX_LINK.match(line) if layer else None
+        if not match:
+            continue
+        title, named_path, plain_path, description = match.groups()
+        try:
+            url = urlsplit(named_path or plain_path)
+        except ValueError:
+            continue
+        relative = Path(unquote(url.path))
+        if (
+            url.scheme
+            or url.netloc
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.parts[0] == "user-managed"
+            or relative.suffix.lower() != ".md"
+            or relative == Path("MEMORY.md")
+        ):
+            continue
+        path = relative.as_posix()
+        topics.setdefault(path, IndexedTopic(title.strip(), description or "", layer, path))
+    return topics
+
+
+class Library:
+    def __init__(self, root, label):
+        root = data_root(root).resolve(strict=True)
+        self.root = root
+        self.index = root / "MEMORY.md"
+        if root.name.casefold() in {"memories", "memories_v2"} or not self.index.is_file():
+            raise InvalidEntry("请选择包含 MEMORY.md 的手工记忆库目录。")
+        self.folder = root / "user-managed"
+        self.folder.mkdir(mode=0o700, exist_ok=True)
+        if self.folder.is_symlink() or not self.folder.is_dir():
+            raise InvalidEntry("用户管理目录必须是普通目录。")
+        self.lock_path = root / ".state" / "library.lock"
+        self.trash_dir = root / ".state" / "trash"
+        self.label = label
+
+    @contextmanager
+    def write_lock(self):
+        """Serialize concurrent writes with MCP servers."""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _backup_to_trash(self, src_path, slug_hint):
+        """Save a safety backup copy into .state/trash/ before deleting a memory."""
+        if not src_path.is_file():
+            return
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug_hint)[:80] or "entry"
+        dest = self.trash_dir / f"{stamp}-{safe_slug}-{secrets.token_hex(2)}.md"
+        shutil.copy2(src_path, dest)
+
+    def read_markdown(self, path, resource_roots=()):
+        resolved = path.resolve(strict=True)
+        allowed = resolved.is_relative_to(self.root) or any(resolved.is_relative_to(r) for r in resource_roots)
+        if not allowed or resolved.suffix.lower() != ".md" or not resolved.is_file():
+            raise InvalidEntry("只能读取当前库或技能目录中的 Markdown。")
+        with resolved.open(encoding="utf-8") as stream:
+            content = stream.read(MAX_POST + 1)
+        if len(content) > MAX_POST:
+            raise InvalidEntry("Markdown 超过可预览的大小。")
+        return content
+
+    def read_index(self):
+        markdown = self.read_markdown(self.index)
+        parsed = parse_index_markdown(markdown)
+        enriched = {}
+        for rel_path, t in parsed.items():
+            md_file = self.root / rel_path
+            if md_file.is_file():
+                try:
+                    raw = md_file.read_text(encoding="utf-8", errors="replace")
+                    meta, _ = mcp_server.parse_frontmatter(raw)
+                    cre_at, upd_at, cre_ep, upd_ep = mcp_server.file_timestamps(md_file, meta)
+                    enriched[rel_path] = replace(
+                        t,
+                        created_at=cre_at,
+                        updated_at=upd_at,
+                        created_epoch=cre_ep,
+                        updated_epoch=upd_ep,
+                    )
+                    continue
+                except OSError:
+                    pass
+            enriched[rel_path] = t
+        return markdown, enriched
+
+    def read_index_with_revision(self):
+        raw = self.index.read_bytes()
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+        return text, sha256(raw).hexdigest()
+
+    def save_index_markdown(self, new_markdown, expected_revision):
+        normalized = new_markdown.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized or len(normalized) > MAX_BODY_CHARS:
+            raise InvalidEntry("MEMORY.md 内容不能为空且须在长度上限内。")
+        found_layers = []
+        for line in normalized.splitlines():
+            m = INDEX_LAYER.match(line)
+            if m:
+                found_layers.append(m.group(1))
+        for req_layer in ("L0", "L1", "L2", "L3", "L4"):
+            if req_layer not in found_layers:
+                raise InvalidEntry(f"MEMORY.md 必须保留完整分层标题，缺少 ## {req_layer}。")
+        parsed_topics = parse_index_markdown(normalized)
+        for rel_path in parsed_topics:
+            candidate = (self.root / rel_path).resolve()
+            if not candidate.is_relative_to(self.root) or not candidate.is_file():
+                raise InvalidEntry(f"索引引用的文件不存在：{rel_path}")
+
+        with self.write_lock():
+            cur_rev = sha256(self.index.read_bytes()).hexdigest()
+            if cur_rev != expected_revision:
+                raise StaleEntry
+            mcp_server.atomic_write(self.index, normalized + "\n")
+
+    @staticmethod
+    def _topic_revision(raw_bytes, topic):
+        meta_sig = f"\n{topic.layer}\n{topic.title}\n{topic.description}".encode("utf-8")
+        return sha256(raw_bytes + meta_sig).hexdigest()
+
+    def read_topic(self, topic_path, topics=None):
+        if topics is None:
+            _, topics = self.read_index()
+        topic = topics.get(topic_path)
+        if topic is None:
+            raise InvalidEntry("条目不在索引中。")
+        detail_path = (self.root / topic.path).resolve(strict=True)
+        if not detail_path.is_relative_to(self.root) or not detail_path.is_file():
+            raise InvalidEntry("找不到对应的记忆 Markdown 文件。")
+        raw_bytes = detail_path.read_bytes()
+        if len(raw_bytes) > MAX_POST:
+            raise InvalidEntry("条目超过大小限制。")
+        detail = raw_bytes.decode("utf-8").replace("\r\n", "\n")
+        meta, body = mcp_server.parse_frontmatter(detail)
+        cre_at, upd_at, _, _ = mcp_server.file_timestamps(detail_path, meta)
+        stem = Path(topic.path).stem
+        return TopicEntry(
+            path=topic.path,
+            slug=stem,
+            meta_name=meta.get("name", stem),
+            title=topic.title,
+            description=topic.description,
+            file_description=meta.get("description", ""),
+            layer=topic.layer,
+            entry_type=meta.get("type", LAYERS[topic.layer][1]),
+            created_at=cre_at,
+            updated_at=upd_at,
+            body=body.rstrip("\n"),
+            revision=self._topic_revision(raw_bytes, topic),
+        )
+
+    def _generate_unique_slug(self, title, preferred_slug=""):
+        slug = preferred_slug.strip()
+        if slug:
+            if not TOPIC_SLUG_RE.fullmatch(slug) or slug.lower() == "readme":
+                raise InvalidEntry("文件标识仅支持英文字母、数字、点、下划线或连字符（且不能为 readme）。")
+            for folder in mcp_server.LAYER_DIRS.values():
+                if (self.root / folder / f"{slug}.md").exists():
+                    raise InvalidEntry(f"已存在同名文件 {folder}/{slug}.md，请更换文件标识或直接编辑原条目。")
+            return slug
+
+        tokens = ASCII_TOKEN_RE.findall(title.casefold())
+        prefix = "-".join(tokens)[:42].strip("-") if tokens else "mem"
+        if not prefix:
+            prefix = "mem"
+        stamp = date.today().strftime("%Y%m%d")
+        candidate = f"{prefix}-{stamp}"
+        while any((self.root / folder / f"{candidate}.md").exists() for folder in mcp_server.LAYER_DIRS.values()):
+            candidate = f"{prefix}-{stamp}-{secrets.token_hex(2)}"
+        return candidate
+
+    def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type=""):
+        validate_common_fields(layer, title, description, body)
+        ts_now = mcp_server.now_iso()
+        with self.write_lock():
+            store = mcp_server.MemoryStore(self.root)
+            _, current_topics = self.read_index()
+
+            if orig_path:
+                try:
+                    cur = self.read_topic(orig_path, current_topics)
+                except (FileNotFoundError, InvalidEntry) as exc:
+                    raise StaleEntry from exc
+                if cur.revision != expected_revision:
+                    raise StaleEntry
+
+                stem = cur.slug
+                new_folder = mcp_server.LAYER_DIRS[layer]
+                new_rel = f"{new_folder}/{stem}.md"
+                new_file = self.root / new_rel
+                if new_rel != orig_path and new_file.exists():
+                    raise InvalidEntry(f"目标层级目录已存在同名文件：{new_rel}")
+
+                fm_name = cur.meta_name or stem
+                if description.strip() == cur.description.strip() and cur.file_description:
+                    fm_desc = cur.file_description
+                else:
+                    fm_desc = description.strip() or title
+
+                if entry_type in VALID_TOPIC_TYPES:
+                    fm_type = entry_type
+                elif layer == cur.layer and cur.entry_type in VALID_TOPIC_TYPES:
+                    fm_type = cur.entry_type
+                else:
+                    fm_type = LAYERS[layer][1]
+
+                cre_at = cur.created_at or ts_now
+                name_serialized = (
+                    fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
+                )
+                desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
+                content = (
+                    f"---\n"
+                    f"name: {name_serialized}\n"
+                    f"description: {desc_serialized}\n"
+                    f"type: {fm_type}\n"
+                    f"created_at: {json.dumps(cre_at)}\n"
+                    f"updated_at: {json.dumps(ts_now)}\n"
+                    f"---\n\n"
+                    f"{body.strip()}\n"
+                )
+                prev_bytes = new_file.read_bytes() if new_file.is_file() else None
+                prev_index_text = self.index.read_text(encoding="utf-8")
+                mcp_server.atomic_write(new_file, content)
+                idx_desc = description.strip() or title
+                try:
+                    if new_rel != orig_path:
+                        store._remove_index_line(orig_path)
+                    store._upsert_index_line(layer, title, new_rel, idx_desc)
+                except Exception:
+                    if prev_bytes is None:
+                        new_file.unlink(missing_ok=True)
+                    else:
+                        mcp_server.atomic_write(new_file, prev_bytes.decode("utf-8"))
+                    try:
+                        mcp_server.atomic_write(self.index, prev_index_text)
+                    except OSError:
+                        pass
+                    raise
+                if new_rel != orig_path:
+                    (self.root / orig_path).unlink(missing_ok=True)
+                return new_rel
+
+            final_slug = self._generate_unique_slug(title, slug)
+            new_folder = mcp_server.LAYER_DIRS[layer]
+            new_rel = f"{new_folder}/{final_slug}.md"
+            new_file = self.root / new_rel
+            fm_type = entry_type if entry_type in VALID_TOPIC_TYPES else LAYERS[layer][1]
+            idx_desc = description.strip() or title
+            desc_serialized = json.dumps(idx_desc, ensure_ascii=False)
+            content = (
+                f"---\n"
+                f"name: {final_slug}\n"
+                f"description: {desc_serialized}\n"
+                f"type: {fm_type}\n"
+                f"created_at: {json.dumps(ts_now)}\n"
+                f"updated_at: {json.dumps(ts_now)}\n"
+                f"---\n\n"
+                f"{body.strip()}\n"
+            )
+            mcp_server.atomic_write(new_file, content)
+            try:
+                store._upsert_index_line(layer, title, new_rel, idx_desc)
+            except Exception:
+                new_file.unlink(missing_ok=True)
+                raise
+            return new_rel
+
+    def archive_topic(self, topic_path, expected_revision):
+        ts_now = mcp_server.now_iso()
+        with self.write_lock():
+            store = mcp_server.MemoryStore(self.root)
+            _, current_topics = self.read_index()
+            try:
+                cur = self.read_topic(topic_path, current_topics)
+            except (FileNotFoundError, InvalidEntry) as exc:
+                raise StaleEntry from exc
+            if cur.revision != expected_revision:
+                raise StaleEntry
+            if cur.layer == "L4":
+                return cur.path
+
+            new_rel = f"archive/{cur.slug}.md"
+            dest = self.root / new_rel
+            if dest.exists():
+                raise InvalidEntry(f"归档目录已存在同名文件：{new_rel}")
+
+            cre_at = cur.created_at or ts_now
+            fm_name = cur.meta_name or cur.slug
+            name_serialized = (
+                fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
+            )
+            fm_desc = cur.file_description or cur.description or cur.title
+            desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
+            fm_type = cur.entry_type if cur.entry_type in VALID_TOPIC_TYPES else "reference"
+            content = (
+                f"---\n"
+                f"name: {name_serialized}\n"
+                f"description: {desc_serialized}\n"
+                f"type: {fm_type}\n"
+                f"created_at: {json.dumps(cre_at)}\n"
+                f"updated_at: {json.dumps(ts_now)}\n"
+                f"---\n\n"
+                f"{cur.body.strip()}\n"
+            )
+            mcp_server.atomic_write(dest, content)
+            try:
+                store._remove_index_line(topic_path)
+                store._upsert_index_line("L4", cur.title, new_rel, cur.description or fm_desc)
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise
+            (self.root / topic_path).unlink(missing_ok=True)
+            return new_rel
+
+    def delete_topic(self, topic_path, expected_revision):
+        with self.write_lock():
+            store = mcp_server.MemoryStore(self.root)
+            _, current_topics = self.read_index()
+            try:
+                cur = self.read_topic(topic_path, current_topics)
+            except (FileNotFoundError, InvalidEntry) as exc:
+                raise StaleEntry from exc
+            if cur.revision != expected_revision:
+                raise StaleEntry
+            target = self.root / topic_path
+            self._backup_to_trash(target, cur.slug)
+            target.unlink()
+            store._remove_index_line(topic_path)
+
+    def path(self, name):
+        if not ENTRY_NAME.fullmatch(name) or name == "readme":
+            raise InvalidEntry("条目名称无效。")
+        return self.folder / f"{name}.md"
+
+    def read(self, name):
+        path = self.path(name)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise InvalidEntry("条目必须是普通 Markdown 文件。")
+            raw = stream.read(MAX_POST + 1)
+        if len(raw) > MAX_POST:
+            raise InvalidEntry("条目超过大小限制。")
+        return Entry.from_file(name, raw)
+
+    def list(self):
+        entries, unreadable = [], []
+        for path in sorted(self.folder.glob("*.md")):
+            if path.name == "README.md":
+                continue
+            try:
+                entries.append(self.read(path.stem))
+            except (ValueError, OSError):
+                unreadable.append(path.name)
+        entries.sort(key=lambda entry: (entry.updated_at, entry.title.casefold()), reverse=True)
+        return entries, unreadable
+
+    def save(self, entry):
+        path = self.path(entry.name)
+        with self.write_lock():
+            if entry.revision:
+                try:
+                    current = self.read(entry.name)
+                except (FileNotFoundError, ValueError) as exc:
+                    raise StaleEntry from exc
+                if entry.revision != current.revision:
+                    raise StaleEntry
+            staged = None
+            try:
+                with NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.folder, prefix=".memory-", delete=False
+                ) as stream:
+                    staged = Path(stream.name)
+                    stream.write(entry.markdown())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if entry.revision:
+                    staged.replace(path)
+                else:
+                    os.link(staged, path)
+            finally:
+                if staged is not None:
+                    staged.unlink(missing_ok=True)
+
+    def delete_user_entry(self, name, expected_revision):
+        path = self.path(name)
+        with self.write_lock():
+            try:
+                current = self.read(name)
+            except (FileNotFoundError, ValueError) as exc:
+                raise StaleEntry from exc
+            if current.revision != expected_revision:
+                raise StaleEntry
+            self._backup_to_trash(path, name)
+            path.unlink()
+
+
+def validate_common_fields(layer, title, description, body):
+    if layer not in LAYERS:
+        raise InvalidEntry("请选择 L0–L4 中的一层。")
+    if not title or len(title) > MAX_TITLE_CHARS or len(title.splitlines()) != 1:
+        raise InvalidEntry(f"标题须为单行且长度为 1–{MAX_TITLE_CHARS} 个字符。")
+    if "](" in title:
+        raise InvalidEntry("标题中不能包含 Markdown 链接分隔符 ']('。")
+    if len(description) > MAX_DESC_CHARS or len(description.splitlines()) > 1:
+        raise InvalidEntry(f"检索摘要须为单行且不超过 {MAX_DESC_CHARS} 个字符。")
+    if not body.strip() or len(body) > MAX_BODY_CHARS:
+        raise InvalidEntry(f"正文不能为空且不超过 {MAX_BODY_CHARS:,} 个字符。")
+
+
+def hidden(name, value):
+    return f'<input type="hidden" name="{escape(name)}" value="{escape(value)}">'
+
+
+def query(**fields):
+    clean = {k: v for k, v in fields.items() if v != ""}
+    return "/?" + urlencode(clean) if clean else "/"
+
+
+def render_layer_radios(selected_layer):
+    pills = []
+    for lk, (lname, _, _) in LAYERS.items():
+        rid = f"layer-opt-{lk}"
+        checked = " checked" if lk == selected_layer else ""
+        pills.append(
+            f'<span class="radio-pill">'
+            f'<input type="radio" id="{rid}" name="layer" value="{lk}"{checked} required>'
+            f'<label for="{rid}"><span class="layer-badge layer-{lk}">{lk}</span> {escape(lname)}</label>'
+            f"</span>"
+        )
+    return (
+        f'<fieldset class="choice-fieldset">'
+        f"<legend>归入层级</legend>"
+        f'<div class="radio-cards">{"".join(pills)}</div>'
+        f"</fieldset>"
+    )
+
+
+def render_scope_radios(selected_scope):
+    opts = [
+        ("index", "主知识库（写入对应分层目录并自动同步 MEMORY.md，三端 Agent 默认检索）"),
+        ("user", "个人手记区（仅存入 user-managed/，由你手动管理）"),
+    ]
+    pills = []
+    for val, label_txt in opts:
+        rid = f"scope-opt-{val}"
+        checked = " checked" if val == selected_scope else ""
+        pills.append(
+            f'<span class="radio-pill">'
+            f'<input type="radio" id="{rid}" name="scope" value="{val}"{checked}>'
+            f'<label for="{rid}">{escape(label_txt)}</label>'
+            f"</span>"
+        )
+    return (
+        f'<fieldset class="choice-fieldset">'
+        f"<legend>存储位置</legend>"
+        f'<div class="radio-cards">{"".join(pills)}</div>'
+        f"</fieldset>"
+    )
+
+
+def render_memory_editor_html(
+    *,
+    mode,
+    scope,
+    token,
+    library_key,
+    layer,
+    title,
+    description,
+    body,
+    cancel_link,
+    slug="",
+    orig_topic="",
+    entry_name="",
+    revision="",
+    entry_type="",
+    file_meta_note="",
+):
+    """Render unified accessible Markdown editor for indexed topics and user-managed notes."""
+    is_new = mode == "new"
+    intro_text = (
+        "新建记忆默认写入主知识库并同步更新 MEMORY.md 索引；也可切换为仅保存在个人手记区（user-managed/）。"
+        if is_new
+        else (
+            f"正在编辑主知识库条目（保存时自动同步更新 MEMORY.md 索引；切换层级会自动迁移目录文件）。"
+            if scope == "index"
+            else "正在编辑个人手记（位于 user-managed/，不会改动自动索引条目）。"
+        )
+    )
+    scope_html = (
+        render_scope_radios(scope)
+        if is_new
+        else hidden("scope", scope)
+    )
+    slug_field_html = ""
+    if is_new:
+        slug_field_html = f"""
+          <div class="field">
+            <label for="slug">文件标识（可选）</label>
+            <input id="slug" name="slug" type="text" value="{escape(slug)}" maxlength="90"
+                   autocorrect="off" autocapitalize="none" spellcheck="false"
+                   aria-describedby="slug-help" placeholder="例如：weekly-report-export">
+            <span id="slug-help" class="field-hint">英文/数字/连字符文件名（主知识库使用），留空则根据标题与日期自动生成。</span>
+          </div>"""
+
+    title_row = (
+        f'<div class="form-row-two">'
+        f'<div class="field">'
+        f'<label for="title">标题 <span class="required">必填</span></label>'
+        f'<input id="title" name="title" type="text" value="{escape(title)}" maxlength="{MAX_TITLE_CHARS}" '
+        f'placeholder="例如：每周报告的导出方法" required autofocus>'
+        f"</div>"
+        f"{slug_field_html}"
+        f"</div>"
+        if is_new
+        else f'<div class="field">'
+        f'<label for="title">标题 <span class="required">必填</span></label>'
+        f'<input id="title" name="title" type="text" value="{escape(title)}" maxlength="{MAX_TITLE_CHARS}" required>'
+        f"</div>"
+    )
+
+    submit_txt = (
+        "保存新记忆"
+        if is_new
+        else ("保存记忆并同步索引" if scope == "index" else "保存个人手记")
+    )
+    hidden_inputs = (
+        hidden("csrf", token)
+        + hidden("library", library_key)
+        + hidden("orig_topic", orig_topic)
+        + hidden("name", entry_name)
+        + hidden("revision", revision)
+        + hidden("entry_type", entry_type)
+        + hidden("create_id", f"entry-{secrets.token_hex(10)}")
+    )
+    footer_meta = f'<div class="file-info">{file_meta_note}</div>' if file_meta_note else ""
+
+    return f"""
+      <div class="editor-wrap">
+        <p class="editor-intro">{escape(intro_text)}</p>
+        <form class="edit-form" method="post" action="/save#feedback" aria-labelledby="detail-title">
+          {hidden_inputs}
+          {scope_html}
+          {render_layer_radios(layer if layer in LAYERS else "L1")}
+          {title_row}
+          <div class="field">
+            <label for="description">一句话索引摘要 / 检索线索</label>
+            <input id="description" name="description" type="text" value="{escape(description)}" maxlength="{MAX_DESC_CHARS}"
+                   aria-describedby="desc-help" placeholder="写明核心结论与下次遇到什么场景时 Agent 应该优先读这条">
+            <span id="desc-help" class="field-hint">主知识库记忆会将此摘要同步展示在 <code>MEMORY.md</code> 索引行（单行 ≤ {MAX_DESC_CHARS} 字）。</span>
+          </div>
+          <div class="field">
+            <label for="body">正文（Markdown） <span class="required">必填</span></label>
+            <textarea class="auto-grow-textarea" id="body" name="body" rows="18" maxlength="{MAX_BODY_CHARS}"
+                      aria-describedby="body-help"
+                      placeholder="记录已验证结论、适用条件、证据路径与失效边界…" required>{escape(body)}</textarea>
+            <span id="body-help" class="field-hint">支持标准 Markdown 与库内相对链接；严禁写入明文密码、Cookie 或 Token。</span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" type="submit">{submit_txt}</button>
+            <a class="btn btn-ghost" href="{escape(cancel_link)}">取消</a>
+            <span class="shortcut-hint">快捷键：⌘S / Ctrl+S 保存</span>
+          </div>
+        </form>
+        {footer_meta}
+      </div>"""
+
+
+def render_index_editor_html(token, library_key, markdown_text, revision, cancel_link, index_path):
+    """Render direct Markdown editor for MEMORY.md (§0 rules + L0-L4 index)."""
+    hidden_inputs = (
+        hidden("csrf", token)
+        + hidden("library", library_key)
+        + hidden("revision", revision)
+    )
+    return f"""
+      <div class="editor-wrap">
+        <p class="editor-intro">直接编辑权威入口 <code>MEMORY.md</code>（保存前会自动校验 <code>## L0</code>–<code>## L4</code> 章节结构及所有链接文件是否存在）。</p>
+        <form class="edit-form" method="post" action="/save_index#feedback" aria-labelledby="detail-title">
+          {hidden_inputs}
+          <div class="field">
+            <label for="index-body">MEMORY.md 全文（Markdown） <span class="required">必填</span></label>
+            <textarea class="auto-grow-textarea" id="index-body" name="body" rows="24" maxlength="{MAX_BODY_CHARS}"
+                      aria-describedby="index-help" required autofocus>{escape(markdown_text)}</textarea>
+            <span id="index-help" class="field-hint">保持每条索引格式为 <code>- [标题](路径.md) — 一句话核心摘要</code>，严禁写入明文凭据。</span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" type="submit">保存 MEMORY.md</button>
+            <a class="btn btn-ghost" href="{escape(cancel_link)}">取消</a>
+            <span class="shortcut-hint">快捷键：⌘S / Ctrl+S 保存</span>
+          </div>
+        </form>
+        <div class="file-info"><code>{escape(str(index_path))}</code></div>
+      </div>"""
+
+
+def render_delete_dialog_html(token, library_key, scope, target_id, display_path, revision):
+    """Render native modal <dialog> for confirming destructive memory deletion."""
+    hidden_inputs = (
+        hidden("csrf", token)
+        + hidden("library", library_key)
+        + hidden("scope", scope)
+        + hidden("target", target_id)
+        + hidden("revision", revision)
+    )
+    note = (
+        "将从主知识库目录与 MEMORY.md 索引中同步移除"
+        if scope == "index"
+        else "将从个人手记目录 user-managed/ 中移除"
+    )
+    return f"""
+      <dialog class="confirm-dialog" id="delete-dialog" aria-labelledby="delete-dialog-title" closedby="any">
+        <h2 id="delete-dialog-title">确认删除这条记忆？</h2>
+        <p class="confirm-dialog-desc">{escape(note)} <code>{escape(display_path)}</code>。删除前系统会自动在 <code>.state/trash/</code> 保存一份备份副本。</p>
+        <div class="confirm-dialog-actions">
+          <button class="btn btn-secondary" type="button" commandfor="delete-dialog" command="close" autofocus>取消</button>
+          <form method="post" action="/delete#feedback">
+            {hidden_inputs}
+            <button class="btn btn-danger" type="submit">确认删除</button>
+          </form>
+        </div>
+      </dialog>"""
+
+
+def format_inline_md(text, base_rel_dir, root, topics, link_params):
+    """Safely render inline code, bold, and links (rewriting internal .md links)."""
+    parts = []
+    last = 0
+    for m in INLINE_TOKEN_RE.finditer(text):
+        parts.append(escape(text[last : m.start()]))
+        code_tok, bold_tok, _, link_label, link_href = m.groups()
+        if code_tok:
+            parts.append(f'<code class="inline-code">{escape(code_tok[1:-1])}</code>')
+        elif bold_tok:
+            parts.append(f"<strong>{escape(bold_tok[2:-2])}</strong>")
+        else:
+            parts.append(render_md_link(link_label, link_href, base_rel_dir, root, topics, link_params))
+        last = m.end()
+    parts.append(escape(text[last:]))
+    return "".join(parts)
+
+
+def render_md_link(label, href, base_rel_dir, root, topics, link_params):
+    """Rewrite intra-library and intra-skill Markdown links into clickable in-app URLs."""
+    safe_label = escape(label)
+    if href.startswith(("https://", "http://")):
+        return f'<a href="{escape(href)}" target="_blank" rel="noopener noreferrer">{safe_label} ↗</a>'
+    parsed = urlsplit(href)
+    clean_path = unquote(parsed.path)
+    if not parsed.scheme and not clean_path.startswith("/") and clean_path:
+        unnorm = root / base_rel_dir / clean_path
+        resolved = unnorm.resolve()
+        if resolved.suffix.lower() == ".md" and resolved.is_file():
+            norm_logical = Path(os.path.normpath(unnorm))
+            if norm_logical.is_relative_to(root / "skills"):
+                rel_skill = norm_logical.relative_to(root / "skills")
+                parts = rel_skill.parts
+                if len(parts) >= 2:
+                    sk_folder = parts[0]
+                    sub_doc = "/".join(parts[1:])
+                    owner = link_params.get("skill", "")
+                    if owner:
+                        import memoryctl
+
+                        resources = memoryctl.resource_catalog(root / "skills").get(owner, [])
+                        if sk_folder in resources:
+                            sub_doc = "../" + "/".join(parts)
+                            sk_folder = owner
+                    sk_params = {
+                        "library": link_params["library"],
+                        "tab": "skills",
+                        "skill": sk_folder,
+                        "doc": "" if sub_doc == "SKILL.md" else sub_doc,
+                    }
+                    return f'<a href="{escape(query(**sk_params))}#detail-title">{safe_label}</a>'
+            if resolved.is_relative_to(root):
+                rel_posix = resolved.relative_to(root).as_posix()
+                if rel_posix == "MEMORY.md":
+                    app_url = query(library=link_params["library"], view="index") + "#detail-title"
+                    return f'<a href="{escape(app_url)}">{safe_label}</a>'
+                if rel_posix in topics:
+                    mem_params = {k: v for k, v in link_params.items() if k != "tab"}
+                    app_url = query(**mem_params, topic=rel_posix) + "#detail-title"
+                    return f'<a href="{escape(app_url)}">{safe_label}</a>'
+    return f'<span class="local-ref" title="{escape(href)}">{safe_label}</span>'
+
+
+def split_table_row(line):
+    stripped = line.strip().strip("|")
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_h1=""):
+    """Render safe structured HTML from Markdown (headings, lists, tables, code blocks)."""
+    _, body = mcp_server.parse_frontmatter(md_text)
+    base_dir = Path(rel_doc_path).parent
+    lines = body.splitlines()
+    blocks = []
+    idx = 0
+    skipped_first_h1 = False
+
+    while idx < len(lines):
+        raw = lines[idx]
+        stripped = raw.strip()
+
+        if not stripped:
+            idx += 1
+            continue
+
+        if stripped.startswith("```"):
+            idx += 1
+            code_lines = []
+            while idx < len(lines) and not lines[idx].strip().startswith("```"):
+                code_lines.append(lines[idx])
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            blocks.append(f'<pre class="code-block"><code>{escape(chr(10).join(code_lines))}</code></pre>')
+            continue
+
+        if stripped.startswith("#"):
+            hashes = len(stripped) - len(stripped.lstrip("#"))
+            if 1 <= hashes <= 4 and stripped[hashes : hashes + 1] == " ":
+                htext = stripped[hashes + 1 :].strip()
+                if hashes == 1 and not skipped_first_h1 and skip_h1 and htext == skip_h1:
+                    skipped_first_h1 = True
+                    idx += 1
+                    continue
+                tag = f"h{min(max(hashes, 2), 4)}"
+                blocks.append(f"<{tag}>{format_inline_md(htext, base_dir, root, topics, link_params)}</{tag}>")
+                idx += 1
+                continue
+
+        if "|" in stripped and idx + 1 < len(lines) and TABLE_SEP_RE.match(lines[idx + 1]):
+            headers = split_table_row(lines[idx])
+            idx += 2
+            tbody_rows = []
+            while idx < len(lines) and "|" in lines[idx] and lines[idx].strip():
+                cells = split_table_row(lines[idx])
+                tds = "".join(
+                    f"<td>{format_inline_md(c, base_dir, root, topics, link_params)}</td>" for c in cells
+                )
+                tbody_rows.append(f"<tr>{tds}</tr>")
+                idx += 1
+            ths = "".join(
+                f"<th>{format_inline_md(h, base_dir, root, topics, link_params)}</th>" for h in headers
+            )
+            blocks.append(
+                f'<div class="table-wrap"><table><thead><tr>{ths}</tr></thead>'
+                f'<tbody>{"".join(tbody_rows)}</tbody></table></div>'
+            )
+            continue
+
+        if stripped.startswith(">"):
+            q_lines = []
+            while idx < len(lines) and lines[idx].strip().startswith(">"):
+                q_lines.append(lines[idx].strip().lstrip(">").strip())
+                idx += 1
+            joined = format_inline_md(" ".join(q_lines), base_dir, root, topics, link_params)
+            blocks.append(f"<blockquote><p>{joined}</p></blockquote>")
+            continue
+
+        if UNORDERED_ITEM_RE.match(raw):
+            items = []
+            while idx < len(lines):
+                m = UNORDERED_ITEM_RE.match(lines[idx])
+                if not m:
+                    break
+                items.append(f"<li>{format_inline_md(m.group(1), base_dir, root, topics, link_params)}</li>")
+                idx += 1
+            blocks.append(f'<ul>{"".join(items)}</ul>')
+            continue
+
+        if ORDERED_ITEM_RE.match(raw):
+            items = []
+            while idx < len(lines):
+                m = ORDERED_ITEM_RE.match(lines[idx])
+                if not m:
+                    break
+                items.append(f"<li>{format_inline_md(m.group(1), base_dir, root, topics, link_params)}</li>")
+                idx += 1
+            blocks.append(f'<ol>{"".join(items)}</ol>')
+            continue
+
+        para_lines = []
+        while idx < len(lines):
+            cur = lines[idx]
+            s = cur.strip()
+            if (
+                not s
+                or s.startswith(("```", "#", ">"))
+                or UNORDERED_ITEM_RE.match(cur)
+                or ORDERED_ITEM_RE.match(cur)
+                or ("|" in s and idx + 1 < len(lines) and TABLE_SEP_RE.match(lines[idx + 1]))
+            ):
+                break
+            para_lines.append(s)
+            idx += 1
+        blocks.append(f"<p>{format_inline_md(' '.join(para_lines), base_dir, root, topics, link_params)}</p>")
+
+    return f'<article class="prose">{"".join(blocks)}</article>'
+
+
+def render_card_time_html(created_at, updated_at, sort_by, now_dt):
+    """Render concise relative timestamp badge for sidebar cards."""
+    if not updated_at and not created_at:
+        return ""
+    newly = mcp_server.is_newly_created(created_at, updated_at)
+    if sort_by == "created":
+        ts_val = created_at or updated_at
+        mode = "new"
+        suffix = "写入"
+    else:
+        ts_val = updated_at or created_at
+        mode = "new" if newly else "upd"
+        suffix = "写入" if newly else "更新"
+
+    rel_txt, _, iso_attr = mcp_server.format_relative_zh(ts_val, now_dt=now_dt)
+    try:
+        dt_val, _ = mcp_server.parse_timestamp(ts_val)
+        is_fresh = (now_dt - dt_val).total_seconds() <= 86400
+    except ValueError:
+        is_fresh = False
+    cls = "entry-time entry-time-fresh" if is_fresh else "entry-time"
+    return (
+        f'<time class="{cls}" datetime="{escape(iso_attr)}" '
+        f'data-ts="{escape(iso_attr)}" data-mode="{mode}">{escape(rel_txt)}{suffix}</time>'
+    )
+
+
+def render_detail_timestamps_html(path_str, created_at, updated_at, now_dt, status_note=""):
+    """Render semantic <time> metadata line showing both update and creation times."""
+    parts = [f"<code>{escape(path_str)}</code>"]
+    if status_note:
+        parts.append(f"<span>{escape(status_note)}</span>")
+    if updated_at or created_at:
+        newly = mcp_server.is_newly_created(created_at, updated_at)
+        upd_rel, upd_full, upd_iso = mcp_server.format_relative_zh(updated_at or created_at, now_dt=now_dt)
+        if newly:
+            parts.append(
+                f'<span class="detail-time-item"><strong>写入时间：</strong>'
+                f'<time datetime="{escape(upd_iso)}" data-ts="{escape(upd_iso)}" data-mode="bare">{escape(upd_rel)}</time>'
+                f"（{escape(upd_full)}）</span>"
+            )
+        else:
+            cre_rel, cre_full, cre_iso = mcp_server.format_relative_zh(created_at, now_dt=now_dt)
+            parts.append(
+                f'<span class="detail-time-item"><strong>最近更新：</strong>'
+                f'<time datetime="{escape(upd_iso)}" data-ts="{escape(upd_iso)}" data-mode="bare">{escape(upd_rel)}</time>'
+                f"（{escape(upd_full)}）</span>"
+            )
+            parts.append(
+                f'<span class="detail-time-item"><strong>首次写入：</strong>'
+                f'<time datetime="{escape(cre_iso)}" data-ts="{escape(cre_iso)}" data-mode="bare">{escape(cre_rel)}</time>'
+                f"（{escape(cre_full)}）</span>"
+            )
+    return f'<p class="detail-path">{" · ".join(parts)}</p>'
+
+
+def entry_link(item, href, is_user, selected, sort_by="updated", now_dt=None):
+    now_dt = now_dt or datetime.now().astimezone()
+    current = CUR_ATTR if selected else ""
+    badge = f'<span class="layer-badge layer-{item.layer}">{item.layer}</span>'
+    user_tag = '<span class="entry-tag-user">手记</span>' if is_user else ""
+    time_html = render_card_time_html(item.created_at, item.updated_at, sort_by, now_dt)
+    summary = f'<p class="entry-desc">{escape(item.description)}</p>' if item.description else ""
+    return f"""
+      <li><a class="entry-link" href="{escape(href)}#detail-title"{current}>
+        <div class="entry-card-head">
+          {badge}
+          <strong class="entry-title">{escape(item.title)}</strong>
+          {user_tag}
+          {time_html}
+        </div>
+        {summary}
+      </a></li>"""
+
+
+def skill_entry_link(sk, href, selected):
+    current = CUR_ATTR if selected else ""
+    cat_label, badge_layer, _ = SKILL_CATS.get(sk["category"], ("通用", "L2", ""))
+    badge = f'<span class="layer-badge layer-{badge_layer}">{escape(cat_label)}</span>'
+    off_tag = "" if sk["enabled"] else '<span class="entry-tag-off">已停用</span>'
+    summary = f'<p class="entry-desc">{escape(sk["description"])}</p>' if sk["description"] else ""
+    return f"""
+      <li><a class="entry-link" href="{escape(href)}#detail-title"{current}>
+        <div class="entry-card-head">
+          {badge}
+          <strong class="entry-title">{escape(sk["name"])}</strong>
+          {off_tag}
+        </div>
+        {summary}
+      </a></li>"""
+
+
+def library_nav_html(libraries, current_key):
+    if len(libraries) <= 1:
+        return ""
+    links = []
+    for key, library in libraries.items():
+        current = CUR_ATTR if key == current_key else ""
+        links.append(
+            f'<li><a href="{escape(query(library=key))}"{current}>{escape(library.label)}</a></li>'
+        )
+    return f'<nav aria-label="切换记忆库"><ul class="lib-pills">{"".join(links)}</ul></nav>'
+
+
+def format_comp_chip(label, state, suffix=""):
+    text = f"{label}{suffix}"
+    if state == "managed":
+        return f'<span class="chip-ok">✓ {escape(text)}</span>'
+    if state in {"drifted", "modified", "conflict", "symlink"}:
+        return f'<span class="chip-warn">! {escape(text)}待同步</span>'
+    return f'<span class="chip-off">○ {escape(label)}未配</span>'
+
+
+def render_agent_panel(token, key, tab="", agent_home=None):
+    """Render clean, intuitive 3-agent integration status ribbon."""
+    try:
+        import memoryctl
+
+        specs = memoryctl.agent_specs(home=agent_home)
+        cards = []
+        managed_count = 0
+        for aid, spec in specs.items():
+            info = memoryctl.inspect_agent(aid, spec)
+            state = info["state"]
+            if state == "managed":
+                managed_count += 1
+                item_cls = "agent-item agent-item-managed"
+                pill_cls = "status-pill status-pill-managed"
+                pill_txt = "● 已连通"
+                btn_html = f"""
+                  <form method="post" action="/agent#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    {hidden("target", aid)}{hidden("op", "disconnect")}
+                    <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
+                  </form>"""
+            elif state in {"drifted", "partial"}:
+                item_cls = "agent-item agent-item-drifted"
+                pill_cls = "status-pill status-pill-drifted"
+                pill_txt = "▲ 待同步"
+                btn_html = f"""
+                  <form method="post" action="/agent#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    {hidden("target", aid)}{hidden("op", "connect")}
+                    <button class="btn btn-warn btn-compact" type="submit">同步</button>
+                  </form>
+                  <form method="post" action="/agent#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    {hidden("target", aid)}{hidden("op", "disconnect")}
+                    <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
+                  </form>"""
+            else:
+                item_cls = "agent-item"
+                pill_cls = "status-pill"
+                pill_txt = "○ 未接入"
+                btn_html = f"""
+                  <form method="post" action="/agent#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    {hidden("target", aid)}{hidden("op", "connect")}
+                    <button class="btn btn-primary btn-compact" type="submit">接入</button>
+                  </form>"""
+
+            comp = info["components"]
+            sk_comp = comp["skill"]
+            sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
+            chips = "".join(
+                [
+                    format_comp_chip("指令规则", comp["instructions"]["state"]),
+                    format_comp_chip("MCP 服务", comp["mcp"]["state"]),
+                    format_comp_chip("Skills", sk_comp["state"], sk_suffix),
+                ]
+            )
+            issue_html = (
+                f'<p class="agent-issue">{escape("；".join(info["issues"]))}</p>'
+                if info["issues"]
+                else ""
+            )
+            cards.append(
+                f"""
+            <div class="{item_cls}">
+              <div class="agent-info">
+                <div class="agent-name-row">
+                  <strong>{escape(info["name"])}</strong>
+                  <span class="{pill_cls}">{pill_txt}</span>
+                </div>
+                <div class="check-chips">{chips}</div>
+                {issue_html}
+              </div>
+              <div class="agent-btns">{btn_html}</div>
+            </div>"""
+            )
+
+        connect_all_btn = ""
+        if managed_count < len(specs):
+            connect_all_btn = f"""
+              <form method="post" action="/agent#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                {hidden("target", "all")}{hidden("op", "connect")}
+                <button class="btn btn-primary btn-compact" type="submit">一键同步全部</button>
+              </form>"""
+
+        summary_note = (
+            f"三端已全部连通（{managed_count}/{len(specs)}）"
+            if managed_count == len(specs)
+            else f"已完整同步 {managed_count}/{len(specs)} 个客户端"
+        )
+        stray_list = memoryctl.scan_stray_agent_memories(home=agent_home)
+        stray_alert = (
+            f'<p class="agent-issue">发现未归集的隐藏目录散落记忆（请合并后清理）：{escape(", ".join(stray_list))}</p>'
+            if stray_list
+            else ""
+        )
+        return f"""
+        <div class="agents-ribbon">
+          <div class="agents-ribbon-top">
+            <div class="agents-title-row">
+              <h2>跨 Agent 统一接入控制</h2>
+              <span class="agents-subtitle">· {escape(summary_note)}</span>
+            </div>
+            <div class="agents-global-actions">
+              {connect_all_btn}
+              <form method="post" action="/doctor#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
+              </form>
+            </div>
+          </div>
+          {stray_alert}
+          <div class="agents-cards">{"".join(cards)}</div>
+        </div>"""
+    except OSError:
+        return (
+            '<div class="agents-ribbon">'
+            '<p class="agents-subtitle">当前进程受沙盒限制无法直接检测三端目录；在本地终端运行 python3 manager/manager.py 即可启用三端可视化控制。</p>'
+            "</div>"
+        )
+
+
+def filter_and_score(library, topics, entries, q, layer, status, source, window="", sort_by="updated"):
+    """Filter topics and user entries by layer/status/source/window, temporal cues, and sort order."""
+    q_stripped = q.strip()
+    has_temporal_cue = bool(q_stripped and mcp_server.TEMPORAL_CUE_RE.search(q_stripped))
+    residual_q = mcp_server.TEMPORAL_STOP_RE.sub(" ", q_stripped).strip() if has_temporal_cue else q_stripped
+    pure_temporal = bool(has_temporal_cue and not residual_q)
+    raw_terms, subtokens = mcp_server.build_query_features("" if pure_temporal else (residual_q or q_stripped))
+
+    now_ep = datetime.now().astimezone().timestamp()
+    window_cutoff = now_ep - 7 * 86400 if window == "7d" else None
+    scored_rows = []
+
+    if source != "user" and status == "active":
+        for topic in topics.values():
+            if layer and topic.layer != layer:
+                continue
+            if (window == "7d" or pure_temporal) and not layer and topic.layer == "L4":
+                continue
+            if window_cutoff is not None and topic.updated_epoch < window_cutoff:
+                continue
+            score = 1
+            if raw_terms:
+                body_text = ""
+                try:
+                    body_text = library.read_markdown(library.root / topic.path)
+                except (ValueError, OSError):
+                    body_text = ""
+                score, _ = mcp_server.score_fields(
+                    raw_terms,
+                    subtokens,
+                    Path(topic.path).stem.casefold(),
+                    topic.title.casefold(),
+                    topic.description.casefold(),
+                    body_text.casefold(),
+                )
+                if score == 0:
+                    continue
+                if has_temporal_cue and now_ep - topic.updated_epoch <= 7 * 86400:
+                    score += 4
+            scored_rows.append((score, "index", topic))
+
+    if source != "index":
+        for item in entries:
+            if item.status != status or (layer and item.layer != layer):
+                continue
+            if window_cutoff is not None and item.updated_epoch < window_cutoff:
+                continue
+            score = 1
+            if raw_terms:
+                score, _ = mcp_server.score_fields(
+                    raw_terms,
+                    subtokens,
+                    item.name.casefold(),
+                    item.title.casefold(),
+                    item.description.casefold(),
+                    item.body.casefold(),
+                )
+                if score == 0:
+                    continue
+                if has_temporal_cue and now_ep - item.updated_epoch <= 7 * 86400:
+                    score += 4
+            scored_rows.append((score, "user", item))
+
+    if raw_terms or pure_temporal:
+        scored_rows.sort(key=lambda r: (-r[0], -r[2].updated_epoch, r[2].layer, r[2].title.casefold()))
+    elif sort_by == "created":
+        scored_rows.sort(key=lambda r: (-r[2].created_epoch, -r[2].updated_epoch, r[2].layer, r[2].title.casefold()))
+    elif sort_by == "updated":
+        scored_rows.sort(key=lambda r: (-r[2].updated_epoch, -r[2].created_epoch, r[2].layer, r[2].title.casefold()))
+    return scored_rows
+
+
+def filter_skills(skills_matrix, q, cat, sk_state):
+    """Filter unified skills by category, enabled state, and search query."""
+    raw_terms, subtokens = mcp_server.build_query_features(q)
+    out = []
+    for sk in skills_matrix:
+        if cat and sk["category"] != cat:
+            continue
+        if sk_state == "enabled" and not sk["enabled"]:
+            continue
+        if sk_state == "disabled" and sk["enabled"]:
+            continue
+        score = 1
+        if raw_terms:
+            body_txt = ""
+            sk_md = Path(sk["path"]) / "SKILL.md"
+            if sk_md.is_file():
+                body_txt = sk_md.read_text(encoding="utf-8", errors="replace")
+            score, _ = mcp_server.score_fields(
+                raw_terms,
+                subtokens,
+                sk["folder"].casefold(),
+                sk["name"].casefold(),
+                sk["description"].casefold(),
+                body_txt.casefold(),
+            )
+            if score == 0:
+                continue
+        out.append((score, sk))
+    if raw_terms:
+        out.sort(key=lambda r: (-r[0], r[1]["name"].casefold()))
+    return [r[1] for r in out]
+
+
+def render_overview(topics, entries, key):
+    """Render Recent Work timeline + L0-L4 overview dashboard when no topic is selected."""
+    now_dt = datetime.now().astimezone()
+    now_ep = now_dt.timestamp()
+    layer_counts = {lk: 0 for lk in LAYERS}
+    recent_pool = []
+
+    for t in topics.values():
+        if t.layer in layer_counts:
+            layer_counts[t.layer] += 1
+        if t.layer != "L4":
+            recent_pool.append(("index", t))
+    for e in entries:
+        if e.status == "active" and e.layer in layer_counts:
+            layer_counts[e.layer] += 1
+            recent_pool.append(("user", e))
+
+    recent_pool.sort(key=lambda pair: (-pair[1].updated_epoch, -pair[1].created_epoch, pair[1].title.casefold()))
+    today_cnt = sum(1 for _, it in recent_pool if now_ep - it.updated_epoch <= 86400)
+    week_cnt = sum(1 for _, it in recent_pool if now_ep - it.updated_epoch <= 7 * 86400)
+
+    recent_items_html = []
+    for kind, it in recent_pool[:8]:
+        href = (
+            query(library=key, topic=it.path) + "#detail-title"
+            if kind == "index"
+            else query(library=key, entry=it.name) + "#detail-title"
+        )
+        newly = mcp_server.is_newly_created(it.created_at, it.updated_at)
+        act_badge = (
+            '<span class="act-badge act-new">新写入</span>'
+            if newly
+            else '<span class="act-badge act-upd">已更新</span>'
+        )
+        upd_rel, upd_full, upd_iso = mcp_server.format_relative_zh(it.updated_at or it.created_at, now_dt=now_dt)
+        if newly:
+            time_meta = (
+                f'<span class="recent-time-meta">'
+                f'<time datetime="{escape(upd_iso)}" data-ts="{escape(upd_iso)}" data-mode="new">{escape(upd_rel)}写入</time>'
+                f'<span>· {escape(upd_full)}</span>'
+                f"</span>"
+            )
+        else:
+            _, cre_full, _ = mcp_server.format_relative_zh(it.created_at, now_dt=now_dt)
+            cre_short = cre_full.split(" ")[0]
+            time_meta = (
+                f'<span class="recent-time-meta">'
+                f'<time datetime="{escape(upd_iso)}" data-ts="{escape(upd_iso)}" data-mode="upd">{escape(upd_rel)}更新</time>'
+                f'<span>· 始于 {escape(cre_short)}</span>'
+                f"</span>"
+            )
+        desc_line = f'<p class="recent-desc">{escape(it.description)}</p>' if it.description else ""
+        recent_items_html.append(
+            f"""
+          <li class="recent-item">
+            <a class="recent-link" href="{escape(href)}">
+              <div class="recent-row-top">
+                <span class="layer-badge layer-{it.layer}">{it.layer}</span>
+                {act_badge}
+                <strong class="recent-title">{escape(it.title)}</strong>
+                {time_meta}
+              </div>
+              {desc_line}
+            </a>
+          </li>"""
+        )
+
+    recent_more_href = query(library=key, window="7d")
+    recent_panel = f"""
+      <section class="recent-panel" aria-labelledby="recent-work-heading">
+        <div class="recent-panel-head">
+          <div class="recent-panel-title">
+            <h2 id="recent-work-heading">⚡ 最近工作动态</h2>
+            <span class="recent-stats">今日活跃 {today_cnt} 条 · 近 7 天活跃 {week_cnt} 条</span>
+          </div>
+          <a class="btn btn-secondary btn-compact" href="{escape(recent_more_href)}">筛选近 7 天全部 →</a>
+        </div>
+        <ul class="recent-list" role="list">{"".join(recent_items_html)}</ul>
+      </section>"""
+
+    cards = []
+    for lk, (lname, _, ldesc) in LAYERS.items():
+        href = query(library=key, layer=lk)
+        cards.append(
+            f"""
+          <a class="overview-card" href="{escape(href)}">
+            <div class="overview-card-top">
+              <span class="layer-badge layer-{lk}">{lk} · {escape(lname)}</span>
+              <span class="overview-num">{layer_counts[lk]}</span>
+            </div>
+            <p>{escape(ldesc)}</p>
+          </a>"""
+        )
+
+    active_user_cnt = sum(e.status == "active" for e in entries)
+    return f"""
+      {recent_panel}
+      <p class="overview-section-label">按 L0–L4 记忆性质浏览</p>
+      <div class="overview-grid">{"".join(cards)}</div>
+      <div class="overview-tip">
+        <strong>如何高效使用这套统一中枢？</strong>
+        <p>1. 左侧列表默认按 <strong>最近更新时间</strong> 倒序排列，顶部可切换「⚡ 最近工作」「最近写入」或「层级顺序」，每条卡片均标明多久前写入或更新。</p>
+        <p>2. 当前共有 <strong>{len(topics)} 条</strong> 主知识库记忆和 <strong>{active_user_cnt} 条</strong> 个人手记。点击任意条目右上角「编辑记忆」即可在线修改并自动刷新 <code>updated_at</code> 与 <code>MEMORY.md</code>。</p>
+        <p>3. 在 Claude Code、Codex 或 Antigravity 中直接询问“最近做了什么”或“最近工作”，MCP 服务也会按最新更新时间优先返回近期活跃工作。</p>
+      </div>"""
+
+
+def render_skills_overview(skills_matrix, key):
+    """Render category overview cards for the unified skills hub."""
+    cat_counts = {ck: 0 for ck in SKILL_CATS}
+    for sk in skills_matrix:
+        if sk["category"] in cat_counts:
+            cat_counts[sk["category"]] += 1
+
+    cards = []
+    for ck, (cname, badge_layer, cdesc) in SKILL_CATS.items():
+        href = query(library=key, tab="skills", cat=ck)
+        cards.append(
+            f"""
+          <a class="overview-card" href="{escape(href)}">
+            <div class="overview-card-top">
+              <span class="layer-badge layer-{badge_layer}">{escape(cname)}</span>
+              <span class="overview-num">{cat_counts[ck]}</span>
+            </div>
+            <p>{escape(cdesc)}</p>
+          </a>"""
+        )
+
+    enabled_cnt = sum(sk["enabled"] for sk in skills_matrix)
+    return f"""
+      <div class="overview-grid">{"".join(cards)}</div>
+      <div class="overview-tip">
+        <strong>统一 Skills 管理机制</strong>
+        <p>1. 所有跨端共享技能统一存放在 <code>{escape(str(data_root() / "skills"))}</code>（共 <strong>{len(skills_matrix)} 个</strong>，当前已启用 <strong>{enabled_cnt} 个</strong>）。</p>
+        <p>2. 点击上方「一键同步全部」或「同步」后，系统会自动将原分散在各客户端的独立目录安全备份到 <code>.state/skill-backups/</code>，并统一替换为指向本仓库的软链接。</p>
+        <p>3. 在任意技能详情页右上角点击「停用此技能」或「启用此技能」，三端挂载状态会实时自动增删同步；客户端专有的内部技能（如 Codex <code>.system</code>）保持原位不受影响。</p>
+      </div>"""
+
+
+def render_skills_tab(
+    libraries,
+    key,
+    token,
+    topics,
+    q="",
+    cat="",
+    sk_state="all",
+    skill_slug="",
+    sub_doc="",
+    raw_mode=False,
+    notice="",
+    error="",
+    agent_home=None,
+):
+    import memoryctl
+
+    library = libraries[key]
+    try:
+        skills_matrix = memoryctl.inspect_skills_matrix(home=agent_home)
+    except OSError:
+        skills_matrix = [
+            {**s, "agents": {"claude": "absent", "codex": "absent", "antigravity": "absent"}}
+            for s in memoryctl.discover_hub_skills()
+        ]
+
+    matched = filter_skills(skills_matrix, q, cat, sk_state)
+    link_base = dict(library=key, tab="skills", q=q, cat=cat, sk_state="" if sk_state == "all" else sk_state)
+    rows = [
+        skill_entry_link(
+            sk,
+            query(**link_base, skill=sk["folder"]),
+            sk["folder"] == skill_slug,
+        )
+        for sk in matched
+    ]
+    listing = (
+        f'<ul class="entry-list" role="list">{"".join(rows)}</ul>'
+        if rows
+        else '<p class="empty">没有匹配的技能，试试清空搜索或切换分类。</p>'
+    )
+
+    base_all_cats = filter_skills(skills_matrix, q, "", sk_state)
+    cat_cnt = {ck: 0 for ck in SKILL_CATS}
+    for s in base_all_cats:
+        if s["category"] in cat_cnt:
+            cat_cnt[s["category"]] += 1
+
+    cat_tabs = [
+        f'<a class="pill-tab" href="{escape(query(library=key, tab="skills", q=q, sk_state="" if sk_state == "all" else sk_state))}"'
+        f'{CUR_ATTR if not cat else ""}>全部 <span class="pill-count">{len(base_all_cats)}</span></a>'
+    ]
+    for ck, (cname, _, _) in SKILL_CATS.items():
+        href = query(library=key, tab="skills", q=q, cat=ck, sk_state="" if sk_state == "all" else sk_state)
+        cat_tabs.append(
+            f'<a class="pill-tab" href="{escape(href)}"{CUR_ATTR if cat == ck else ""}>'
+            f'{escape(cname)} <span class="pill-count">{cat_cnt[ck]}</span></a>'
+        )
+
+    en_cnt = sum(s["enabled"] for s in skills_matrix)
+    dis_cnt = len(skills_matrix) - en_cnt
+    seg_items = [
+        (f"全部 ({len(skills_matrix)})", sk_state == "all", query(library=key, tab="skills", q=q, cat=cat)),
+        (f"已启用 ({en_cnt})", sk_state == "enabled", query(library=key, tab="skills", q=q, cat=cat, sk_state="enabled")),
+        (f"已停用 ({dis_cnt})", sk_state == "disabled", query(library=key, tab="skills", q=q, cat=cat, sk_state="disabled")),
+    ]
+    source_tabs = "".join(
+        f'<a class="seg-link" href="{escape(shref)}"{CUR_ATTR if cur else ""}>{escape(slabel)}</a>'
+        for slabel, cur, shref in seg_items
+    )
+
+    detail_badges = ""
+    detail_submeta = ""
+    detail_toolbar = ""
+    reader = ""
+
+    by_folder = {s["folder"]: s for s in skills_matrix}
+    if skill_slug and skill_slug in by_folder:
+        sk = by_folder[skill_slug]
+        cat_label, badge_layer, _ = SKILL_CATS.get(sk["category"], ("通用", "L2", ""))
+        rel_md = f"skills/{skill_slug}/{sub_doc or 'SKILL.md'}"
+        target_file = (library.root / "skills" / skill_slug / (sub_doc or "SKILL.md")).resolve()
+        try:
+            hub = library.root / "skills"
+            resources = memoryctl.resource_catalog(hub).get(skill_slug, [])
+            md_content = library.read_markdown(target_file, [(hub / name).resolve() for name in resources])
+            heading = sk["name"] if not sub_doc else f"{sk['name']} · {Path(sub_doc).name}"
+            ag_chips = []
+            for aid, alabel in (("claude", "Claude"), ("codex", "Codex"), ("antigravity", "Antigravity")):
+                ast = sk["agents"].get(aid, "absent")
+                if ast == "linked":
+                    ag_chips.append(f'<span class="meta-chip">✓ {alabel} 已挂载</span>')
+                elif ast == "standalone":
+                    ag_chips.append(f'<span class="meta-chip">! {alabel} 独立副本待合入</span>')
+                else:
+                    ag_chips.append(f'<span class="meta-chip">○ {alabel} 未挂载</span>')
+            detail_badges = (
+                f'<div class="detail-badges">'
+                f'<span class="layer-badge layer-{badge_layer}">{escape(cat_label)}</span>'
+                + "".join(ag_chips)
+                + "</div>"
+            )
+            detail_submeta = f'<p class="detail-path"><code>skills/{escape(skill_slug)}/{escape(sub_doc or "SKILL.md")}</code></p>'
+            toggle_op, toggle_btn_txt, toggle_cls = (
+                ("disable", "停用此技能", "btn btn-danger-ghost btn-compact")
+                if sk["enabled"]
+                else ("enable", "启用此技能", "btn btn-primary btn-compact")
+            )
+            back_btn = (
+                f'<a class="btn btn-secondary btn-compact" href="{escape(query(**link_base, skill=skill_slug))}#detail-title">返回 SKILL.md</a>'
+                if sub_doc
+                else ""
+            )
+            raw_href = query(**link_base, skill=skill_slug, doc=sub_doc, raw="" if raw_mode else "1") + "#detail-title"
+            detail_toolbar = f"""
+              {back_btn}
+              <a class="btn btn-ghost btn-compact" href="{escape(raw_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
+              <form method="post" action="/skill#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("folder", skill_slug)}{hidden("op", toggle_op)}
+                <button class="{toggle_cls}" type="submit">{toggle_btn_txt}</button>
+              </form>"""
+            summary_html = (
+                f'<div class="doc-summary-banner">{escape(sk["description"])}</div>'
+                if sk["description"] and not sub_doc
+                else ""
+            )
+            md_params = {**link_base, "skill": skill_slug}
+            body_html = (
+                f'<pre class="markdown-raw">{escape(md_content)}</pre>'
+                if raw_mode
+                else render_markdown_html(
+                    md_content,
+                    rel_md,
+                    library.root,
+                    topics,
+                    md_params,
+                    skip_h1="",
+                )
+            )
+            reader = summary_html + body_html
+        except (ValueError, OSError):
+            heading = "无法读取技能文档"
+            error = "找不到请求的技能 Markdown 文件。"
+    else:
+        heading = "Skills 统一技能中心"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">跨 Claude Code / Codex / Antigravity 共享</span></div>'
+        if dis_cnt > 0:
+            detail_toolbar = f"""
+              <form method="post" action="/skill#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("folder", "all")}{hidden("op", "enable")}
+                <button class="btn btn-secondary btn-compact" type="submit">全部启用</button>
+              </form>"""
+        reader = render_skills_overview(skills_matrix, key)
+
+    feedback = ""
+    if error:
+        feedback = f'<p class="message error" id="feedback" role="alert" tabindex="-1">{escape(error)}</p>'
+    elif notice:
+        feedback = f'<p class="message" id="feedback" role="status" tabindex="-1">{escape(notice)}</p>'
+
+    mode_tabs = (
+        f'<a class="mode-tab" href="{escape(query(library=key))}">记忆知识库 ({len(topics)})</a>'
+        f'<a class="mode-tab" href="{escape(query(library=key, tab="skills"))}"{CUR_ATTR}>Skills 技能中心 ({en_cnt}/{len(skills_matrix)})</a>'
+    )
+    topbar_cta = f'<a class="btn btn-ghost" href="{escape(query(library=key))}">切换到记忆知识库</a>'
+    search_hidden = (
+        hidden("library", key)
+        + hidden("tab", "skills")
+        + (hidden("cat", cat) if cat else "")
+        + (hidden("sk_state", sk_state) if sk_state != "all" else "")
+    )
+    clear_search = (
+        f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=key, tab="skills", cat=cat, sk_state="" if sk_state == "all" else sk_state))}">清除</a>'
+        if q
+        else ""
+    )
+
+    return load_template().substitute(
+        library=escape(library.label),
+        home_link=escape(query(library=key, tab="skills")),
+        mode_tabs=mode_tabs,
+        library_nav=library_nav_html(libraries, key),
+        topbar_cta=topbar_cta,
+        search_hidden_fields=search_hidden,
+        search_placeholder="搜索技能名称、目录或触发场景…",
+        clear_search=clear_search,
+        filter_caption="技能分类（点击即切换）",
+        layer_tabs="".join(cat_tabs),
+        segment_class="segment-row-3",
+        source_tabs=source_tabs,
+        list_title="技能列表",
+        sort_controls="",
+        index_path=escape(str(library.index)),
+        skills_path=escape(str(library.root / "skills")),
+        folder=escape(str(library.folder)),
+        agent_panel=render_agent_panel(token, key, tab="skills", agent_home=agent_home),
+        detail_badges=detail_badges,
+        detail_submeta=detail_submeta,
+        detail_toolbar=detail_toolbar,
+        heading=escape(heading),
+        reader=reader,
+        editor="",
+        confirm_dialog="",
+        feedback=feedback,
+        unreadable="",
+        listing=listing,
+        count=len(rows),
+        q=escape(q),
+    )
+
+
+def render(
+    libraries,
+    key,
+    token,
+    entry=Entry(),
+    topic_draft=None,
+    index_draft=None,
+    draft_scope="",
+    draft_slug="",
+    tab="memory",
+    q="",
+    layer="",
+    status="active",
+    source="all",
+    window="",
+    sort_by="updated",
+    cat="",
+    sk_state="all",
+    skill_slug="",
+    sub_doc="",
+    view="",
+    topic_path="",
+    raw_mode=False,
+    notice="",
+    error="",
+    agent_home=None,
+):
+    library = libraries[key]
+    entries, unreadable = library.list()
+    try:
+        markdown, topics = library.read_index()
+    except (ValueError, OSError):
+        markdown, topics = "", {}
+        unreadable.append("MEMORY.md")
+
+    if tab == "skills":
+        return render_skills_tab(
+            libraries,
+            key,
+            token,
+            topics,
+            q=q,
+            cat=cat,
+            sk_state=sk_state,
+            skill_slug=skill_slug,
+            sub_doc=sub_doc,
+            raw_mode=raw_mode,
+            notice=notice,
+            error=error,
+            agent_home=agent_home,
+        )
+
+    import memoryctl
+
+    hub_skills = memoryctl.discover_hub_skills()
+    en_sk_cnt = sum(s["enabled"] for s in hub_skills)
+    now_dt = datetime.now().astimezone()
+
+    sort_param = "" if sort_by == "updated" else sort_by
+    link_params = dict(library=key, q=q, layer=layer, status=status, source=source, window=window, sort=sort_param)
+    matched = filter_and_score(library, topics, entries, q, layer, status, source, window=window, sort_by=sort_by)
+    rows = []
+    for _, kind, item in matched:
+        if kind == "index":
+            rows.append(
+                entry_link(
+                    item,
+                    query(**link_params, topic=item.path),
+                    False,
+                    item.path == topic_path,
+                    sort_by=sort_by,
+                    now_dt=now_dt,
+                )
+            )
+        else:
+            rows.append(
+                entry_link(
+                    item,
+                    query(**link_params, entry=item.name),
+                    True,
+                    item.name == entry.name,
+                    sort_by=sort_by,
+                    now_dt=now_dt,
+                )
+            )
+
+    listing = (
+        f'<ul class="entry-list" role="list">{"".join(rows)}</ul>'
+        if rows
+        else '<p class="empty">没有找到匹配的记忆条目，试试清空筛选或换个关键词。</p>'
+    )
+
+    base_all_layers = filter_and_score(library, topics, entries, q, "", status, source, window="", sort_by=sort_by)
+    recent_7d_rows = filter_and_score(library, topics, entries, q, "", "active", source, window="7d", sort_by="updated")
+    per_layer_cnt = {lk: 0 for lk in LAYERS}
+    for _, _, it in base_all_layers:
+        if it.layer in per_layer_cnt:
+            per_layer_cnt[it.layer] += 1
+
+    recent_cur = CUR_ATTR if (window == "7d" and not layer) else ""
+    all_cur = CUR_ATTR if (not layer and not window) else ""
+    layer_tabs = [
+        f'<a class="pill-tab pill-tab-recent" href="{escape(query(library=key, q=q, source=source, window="7d"))}"'
+        f'{recent_cur}>⚡ 最近工作 <span class="pill-count">{len(recent_7d_rows)}</span></a>',
+        f'<a class="pill-tab" href="{escape(query(library=key, q=q, status=status, source=source, sort=sort_param))}"'
+        f'{all_cur}>全部 <span class="pill-count">{len(base_all_layers)}</span></a>',
+    ]
+    for lk in LAYERS:
+        active_attr = CUR_ATTR if layer == lk else ""
+        href = query(library=key, q=q, layer=lk, status=status, source=source, sort=sort_param)
+        layer_tabs.append(
+            f'<a class="pill-tab" href="{escape(href)}"{active_attr}>'
+            f'{lk} {LAYER_SHORT[lk]} <span class="pill-count">{per_layer_cnt[lk]}</span></a>'
+        )
+
+    sort_options = [
+        ("updated", "最近更新"),
+        ("created", "最近写入"),
+        ("index", "层级顺序"),
+    ]
+    sort_links = []
+    for skey, slabel in sort_options:
+        s_cur = CUR_ATTR if sort_by == skey else ""
+        s_href = query(
+            library=key,
+            q=q,
+            layer=layer,
+            status=status,
+            source=source,
+            window=window,
+            sort="" if skey == "updated" else skey,
+            topic=topic_path,
+            entry=entry.name,
+        )
+        sort_links.append(f'<a class="sort-link" href="{escape(s_href)}"{s_cur}>{escape(slabel)}</a>')
+    sort_controls_html = f'<nav class="sort-switch" aria-label="排序方式">{"".join(sort_links)}</nav>'
+
+    active_user_cnt = sum(e.status == "active" for e in entries)
+    archived_user_cnt = sum(e.status == "archived" for e in entries)
+    segments = [
+        ("全部", status == "active" and source == "all", query(library=key, q=q, layer=layer)),
+        (f"知识库 ({len(topics)})", status == "active" and source == "index", query(library=key, q=q, layer=layer, source="index")),
+        (f"手记 ({active_user_cnt})", status == "active" and source == "user", query(library=key, q=q, layer=layer, source="user")),
+        (f"归档 ({archived_user_cnt})", status == "archived", query(library=key, q=q, layer=layer, source="user", status="archived")),
+    ]
+    source_tabs = "".join(
+        f'<a class="seg-link" href="{escape(shref)}"{CUR_ATTR if cur else ""}>{escape(slabel)}</a>'
+        for slabel, cur, shref in segments
+    )
+
+    home_link = query(library=key)
+    index_link = query(library=key, view="index") + "#detail-title"
+    new_link = query(library=key, layer=layer, source=source if source in {"index", "user"} else "", view="new") + "#detail-title"
+
+    detail_badges = ""
+    detail_submeta = ""
+    detail_toolbar = ""
+    reader = ""
+    editor_html = ""
+    confirm_dialog_html = ""
+
+    if view == "new":
+        heading = "新建记忆"
+        default_scope = draft_scope or ("user" if source == "user" else "index")
+        default_layer = (
+            topic_draft.layer
+            if topic_draft
+            else (entry.layer if entry.title or entry.body else (layer or "L1"))
+        )
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">支持写入主知识库或个人手记</span></div>'
+        editor_html = render_memory_editor_html(
+            mode="new",
+            scope=default_scope,
+            token=token,
+            library_key=key,
+            layer=default_layer,
+            title=topic_draft.title if topic_draft else entry.title,
+            description=topic_draft.description if topic_draft else entry.description,
+            body=topic_draft.body if topic_draft else entry.body,
+            slug=draft_slug,
+            cancel_link=query(**link_params),
+        )
+    elif view == "edit" and entry.name:
+        heading = f"编辑手记 · {entry.title or entry.name}"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">个人手记区 · user-managed/</span></div>'
+        detail_submeta = f'<p class="detail-path"><code>user-managed/{escape(entry.name)}.md</code></p>'
+        meta_note = (
+            f"<span>当前状态：{STATES[entry.status]} · 类型：{escape(entry.resolved_type())} · "
+            f"上次修改：{escape(entry.updated_at)}</span>"
+            f"<code>user-managed/{escape(entry.name)}.md</code>"
+        )
+        editor_html = render_memory_editor_html(
+            mode="edit",
+            scope="user",
+            token=token,
+            library_key=key,
+            layer=entry.layer,
+            title=entry.title,
+            description=entry.description,
+            body=entry.body,
+            entry_name=entry.name,
+            revision=entry.revision,
+            entry_type=entry.entry_type,
+            cancel_link=query(**link_params, entry=entry.name) + "#detail-title",
+            file_meta_note=meta_note,
+        )
+    elif view == "edit_topic" and (topic_draft or topic_path):
+        try:
+            t_entry = topic_draft if topic_draft is not None else library.read_topic(topic_path, topics)
+            heading = f"编辑记忆 · {t_entry.title}"
+            lname = LAYERS.get(t_entry.layer, ("记忆", "reference", ""))[0]
+            detail_badges = (
+                f'<div class="detail-badges">'
+                f'<span class="layer-badge layer-{t_entry.layer}">{t_entry.layer} · {escape(lname)}</span>'
+                f'<span class="meta-chip">主知识库索引条目</span>'
+                f"</div>"
+            )
+            detail_submeta = f'<p class="detail-path"><code>{escape(t_entry.path)}</code></p>'
+            meta_note = (
+                f"<span>类型：{escape(t_entry.entry_type)} · 保存时将自动同步更新 MEMORY.md</span>"
+                f"<code>{escape(t_entry.path)}</code>"
+            )
+            editor_html = render_memory_editor_html(
+                mode="edit_topic",
+                scope="index",
+                token=token,
+                library_key=key,
+                layer=t_entry.layer,
+                title=t_entry.title,
+                description=t_entry.description,
+                body=t_entry.body,
+                orig_topic=t_entry.path,
+                revision=t_entry.revision,
+                entry_type=t_entry.entry_type,
+                cancel_link=query(**link_params, topic=t_entry.path) + "#detail-title",
+                file_meta_note=meta_note,
+            )
+        except (ValueError, OSError):
+            heading = "无法编辑条目"
+            error = error or "找不到该记忆条目或索引已变更，请从左侧列表重新打开。"
+    elif view == "edit_index":
+        heading = "编辑 MEMORY.md · 记忆维护规则与总索引"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
+        detail_submeta = f'<p class="detail-path"><code>{escape(str(library.index))}</code></p>'
+        try:
+            idx_text, idx_rev = index_draft if index_draft is not None else library.read_index_with_revision()
+            editor_html = render_index_editor_html(
+                token=token,
+                library_key=key,
+                markdown_text=idx_text,
+                revision=idx_rev,
+                cancel_link=query(**link_params, view="index") + "#detail-title",
+                index_path=library.index,
+            )
+        except OSError:
+            error = error or "无法读取 MEMORY.md。"
+    elif entry.name and entry.revision:
+        heading = entry.title
+        lname = LAYERS[entry.layer][0]
+        detail_badges = (
+            f'<div class="detail-badges">'
+            f'<span class="layer-badge layer-{entry.layer}">{entry.layer} · {escape(lname)}</span>'
+            f'<span class="meta-chip">个人手记</span>'
+            f'<span class="meta-chip">类型: {escape(entry.resolved_type())}</span>'
+            f'<span class="meta-chip">{STATES[entry.status]}</span>'
+            f"</div>"
+        )
+        detail_submeta = render_detail_timestamps_html(
+            f"user-managed/{entry.name}.md",
+            entry.created_at,
+            entry.updated_at,
+            now_dt,
+        )
+        edit_href = query(**link_params, entry=entry.name, view="edit") + "#detail-title"
+        toggle_href = query(**link_params, entry=entry.name, raw="" if raw_mode else "1") + "#detail-title"
+        toggle_label = "阅读视图" if raw_mode else "查看源码"
+        act, act_label = ("archive", "归档") if entry.status == "active" else ("restore", "恢复")
+        detail_toolbar = f"""
+          <a class="btn btn-primary btn-compact" href="{escape(edit_href)}">编辑手记</a>
+          <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{toggle_label}</a>
+          <form action="/{act}#feedback" method="post" aria-label="{act_label}当前条目">
+            {hidden("csrf", token)}{hidden("name", entry.name)}{hidden("revision", entry.revision)}
+            {hidden("library", key)}
+            <button class="btn btn-ghost btn-compact" type="submit">{act_label}</button>
+          </form>
+          <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
+        confirm_dialog_html = render_delete_dialog_html(
+            token=token,
+            library_key=key,
+            scope="user",
+            target_id=entry.name,
+            display_path=f"user-managed/{entry.name}.md",
+            revision=entry.revision,
+        )
+        summary_html = (
+            f'<div class="doc-summary-banner">{escape(entry.description)}</div>'
+            if entry.description
+            else ""
+        )
+        body_html = (
+            f'<pre class="markdown-raw">{escape(entry.markdown())}</pre>'
+            if raw_mode
+            else render_markdown_html(
+                entry.body,
+                f"user-managed/{entry.name}.md",
+                library.root,
+                topics,
+                link_params,
+                skip_h1=entry.title,
+            )
+        )
+        reader = summary_html + body_html
+    elif view == "index":
+        heading = "MEMORY.md · 记忆维护规则与总索引"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
+        detail_submeta = f'<p class="detail-path"><code>{escape(str(library.index))}</code></p>'
+        edit_idx_href = query(**link_params, view="edit_index") + "#detail-title"
+        toggle_href = query(**link_params, view="index", raw="" if raw_mode else "1") + "#detail-title"
+        detail_toolbar = (
+            f'<a class="btn btn-primary btn-compact" href="{escape(edit_idx_href)}">编辑 MEMORY.md</a>'
+            f'<a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">'
+            f'{"阅读视图" if raw_mode else "查看源码"}</a>'
+        )
+        reader = (
+            f'<pre class="markdown-raw">{escape(markdown)}</pre>'
+            if raw_mode
+            else render_markdown_html(markdown, "MEMORY.md", library.root, topics, link_params, skip_h1="")
+        )
+    elif topic_path:
+        try:
+            t_entry = library.read_topic(topic_path, topics)
+            detail = library.read_markdown(library.root / t_entry.path)
+            heading = t_entry.title
+            lname = LAYERS[t_entry.layer][0]
+            detail_badges = (
+                f'<div class="detail-badges">'
+                f'<span class="layer-badge layer-{t_entry.layer}">{t_entry.layer} · {escape(lname)}</span>'
+                f'<span class="meta-chip">知识库索引</span>'
+                f'<span class="meta-chip">type: {escape(t_entry.entry_type)}</span>'
+                f"</div>"
+            )
+            detail_submeta = render_detail_timestamps_html(
+                t_entry.path,
+                t_entry.created_at,
+                t_entry.updated_at,
+                now_dt,
+            )
+            edit_topic_href = query(**link_params, topic=t_entry.path, view="edit_topic") + "#detail-title"
+            toggle_href = query(**link_params, topic=t_entry.path, raw="" if raw_mode else "1") + "#detail-title"
+            archive_btn = ""
+            if t_entry.layer != "L4":
+                archive_btn = f"""
+                  <form action="/archive_topic#feedback" method="post" aria-label="归档当前记忆到 L4">
+                    {hidden("csrf", token)}{hidden("library", key)}
+                    {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
+                    <button class="btn btn-ghost btn-compact" type="submit">归档至 L4</button>
+                  </form>"""
+            detail_toolbar = f"""
+              <a class="btn btn-primary btn-compact" href="{escape(edit_topic_href)}">编辑记忆</a>
+              <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
+              {archive_btn}
+              <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
+            confirm_dialog_html = render_delete_dialog_html(
+                token=token,
+                library_key=key,
+                scope="index",
+                target_id=t_entry.path,
+                display_path=t_entry.path,
+                revision=t_entry.revision,
+            )
+            summary_html = (
+                f'<div class="doc-summary-banner">{escape(t_entry.description)}</div>'
+                if t_entry.description
+                else ""
+            )
+            body_html = (
+                f'<pre class="markdown-raw">{escape(detail)}</pre>'
+                if raw_mode
+                else render_markdown_html(
+                    detail,
+                    t_entry.path,
+                    library.root,
+                    topics,
+                    link_params,
+                    skip_h1=t_entry.title,
+                )
+            )
+            reader = summary_html + body_html
+        except (ValueError, OSError):
+            heading = "无法读取条目"
+            error = error or "无法读取该条目，请检查它是否仍在索引和记忆目录中。"
+    else:
+        heading = "记忆库概览"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'
+        reader = render_overview(topics, entries, key)
+
+    feedback = ""
+    if error:
+        feedback = f'<p class="message error" id="feedback" role="alert" tabindex="-1">{escape(error)}</p>'
+    elif notice:
+        feedback = f'<p class="message" id="feedback" role="status" tabindex="-1">{escape(notice)}</p>'
+    unreadable_note = ""
+    if unreadable:
+        names = "、".join(escape(name) for name in unreadable)
+        unreadable_note = f'<p class="message error">无法读取这些文件，请检查格式：{names}</p>'
+
+    search_hidden = (
+        hidden("library", key)
+        + (hidden("layer", layer) if layer else "")
+        + (hidden("source", source) if source != "all" else "")
+        + (hidden("status", status) if status != "active" else "")
+        + (hidden("window", window) if window else "")
+        + (hidden("sort", sort_param) if sort_param else "")
+    )
+    clear_search = (
+        f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=key, layer=layer, source=source, status=status, window=window, sort=sort_param))}">清除</a>'
+        if q
+        else ""
+    )
+    mode_tabs = (
+        f'<a class="mode-tab" href="{escape(query(library=key))}"{CUR_ATTR}>记忆知识库 ({len(topics)})</a>'
+        f'<a class="mode-tab" href="{escape(query(library=key, tab="skills"))}">Skills 技能中心 ({en_sk_cnt}/{len(hub_skills)})</a>'
+    )
+    topbar_cta = (
+        f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>'
+        f'<a class="btn btn-primary" href="{escape(new_link)}"><span aria-hidden="true">＋</span> 新建记忆</a>'
+    )
+
+    return load_template().substitute(
+        library=escape(library.label),
+        home_link=escape(home_link),
+        mode_tabs=mode_tabs,
+        library_nav=library_nav_html(libraries, key),
+        topbar_cta=topbar_cta,
+        search_hidden_fields=search_hidden,
+        search_placeholder="搜索标题、摘要、正文或“最近工作”…",
+        clear_search=clear_search,
+        filter_caption="内容分层与近期动态",
+        layer_tabs="".join(layer_tabs),
+        segment_class="segment-row",
+        source_tabs=source_tabs,
+        list_title="近 7 天活跃" if window == "7d" else "记忆列表",
+        sort_controls=sort_controls_html,
+        index_path=escape(str(library.index)),
+        skills_path=escape(str(library.root / "skills")),
+        folder=escape(str(library.folder)),
+        agent_panel=render_agent_panel(token, key, tab="", agent_home=agent_home),
+        detail_badges=detail_badges,
+        detail_submeta=detail_submeta,
+        detail_toolbar=detail_toolbar,
+        heading=escape(heading),
+        reader=reader,
+        editor=editor_html,
+        confirm_dialog=confirm_dialog_html,
+        feedback=feedback,
+        unreadable=unreadable_note,
+        listing=listing,
+        count=len(rows),
+        q=escape(q),
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format_string, *args):
+        pass
+
+    def setup(self):
+        self.request.settimeout(5)
+        super().setup()
+
+    def respond(self, status, content, mime="text/html; charset=utf-8", location=None):
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'self'; script-src 'self'; base-uri 'none'; "
+            "form-action 'self'; frame-ancestors 'none'",
+        )
+        if location:
+            self.send_header("Location", location)
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+
+    def known_host(self):
+        return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
+
+    def page(self, code=HTTPStatus.OK, entry=Entry(), key="primary", **kwargs):
+        agent_home = getattr(self.server, "agent_home", None)
+        self.respond(
+            code,
+            render(
+                self.server.libraries,
+                key,
+                self.server.token,
+                entry=entry,
+                agent_home=agent_home,
+                **kwargs,
+            ),
+        )
+
+    def do_GET(self):
+        if not self.known_host():
+            self.respond(HTTPStatus.FORBIDDEN, "地址无效。", "text/plain; charset=utf-8")
+            return
+        url = urlsplit(self.path)
+        if url.path == "/style.css":
+            self.respond(HTTPStatus.OK, load_style(), "text/css; charset=utf-8")
+            return
+        if url.path == "/app.js":
+            self.respond(HTTPStatus.OK, load_script(), "application/javascript; charset=utf-8")
+            return
+        if url.path != "/":
+            self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
+            return
+        key = "primary"
+        try:
+            params = parse_qs(url.query, max_num_fields=18)
+            requested_key = params.get("library", ["primary"])[0]
+            if requested_key not in self.server.libraries:
+                raise InvalidEntry("记忆库不存在。")
+            key = requested_key
+            tab = "skills" if params.get("tab", [""])[0] == "skills" else "memory"
+            q = params.get("q", [""])[0].strip()[:120]
+            layer = params.get("layer", [""])[0]
+            status = params.get("status", ["active"])[0]
+            source = params.get("source", ["all"])[0]
+            window = params.get("window", [""])[0]
+            sort_by = params.get("sort", ["updated"])[0]
+            cat = params.get("cat", [""])[0]
+            sk_state = params.get("sk_state", ["all"])[0]
+            skill_slug = params.get("skill", [""])[0]
+            sub_doc = params.get("doc", [""])[0]
+            view = params.get("view", [""])[0]
+            topic_path = params.get("topic", [""])[0]
+            raw_mode = params.get("raw", [""])[0] == "1"
+            if (
+                (layer and layer not in LAYERS)
+                or status not in STATES
+                or source not in SOURCES
+                or window not in {"", "7d"}
+                or sort_by not in {"updated", "created", "index"}
+                or (cat and cat not in SKILL_CATS)
+                or sk_state not in {"all", "enabled", "disabled"}
+                or view not in {"", "new", "edit", "edit_topic", "index", "edit_index"}
+            ):
+                raise InvalidEntry("筛选条件无效。")
+            name = params.get("entry", [""])[0]
+            library = self.server.libraries[key]
+            entry = library.read(name) if (name and tab == "memory") else Entry(layer=layer or "L2")
+        except (ValueError, OSError):
+            self.page(HTTPStatus.BAD_REQUEST, key=key, error="无法打开条目，请重新选择。")
+            return
+        notices = {
+            "saved": "个人手记已保存。",
+            "topic_saved": "记忆已保存并同步更新 MEMORY.md 索引。",
+            "topic_archived": "记忆已移入 L4 事故归档并同步更新索引。",
+            "index_saved": "MEMORY.md 规范与索引已保存。",
+            "deleted": "记忆条目已移除（已在 .state/trash/ 保留安全备份）。",
+            "archived": "手记已归档。",
+            "restored": "手记已恢复生效。",
+            "connected": "客户端记忆与 Skills 已统一同步生效。",
+            "disconnected": "客户端接入已干净移除，原备份已还原。",
+            "doctored": "自检完成，所有可自动修复项已同步对齐。",
+            "skill_enabled": "技能已启用并同步到已连通客户端。",
+            "skill_disabled": "技能已停用并从已连通客户端卸载。",
+        }
+        notice = notices.get(params.get("notice", [""])[0], "")
+        self.page(
+            entry=entry,
+            key=key,
+            tab=tab,
+            q=q,
+            layer=layer,
+            status=status,
+            source=source,
+            window=window,
+            sort_by=sort_by,
+            cat=cat,
+            sk_state=sk_state,
+            skill_slug=skill_slug,
+            sub_doc=sub_doc,
+            view=view,
+            topic_path=topic_path,
+            raw_mode=raw_mode,
+            notice=notice,
+        )
+
+    def do_POST(self):
+        origin = self.headers.get("Origin")
+        expected_origin = f"http://127.0.0.1:{self.server.server_port}"
+        if not self.known_host() or (origin and origin != expected_origin):
+            self.respond(HTTPStatus.FORBIDDEN, "请求来源无效。", "text/plain; charset=utf-8")
+            return
+        allowed_routes = {
+            "/save",
+            "/save_index",
+            "/archive_topic",
+            "/delete",
+            "/archive",
+            "/restore",
+            "/agent",
+            "/doctor",
+            "/skill",
+        }
+        if self.path not in allowed_routes:
+            self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
+            return
+        if self.headers.get_content_type() != "application/x-www-form-urlencoded":
+            self.page(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, error="请使用页面上的表单。")
+            return
+        try:
+            size = int(self.headers.get("Content-Length", ""))
+            if not 0 < size <= MAX_POST:
+                raise ValueError
+            params = parse_qs(
+                self.rfile.read(size).decode("utf-8"),
+                keep_blank_values=True,
+                max_num_fields=20,
+                errors="strict",
+            )
+            if any(len(values) != 1 for values in params.values()):
+                raise ValueError
+            fields = {k: v[0] for k, v in params.items()}
+        except (ValueError, TimeoutError):
+            self.page(HTTPStatus.BAD_REQUEST, error="表单无效或超出大小限制。")
+            return
+        if not secrets.compare_digest(
+            fields.get("csrf", "").encode("utf-8"), self.server.token.encode("ascii")
+        ):
+            self.respond(HTTPStatus.FORBIDDEN, "请刷新页面后重试。", "text/plain; charset=utf-8")
+            return
+
+        if self.path in {"/agent", "/doctor", "/skill"}:
+            self.handle_control_action(fields)
+            return
+        if self.path == "/save_index":
+            self.handle_save_index(fields)
+            return
+        if self.path == "/archive_topic":
+            self.handle_archive_topic(fields)
+            return
+        if self.path == "/delete":
+            self.handle_delete(fields)
+            return
+        self.update_entry(fields)
+
+    def handle_control_action(self, fields):
+        import memoryctl
+
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            key = "primary"
+        return_tab = "skills" if fields.get("tab") == "skills" or self.path == "/skill" else ""
+        agent_home = getattr(self.server, "agent_home", None)
+        try:
+            if self.path == "/skill":
+                folder = fields.get("folder", "")
+                op = fields.get("op", "")
+                if op not in {"enable", "disable"}:
+                    raise InvalidEntry("不支持的技能操作。")
+                memoryctl.set_skill_enabled(folder, op == "enable", home=agent_home)
+                notice = "skill_enabled" if op == "enable" else "skill_disabled"
+                loc = query(
+                    library=key,
+                    tab="skills",
+                    skill="" if folder == "all" else folder,
+                    notice=notice,
+                )
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/doctor":
+                report = memoryctl.run_doctor(fix=True, home=agent_home)
+                errs = [f["detail"] for f in report["findings"] if f["severity"] == "error"]
+                if errs:
+                    self.page(
+                        HTTPStatus.UNPROCESSABLE_ENTITY,
+                        key=key,
+                        tab=return_tab or "memory",
+                        error="自检发现异常：" + "；".join(errs),
+                    )
+                    return
+                notice = "doctored"
+            else:
+                target = fields.get("target", "all")
+                op = fields.get("op", "")
+                targets = memoryctl.resolve_targets(target, home=agent_home)
+                if op == "connect":
+                    for aid, spec in targets:
+                        memoryctl.connect_agent(aid, spec)
+                    notice = "connected"
+                elif op == "disconnect":
+                    for aid, spec in targets:
+                        memoryctl.disconnect_agent(aid, spec)
+                    notice = "disconnected"
+                else:
+                    raise InvalidEntry("不支持的控制操作。")
+        except (RuntimeError, ValueError, OSError, SystemExit) as exc:
+            self.page(
+                HTTPStatus.CONFLICT,
+                key=key,
+                tab=return_tab or "memory",
+                error=f"操作未完成：{exc}",
+            )
+            return
+        location = query(library=key, tab=return_tab, notice=notice)
+        self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
+
+    def handle_save_index(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        body = fields.get("body", "")
+        revision = fields.get("revision", "")
+        try:
+            library.save_index_markdown(body, revision)
+        except StaleEntry:
+            self.page(
+                HTTPStatus.CONFLICT,
+                key=key,
+                view="edit_index",
+                index_draft=(body, revision),
+                error="保存冲突：MEMORY.md 已被其他进程更新，请先复制当前内容再刷新重开。",
+            )
+            return
+        except InvalidEntry as exc:
+            self.page(
+                HTTPStatus.BAD_REQUEST,
+                key=key,
+                view="edit_index",
+                index_draft=(body, revision),
+                error=str(exc),
+            )
+            return
+        except OSError:
+            self.page(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                key=key,
+                view="edit_index",
+                index_draft=(body, revision),
+                error="写入 MEMORY.md 失败，请检查文件权限。",
+            )
+            return
+        loc = query(library=key, view="index", notice="index_saved")
+        self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def handle_archive_topic(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        topic_path = fields.get("topic", "")
+        revision = fields.get("revision", "")
+        try:
+            new_rel = library.archive_topic(topic_path, revision)
+        except StaleEntry:
+            self.page(
+                HTTPStatus.CONFLICT,
+                key=key,
+                topic_path=topic_path,
+                error="归档冲突：该条目内容或索引刚发生变化，请刷新后再试。",
+            )
+            return
+        except (InvalidEntry, OSError) as exc:
+            self.page(HTTPStatus.BAD_REQUEST, key=key, topic_path=topic_path, error=str(exc))
+            return
+        loc = query(library=key, topic=new_rel, notice="topic_archived")
+        self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def handle_delete(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        scope = fields.get("scope", "")
+        target = fields.get("target", "")
+        revision = fields.get("revision", "")
+        try:
+            if scope == "index":
+                library.delete_topic(target, revision)
+            elif scope == "user":
+                library.delete_user_entry(target, revision)
+            else:
+                raise InvalidEntry("未知的删除目标类型。")
+        except StaleEntry:
+            self.page(
+                HTTPStatus.CONFLICT,
+                key=key,
+                error="删除冲突：该记忆刚刚被修改或已不存在，请刷新后重试。",
+            )
+            return
+        except (InvalidEntry, OSError) as exc:
+            self.page(HTTPStatus.BAD_REQUEST, key=key, error=str(exc))
+            return
+        loc = query(library=key, notice="deleted")
+        self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def update_entry(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        saving = self.path == "/save"
+        scope = fields.get("scope", "user") if saving else "user"
+
+        if saving and scope == "index":
+            orig_topic = fields.get("orig_topic", "").strip()
+            revision = fields.get("revision", "")
+            layer = fields.get("layer", "L1")
+            title = fields.get("title", "").strip()
+            description = fields.get("description", "").strip()
+            body = fields.get("body", "").replace("\r\n", "\n").replace("\r", "\n")
+            slug = fields.get("slug", "").strip()
+            entry_type = fields.get("entry_type", "").strip()
+            draft = TopicEntry(
+                path=orig_topic,
+                slug=Path(orig_topic).stem if orig_topic else slug,
+                title=title,
+                description=description,
+                layer=layer if layer in LAYERS else "L1",
+                entry_type=entry_type or LAYERS.get(layer, ("", "reference", ""))[1],
+                body=body,
+                revision=revision,
+            )
+            err_view = "edit_topic" if orig_topic else "new"
+            try:
+                saved_rel = library.save_topic(
+                    orig_path=orig_topic,
+                    expected_revision=revision,
+                    layer=layer,
+                    title=title,
+                    description=description,
+                    body=body,
+                    slug=slug,
+                    entry_type=entry_type,
+                )
+            except StaleEntry:
+                self.page(
+                    HTTPStatus.CONFLICT,
+                    key=key,
+                    view=err_view,
+                    topic_path=orig_topic,
+                    topic_draft=draft,
+                    draft_scope="index",
+                    draft_slug=slug,
+                    error="保存冲突：该记忆或 MEMORY.md 索引刚刚被更新。请先复制你编辑的内容，刷新条目后再粘贴保存。",
+                )
+                return
+            except InvalidEntry as exc:
+                self.page(
+                    HTTPStatus.BAD_REQUEST,
+                    key=key,
+                    view=err_view,
+                    topic_path=orig_topic,
+                    topic_draft=draft,
+                    draft_scope="index",
+                    draft_slug=slug,
+                    error=str(exc),
+                )
+                return
+            except OSError:
+                self.page(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    key=key,
+                    view=err_view,
+                    topic_path=orig_topic,
+                    topic_draft=draft,
+                    draft_scope="index",
+                    draft_slug=slug,
+                    error="写入失败，请检查目录权限或磁盘空间。",
+                )
+                return
+            loc = query(library=key, topic=saved_rel, notice="topic_saved")
+            self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+            return
+
+        name = fields.get("name", "")
+        revision = fields.get("revision", "")
+        entry = Entry()
+        view = "edit" if (saving and name) else ("new" if saving else "")
+        if saving:
+            entry = Entry(
+                name=name,
+                revision=revision,
+                title=fields.get("title", "").strip(),
+                description=fields.get("description", "").strip(),
+                layer=fields.get("layer", ""),
+                body=fields.get("body", "").replace("\r\n", "\n").replace("\r", "\n"),
+            )
+        try:
+            current = library.read(name) if name else Entry()
+            if saving:
+                preserved_type = (
+                    current.entry_type
+                    if current.entry_type in ALLOWED_LAYER_TYPES.get(entry.layer, set())
+                    else ""
+                )
+                entry = replace(
+                    entry,
+                    entry_type=preserved_type,
+                    status=current.status,
+                    updated_at=current.updated_at,
+                )
+            if current.revision != revision:
+                raise StaleEntry
+            ts_now = mcp_server.now_iso()
+            if saving:
+                validate_common_fields(entry.layer, entry.title, entry.description, entry.body)
+                new_name = fields.get("create_id", "")
+                if not name and not re.fullmatch(r"entry-[a-f0-9]{20}", new_name):
+                    raise InvalidEntry("无法识别新条目，请刷新页面后重试。")
+                cre_at = current.created_at if name else ts_now
+                entry = replace(entry, name=name or new_name, created_at=cre_at, updated_at=ts_now)
+                notice = "saved"
+            else:
+                if not name:
+                    raise InvalidEntry("请选择一条记忆。")
+                state = "archived" if self.path == "/archive" else "active"
+                entry = replace(current, status=state, updated_at=ts_now)
+                notice = "archived" if state == "archived" else "restored"
+            library.save(entry)
+        except (StaleEntry, FileNotFoundError, FileExistsError):
+            self.page(
+                HTTPStatus.CONFLICT,
+                entry=entry,
+                key=key,
+                view=view,
+                draft_scope="user",
+                error="保存冲突：条目已变化或表单已提交。可复制当前输入，再从列表重新打开条目。",
+            )
+            return
+        except InvalidEntry as exc:
+            if entry.layer not in LAYERS:
+                entry = replace(entry, layer="L2")
+            self.page(
+                HTTPStatus.BAD_REQUEST,
+                entry=entry,
+                key=key,
+                view=view,
+                draft_scope="user",
+                error=str(exc),
+            )
+            return
+        except (OSError, ValueError):
+            self.page(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                entry=entry,
+                key=key,
+                view=view,
+                draft_scope="user",
+                error="写入失败。请检查目录权限或 Markdown 文件格式。",
+            )
+            return
+        location = query(library=key, entry=entry.name, status=entry.status, notice=notice)
+        self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--memory-root", type=Path, default=data_root())
+    parser.add_argument("--also-root", type=Path, help="同一页面可切换到的本机记忆库")
+    parser.add_argument("--port", type=int, default=8765, help="端口，0 表示自动选择")
+    args = parser.parse_args()
+    try:
+        primary = data_root(args.memory_root).resolve(strict=True)
+        os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
+        primary_label = "统一本地记忆"
+        libraries = {"primary": Library(primary, primary_label)}
+        if args.also_root:
+            alternate = Library(args.also_root, "对照记忆库")
+            if alternate.root != primary:
+                libraries["local"] = alternate
+        server = HTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            parser.exit(
+                2,
+                f"端口 127.0.0.1:{args.port} 已在运行服务，可直接访问 http://127.0.0.1:{args.port}/ "
+                f"（如需另起实例可加 --port 8766）。\n",
+            )
+        parser.exit(2, f"{exc}\n")
+    except ValueError as exc:
+        parser.exit(2, f"{exc}\n")
+    with server:
+        server.libraries = libraries
+        server.token = secrets.token_urlsafe(32)
+        server.agent_home = None
+        print(f"http://127.0.0.1:{server.server_port}/", flush=True)
+        for library in libraries.values():
+            print(f"{library.label}: {library.index}", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()

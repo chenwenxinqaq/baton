@@ -1,0 +1,1008 @@
+#!/usr/bin/env python3
+"""Zero-dependency MCP stdio server for the unified L0-L4 Markdown memory library."""
+
+import argparse
+from contextlib import contextmanager
+from datetime import date, datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from tempfile import NamedTemporaryFile
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+from library_paths import data_root
+
+DEFAULT_ROOT = data_root()
+LAYER_DIRS = {
+    "L0": "constraints",
+    "L1": "methods",
+    "L2": "preferences",
+    "L3": "projects",
+    "L4": "archive",
+}
+LAYER_DEFAULT_TYPE = {
+    "L0": "feedback",
+    "L1": "reference",
+    "L2": "feedback",
+    "L3": "project",
+    "L4": "reference",
+}
+ALLOWED_LAYER_TYPES = {
+    "L0": {"feedback", "reference"},
+    "L1": {"reference"},
+    "L2": {"feedback"},
+    "L3": {"project"},
+    "L4": {"reference"},
+}
+VALID_TOPIC_TYPES = {"user", "feedback", "project", "reference"}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+INDEX_LAYER_RE = re.compile(r"^## (L[0-4])(?:\s|$)")
+INDEX_LINK_RE = re.compile(
+    r"^\s*[-*+]\s+\[(.+?)\]\((?:<([^>]+)>|([^\s()]+))\)(?:\s+[—–-]\s+(.+))?$"
+)
+CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+ALNUM_RUN_RE = re.compile(r"[a-z0-9_.-]{2,}")
+TEMPORAL_CUE_RE = re.compile(
+    r"(刚刚|刚才|最近|最新|近期|今天|今日|昨天|本周|这周|近期工作|最近工作|最近进展|recent|latest|today)",
+    re.IGNORECASE,
+)
+TEMPORAL_STOP_RE = re.compile(
+    r"(刚刚|刚才|最近|最新|近期|今天|今日|昨天|本周|这周|做了什么|干了什么|改了什么|写了什么|"
+    r"有什么|有哪些|进展|动态|工作|项目|记忆|记录|更新|写入|recent|latest|work|today|what)",
+    re.IGNORECASE,
+)
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+DEFAULT_PROTOCOL = "2024-11-05"
+
+
+def now_iso():
+    """Return local timezone-aware ISO 8601 timestamp with second precision."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def local_tz():
+    """Return current system local tzinfo."""
+    return datetime.now().astimezone().tzinfo
+
+
+def parse_timestamp(ts_str, fallback_epoch=None):
+    """Parse ISO 8601 datetime or YYYY-MM-DD date into (aware_datetime, has_clock_time)."""
+    tz = local_tz()
+    s = (ts_str or "").strip()
+    if s:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            d = date.fromisoformat(s)
+            return datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=tz), False
+        iso_norm = s[:-1] + "+00:00" if s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso_norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        else:
+            dt = dt.astimezone(tz)
+        return dt, True
+    if fallback_epoch is not None:
+        return datetime.fromtimestamp(fallback_epoch, tz=tz), True
+    return datetime.now().astimezone(), True
+
+
+def file_timestamps(md_path, meta):
+    """Resolve (created_at_str, updated_at_str, created_epoch, updated_epoch) for a file."""
+    st = md_path.stat()
+    mtime_epoch = st.st_mtime
+    btime_epoch = min(getattr(st, "st_birthtime", mtime_epoch), mtime_epoch)
+
+    raw_upd = str(meta.get("updated_at") or "").strip()
+    raw_cre = str(meta.get("created_at") or "").strip()
+
+    try:
+        upd_dt, upd_has_time = parse_timestamp(raw_upd, fallback_epoch=mtime_epoch)
+    except ValueError:
+        upd_dt, upd_has_time = parse_timestamp("", fallback_epoch=mtime_epoch)
+        raw_upd = ""
+
+    try:
+        if raw_cre:
+            cre_dt, cre_has_time = parse_timestamp(raw_cre, fallback_epoch=btime_epoch)
+        else:
+            cre_dt, cre_has_time = parse_timestamp("", fallback_epoch=btime_epoch)
+            if cre_dt > upd_dt:
+                cre_dt, cre_has_time = upd_dt, upd_has_time
+    except ValueError:
+        cre_dt, cre_has_time = upd_dt, upd_has_time
+        raw_cre = ""
+
+    if cre_dt > upd_dt:
+        cre_dt, cre_has_time = upd_dt, upd_has_time
+
+    upd_out = raw_upd if raw_upd else (upd_dt.isoformat(timespec="seconds") if upd_has_time else upd_dt.strftime("%Y-%m-%d"))
+    cre_out = raw_cre if raw_cre else (cre_dt.isoformat(timespec="seconds") if cre_has_time else cre_dt.strftime("%Y-%m-%d"))
+    return cre_out, upd_out, cre_dt.timestamp(), upd_dt.timestamp()
+
+
+def is_newly_created(created_at_str, updated_at_str):
+    """Return True when updated_at is effectively the initial creation timestamp."""
+    if not created_at_str or not updated_at_str:
+        return True
+    if created_at_str == updated_at_str:
+        return True
+    try:
+        cre_dt, cre_has_time = parse_timestamp(created_at_str)
+        upd_dt, upd_has_time = parse_timestamp(updated_at_str)
+    except ValueError:
+        return False
+    if not cre_has_time and not upd_has_time:
+        return cre_dt.date() == upd_dt.date()
+    return abs((upd_dt - cre_dt).total_seconds()) < 600
+
+
+def format_relative_zh(ts_str, now_dt=None):
+    """Format a timestamp string into (relative_zh, full_display, machine_datetime)."""
+    now_dt = now_dt or datetime.now().astimezone()
+    try:
+        dt, has_time = parse_timestamp(ts_str)
+    except ValueError:
+        return "未知时间", ts_str or "", ts_str or ""
+
+    days_diff = (now_dt.date() - dt.date()).days
+    if has_time:
+        diff_sec = max(0.0, (now_dt - dt).total_seconds())
+        full_disp = dt.strftime("%Y-%m-%d %H:%M")
+        iso_attr = dt.isoformat(timespec="seconds")
+        if diff_sec < 60:
+            rel = "刚刚"
+        elif diff_sec < 3600:
+            rel = f"{int(diff_sec // 60)}分钟前"
+        elif diff_sec < 86400 and days_diff == 0:
+            rel = f"{int(diff_sec // 3600)}小时前"
+        elif days_diff == 1 or (diff_sec < 86400 and days_diff <= 1):
+            rel = f"昨天 {dt.strftime('%H:%M')}"
+        elif days_diff < 7:
+            rel = f"{days_diff}天前"
+        elif days_diff < 30:
+            rel = f"{max(1, days_diff // 7)}周前"
+        elif days_diff < 365:
+            rel = f"{max(1, days_diff // 30)}个月前"
+        else:
+            rel = f"{max(1, days_diff // 365)}年前"
+        return rel, full_disp, iso_attr
+
+    full_disp = dt.strftime("%Y-%m-%d")
+    iso_attr = full_disp
+    if days_diff <= 0:
+        rel = "今天"
+    elif days_diff == 1:
+        rel = "昨天"
+    elif days_diff < 7:
+        rel = f"{days_diff}天前"
+    elif days_diff < 30:
+        rel = f"{max(1, days_diff // 7)}周前"
+    elif days_diff < 365:
+        rel = f"{max(1, days_diff // 30)}个月前"
+    else:
+        rel = f"{max(1, days_diff // 365)}年前"
+    return rel, full_disp, iso_attr
+
+
+def parse_frontmatter(text):
+    """Extract simple YAML/JSON-style key: value frontmatter and remaining body."""
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
+        return {}, normalized
+    header, sep, body = normalized[4:].partition("\n---\n")
+    if not sep:
+        return {}, normalized
+    fields = {}
+    for line in header.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, colon, raw_val = line.partition(":")
+        if not colon:
+            continue
+        key = key.strip()
+        val = raw_val.strip()
+        if val.startswith('"') and val.endswith('"'):
+            try:
+                val = json.loads(val)
+            except json.JSONDecodeError:
+                val = val[1:-1]
+        fields[key] = val
+    return fields, body.lstrip("\n")
+
+
+def extract_title(body, fallback):
+    """Extract first Markdown H1 heading if present."""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return fallback
+
+
+def first_summary_snippet(body):
+    """Extract first informative non-heading line as snippet."""
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("```"):
+            return s[:240]
+    return ""
+
+
+def atomic_write(path, content):
+    """Atomically write UTF-8 text to path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".tmp-", delete=False
+        ) as handle:
+            staged = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.replace(path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+def build_query_features(query):
+    """Extract whitespace terms plus CJK bigrams/subtokens for partial phrase recall."""
+    q_cf = query.strip().casefold()
+    raw_terms = [t for t in q_cf.split() if t]
+    subtokens = []
+    seen = set()
+    for term in raw_terms:
+        for run in ALNUM_RUN_RE.findall(term):
+            if run not in seen:
+                seen.add(run)
+                subtokens.append(run)
+        for cjk in CJK_RUN_RE.findall(term):
+            if len(cjk) == 2:
+                if cjk not in seen:
+                    seen.add(cjk)
+                    subtokens.append(cjk)
+            else:
+                for idx in range(len(cjk) - 1):
+                    bg = cjk[idx : idx + 2]
+                    if bg not in seen:
+                        seen.add(bg)
+                        subtokens.append(bg)
+    return raw_terms, subtokens
+
+
+def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
+    """Score an entry against exact query terms and fallback CJK bigrams."""
+    score = 0
+    matched_terms = []
+    for term in raw_terms:
+        hit = False
+        if term in name_cf or term in title_cf:
+            score += 8
+            hit = True
+        if term in desc_cf:
+            score += 5
+            hit = True
+        if term in body_cf:
+            score += 2
+            hit = True
+        if hit:
+            matched_terms.append(term)
+
+    if score > 0 or not subtokens:
+        return score, matched_terms
+
+    sub_hits = []
+    sub_score = 0
+    for tok in subtokens:
+        hit = False
+        if tok in name_cf or tok in title_cf:
+            sub_score += 3
+            hit = True
+        if tok in desc_cf:
+            sub_score += 2
+            hit = True
+        if tok in body_cf:
+            sub_score += 1
+            hit = True
+        if hit:
+            sub_hits.append(tok)
+
+    min_required = 1 if len(subtokens) == 1 else max(2, (len(subtokens) + 1) // 2)
+    if len(sub_hits) >= min_required:
+        return sub_score, sub_hits
+    return 0, []
+
+
+class MemoryStore:
+    """Read, search, upsert, and archive entries in the L0-L4 Markdown library."""
+
+    def __init__(self, root):
+        self.root = data_root(root).resolve(strict=True)
+        self.index_path = self.root / "MEMORY.md"
+        if not self.index_path.is_file():
+            raise ValueError(f"MEMORY.md not found under {self.root}")
+        self.lock_path = self.root / ".state" / "library.lock"
+
+    @contextmanager
+    def write_lock(self):
+        """Serialize concurrent writes across multiple MCP servers and Web UI."""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def resolve_safe(self, rel_path):
+        """Resolve a relative path and enforce confinement inside self.root."""
+        candidate = (self.root / rel_path).resolve()
+        if not candidate.is_relative_to(self.root):
+            raise ValueError("Path escapes memory root.")
+        return candidate
+
+    def parse_index(self):
+        """Parse L0-L4 index entries from MEMORY.md."""
+        text = self.index_path.read_text(encoding="utf-8")
+        entries = {}
+        current_layer = ""
+        for line in text.splitlines():
+            if line.startswith("#"):
+                m = INDEX_LAYER_RE.match(line)
+                current_layer = m.group(1) if m else ""
+                continue
+            if not current_layer:
+                continue
+            m = INDEX_LINK_RE.match(line)
+            if not m:
+                continue
+            title, angled, plain, desc = m.groups()
+            target = (angled or plain or "").strip()
+            entries[target] = {
+                "layer": current_layer,
+                "title": title.strip(),
+                "description": (desc or "").strip(),
+                "path": target,
+            }
+        return entries
+
+    def collect_entries(self, include_archived=False):
+        """Collect all indexed and user-managed memory entries with metadata and timestamps."""
+        indexed = self.parse_index()
+        items = []
+
+        for layer, folder in LAYER_DIRS.items():
+            dir_path = self.root / folder
+            if not dir_path.is_dir():
+                continue
+            for md in sorted(dir_path.glob("*.md")):
+                if md.name == "README.md":
+                    continue
+                rel = md.relative_to(self.root).as_posix()
+                raw = md.read_text(encoding="utf-8")
+                meta, body = parse_frontmatter(raw)
+                cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
+                idx = indexed.get(rel, {})
+                items.append(
+                    {
+                        "path": rel,
+                        "source": "index",
+                        "layer": idx.get("layer", layer),
+                        "name": meta.get("name", md.stem),
+                        "title": idx.get("title") or extract_title(body, md.stem),
+                        "description": meta.get("description") or idx.get("description", ""),
+                        "type": meta.get("type", LAYER_DEFAULT_TYPE[layer]),
+                        "status": meta.get("status", "active"),
+                        "created_at": cre_at,
+                        "updated_at": upd_at,
+                        "created_epoch": cre_ep,
+                        "updated_epoch": upd_ep,
+                        "body": body,
+                    }
+                )
+
+        user_dir = self.root / "user-managed"
+        if user_dir.is_dir():
+            for md in sorted(user_dir.glob("*.md")):
+                if md.name == "README.md":
+                    continue
+                rel = md.relative_to(self.root).as_posix()
+                raw = md.read_text(encoding="utf-8")
+                meta, body = parse_frontmatter(raw)
+                status = meta.get("status", "active")
+                if status == "archived" and not include_archived:
+                    continue
+                cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
+                items.append(
+                    {
+                        "path": rel,
+                        "source": "user-managed",
+                        "layer": meta.get("layer", "L2"),
+                        "name": meta.get("name", md.stem),
+                        "title": meta.get("title") or extract_title(body, md.stem),
+                        "description": meta.get("description", ""),
+                        "type": meta.get("type", "feedback"),
+                        "status": status,
+                        "created_at": cre_at,
+                        "updated_at": upd_at,
+                        "created_epoch": cre_ep,
+                        "updated_epoch": upd_ep,
+                        "body": body,
+                    }
+                )
+
+        if include_archived:
+            return items
+        return [item for item in items if item.get("status", "active") != "archived"]
+
+    def search(self, query, layer="", include_archived=False, limit=10):
+        """Search entries by query terms, CJK bigrams, and temporal recency cues."""
+        capped_limit = max(1, min(int(limit), 50))
+        q_stripped = query.strip()
+        if not q_stripped:
+            return self.list_entries(layer=layer, include_archived=include_archived, sort="updated")[:capped_limit]
+
+        has_temporal_cue = bool(TEMPORAL_CUE_RE.search(q_stripped))
+        residual_query = TEMPORAL_STOP_RE.sub(" ", q_stripped).strip() if has_temporal_cue else q_stripped
+
+        all_items = [
+            it for it in self.collect_entries(include_archived=include_archived)
+            if not layer or it["layer"] == layer
+        ]
+
+        # Pure temporal query (e.g. "刚刚做了什么", "最近工作", "最近进展"): return most recently updated active work
+        if has_temporal_cue and not residual_query:
+            candidates = (
+                all_items
+                if (include_archived or layer == "L4")
+                else [it for it in all_items if it["layer"] != "L4"] or all_items
+            )
+            candidates.sort(key=lambda it: (-it["updated_epoch"], it["layer"], it["path"]))
+            return [
+                {
+                    "score": 10,
+                    "path": it["path"],
+                    "source": it["source"],
+                    "layer": it["layer"],
+                    "title": it["title"],
+                    "description": it["description"],
+                    "status": it["status"],
+                    "created_at": it["created_at"],
+                    "updated_at": it["updated_at"],
+                    "snippet": first_summary_snippet(it["body"]),
+                }
+                for it in candidates[:capped_limit]
+            ]
+
+        effective_q = residual_query if (has_temporal_cue and residual_query) else q_stripped
+        raw_terms, subtokens = build_query_features(effective_q)
+        now_ep = datetime.now().astimezone().timestamp()
+
+        results = []
+        for item in all_items:
+            score, matched = score_fields(
+                raw_terms,
+                subtokens,
+                item["name"].casefold(),
+                item["title"].casefold(),
+                item["description"].casefold(),
+                item["body"].casefold(),
+            )
+            if score == 0:
+                continue
+
+            if has_temporal_cue:
+                age_sec = max(0.0, now_ep - item["updated_epoch"])
+                if age_sec <= 86400:
+                    score += 6
+                elif age_sec <= 7 * 86400:
+                    score += 3
+
+            snippet = ""
+            for line in item["body"].splitlines():
+                line_cf = line.casefold()
+                if any(tok in line_cf for tok in matched):
+                    snippet = line.strip()[:240]
+                    break
+
+            results.append(
+                {
+                    "score": score,
+                    "path": item["path"],
+                    "source": item["source"],
+                    "layer": item["layer"],
+                    "title": item["title"],
+                    "description": item["description"],
+                    "status": item["status"],
+                    "created_at": item["created_at"],
+                    "updated_at": item["updated_at"],
+                    "_updated_epoch": item["updated_epoch"],
+                    "snippet": snippet or first_summary_snippet(item["body"]),
+                }
+            )
+
+        results.sort(key=lambda r: (-r["score"], -r["_updated_epoch"], r["layer"], r["path"]))
+        for r in results:
+            r.pop("_updated_epoch", None)
+        return results[:capped_limit]
+
+    def list_entries(self, layer="", include_archived=False, sort="updated"):
+        """List entries optionally filtered by layer and sorted by updated/created/layer."""
+        collected = [
+            it for it in self.collect_entries(include_archived=include_archived)
+            if not layer or it["layer"] == layer
+        ]
+        if sort == "created":
+            collected.sort(key=lambda it: (-it["created_epoch"], -it["updated_epoch"], it["path"]))
+        elif sort == "layer":
+            collected.sort(key=lambda it: (it["layer"], -it["updated_epoch"], it["path"]))
+        else:
+            collected.sort(key=lambda it: (-it["updated_epoch"], it["layer"], it["path"]))
+
+        return [
+            {
+                "path": item["path"],
+                "source": item["source"],
+                "layer": item["layer"],
+                "title": item["title"],
+                "description": item["description"],
+                "status": item["status"],
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+            }
+            for item in collected
+        ]
+
+    def read_entry(self, rel_path):
+        """Read a Markdown file inside the memory root."""
+        target = self.resolve_safe(rel_path)
+        if not target.is_file() or target.suffix.lower() != ".md":
+            raise ValueError(f"Not a readable markdown file: {rel_path}")
+        return {
+            "path": target.relative_to(self.root).as_posix(),
+            "content": target.read_text(encoding="utf-8"),
+        }
+
+    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False):
+        """Create or update a memory entry under lock and synchronize MEMORY.md index."""
+        if layer not in LAYER_DIRS:
+            raise ValueError(f"Invalid layer: {layer}. Expected L0-L4.")
+        if not NAME_RE.fullmatch(name) or name.lower() == "readme":
+            raise ValueError("name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ and not be 'readme'.")
+        title = title.strip()
+        description = description.strip()
+        body = body.strip()
+        if not title or "\n" in title:
+            raise ValueError("title must be a single non-empty line.")
+        if "\n" in description:
+            raise ValueError("description must be a single line.")
+        if not body:
+            raise ValueError("body must not be empty.")
+
+        resolved_type = topic_type or LAYER_DEFAULT_TYPE[layer]
+        allowed_types = ALLOWED_LAYER_TYPES[layer] if user_managed else VALID_TOPIC_TYPES
+        if resolved_type not in allowed_types:
+            raise ValueError(f"type '{resolved_type}' is invalid for {layer}.")
+
+        ts_now = now_iso()
+        with self.write_lock():
+            if user_managed:
+                target = self.root / "user-managed" / f"{name}.md"
+                status = "active"
+                cre_at = ts_now
+                if target.is_file():
+                    old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
+                    status = old_meta.get("status", "active")
+                    cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
+                    if not topic_type and old_meta.get("type") in ALLOWED_LAYER_TYPES[layer]:
+                        resolved_type = old_meta["type"]
+                meta = {
+                    "name": name,
+                    "title": title,
+                    "description": description,
+                    "type": resolved_type,
+                    "layer": layer,
+                    "status": status,
+                    "created_at": cre_at,
+                    "updated_at": ts_now,
+                }
+                header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
+                atomic_write(target, f"---\n{header}\n---\n\n{body}\n")
+                return {
+                    "path": target.relative_to(self.root).as_posix(),
+                    "indexed": False,
+                    "created_at": cre_at,
+                    "updated_at": ts_now,
+                }
+
+            folder = LAYER_DIRS[layer]
+            target = self.root / folder / f"{name}.md"
+            rel_path = f"{folder}/{name}.md"
+
+            # Find any existing entry (in target layer or another layer) to preserve created_at
+            stale_files = []
+            preserved_created = None
+            if target.is_file():
+                old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
+                preserved_created, _, _, _ = file_timestamps(target, old_meta)
+            for other_layer, other_folder in LAYER_DIRS.items():
+                if other_layer == layer:
+                    continue
+                stale = self.root / other_folder / f"{name}.md"
+                if stale.is_file():
+                    if preserved_created is None:
+                        s_meta, _ = parse_frontmatter(stale.read_text(encoding="utf-8"))
+                        preserved_created, _, _, _ = file_timestamps(stale, s_meta)
+                    stale_files.append((stale, f"{other_folder}/{name}.md"))
+
+            cre_at = preserved_created or ts_now
+            desc_val = json.dumps(description or title, ensure_ascii=False)
+            formatted_body = body if body.lstrip().startswith("# ") else f"# {title}\n\n{body}"
+            content = (
+                f"---\n"
+                f"name: {name}\n"
+                f"description: {desc_val}\n"
+                f"type: {resolved_type}\n"
+                f"created_at: {json.dumps(cre_at)}\n"
+                f"updated_at: {json.dumps(ts_now)}\n"
+                f"---\n\n"
+                f"{formatted_body}\n"
+            )
+
+            # Crash-safe multi-file update: snapshot MEMORY.md & target so any error rolls back both cleanly
+            prev_target_bytes = target.read_bytes() if target.is_file() else None
+            prev_index_text = self.index_path.read_text(encoding="utf-8")
+            atomic_write(target, content)
+            try:
+                for _, stale_rel in stale_files:
+                    self._remove_index_line(stale_rel)
+                self._upsert_index_line(layer, title, rel_path, description or title)
+            except Exception:
+                if prev_target_bytes is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    atomic_write(target, prev_target_bytes.decode("utf-8"))
+                try:
+                    atomic_write(self.index_path, prev_index_text)
+                except OSError:
+                    pass
+                raise
+
+            migrated_from = []
+            for stale_path, stale_rel in stale_files:
+                stale_path.unlink(missing_ok=True)
+                migrated_from.append(stale_rel)
+
+            res = {
+                "path": rel_path,
+                "indexed": True,
+                "created_at": cre_at,
+                "updated_at": ts_now,
+            }
+            if migrated_from:
+                res["migrated_from"] = migrated_from
+            return res
+
+    def _remove_index_line(self, rel_path):
+        """Remove any index line referencing rel_path from MEMORY.md."""
+        marker = f"]({rel_path})"
+        lines = [
+            line for line in self.index_path.read_text(encoding="utf-8").splitlines()
+            if marker not in line
+        ]
+        atomic_write(self.index_path, "\n".join(lines) + "\n")
+
+    def _upsert_index_line(self, layer, title, rel_path, description):
+        """Update or insert a single index bullet under ## <layer> in MEMORY.md."""
+        lines = self.index_path.read_text(encoding="utf-8").splitlines()
+        new_line = f"- [{title}]({rel_path}) — {description}"
+        link_marker = f"]({rel_path})"
+
+        current_layer = ""
+        found_same_layer = False
+        cleaned_lines = []
+        for line in lines:
+            if line.startswith("#"):
+                m = INDEX_LAYER_RE.match(line)
+                current_layer = m.group(1) if m else ""
+            if link_marker in line:
+                if current_layer == layer and not found_same_layer:
+                    cleaned_lines.append(new_line)
+                    found_same_layer = True
+                continue
+            cleaned_lines.append(line)
+
+        if not found_same_layer:
+            inserted = []
+            in_target = False
+            did_insert = False
+            for idx, line in enumerate(cleaned_lines):
+                if line.startswith("## "):
+                    m = INDEX_LAYER_RE.match(line)
+                    if in_target and not did_insert:
+                        if inserted and inserted[-1].strip() == "":
+                            inserted.insert(len(inserted) - 1, new_line)
+                        else:
+                            inserted.append(new_line)
+                        did_insert = True
+                    in_target = bool(m and m.group(1) == layer)
+                inserted.append(line)
+                if idx == len(cleaned_lines) - 1 and in_target and not did_insert:
+                    inserted.append(new_line)
+                    did_insert = True
+            cleaned_lines = inserted
+
+        atomic_write(self.index_path, "\n".join(cleaned_lines) + "\n")
+
+    def archive_entry(self, name, user_managed=False):
+        """Archive a user-managed entry or move a standard topic into archive/."""
+        if not NAME_RE.fullmatch(name):
+            raise ValueError("Invalid entry name.")
+        ts_now = now_iso()
+        with self.write_lock():
+            if user_managed:
+                target = self.root / "user-managed" / f"{name}.md"
+                if not target.is_file():
+                    raise ValueError(f"User-managed entry not found: {name}")
+                meta, body = parse_frontmatter(target.read_text(encoding="utf-8"))
+                cre_at = meta.get("created_at") or meta.get("updated_at") or ts_now
+                ordered = {
+                    "name": meta.get("name", name),
+                    "title": meta.get("title", extract_title(body, name)),
+                    "description": meta.get("description", ""),
+                    "type": meta.get("type", LAYER_DEFAULT_TYPE.get(meta.get("layer", "L2"), "feedback")),
+                    "layer": meta.get("layer", "L2"),
+                    "status": "archived",
+                    "created_at": cre_at,
+                    "updated_at": ts_now,
+                }
+                header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
+                atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
+                return {"path": target.relative_to(self.root).as_posix(), "status": "archived", "updated_at": ts_now}
+
+            indexed = self.parse_index()
+            for layer, folder in LAYER_DIRS.items():
+                if layer == "L4":
+                    continue
+                candidate = self.root / folder / f"{name}.md"
+                if candidate.is_file():
+                    dest = self.root / "archive" / f"{name}.md"
+                    if dest.exists():
+                        raise ValueError(f"Archive file already exists: archive/{name}.md")
+                    old_rel = f"{folder}/{name}.md"
+                    idx_info = indexed.get(old_rel, {})
+                    raw = candidate.read_text(encoding="utf-8")
+                    meta, body = parse_frontmatter(raw)
+                    cre_at, _, _, _ = file_timestamps(candidate, meta)
+                    title = idx_info.get("title") or extract_title(body, name)
+                    fm_desc = meta.get("description") or idx_info.get("description") or title
+                    idx_desc = idx_info.get("description") or fm_desc
+                    fm_name = meta.get("name", name)
+                    name_serialized = fm_name if NAME_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
+                    desc_json = json.dumps(fm_desc, ensure_ascii=False)
+                    fm_type = meta.get("type") if meta.get("type") in VALID_TOPIC_TYPES else "reference"
+                    archived_raw = (
+                        f"---\n"
+                        f"name: {name_serialized}\n"
+                        f"description: {desc_json}\n"
+                        f"type: {fm_type}\n"
+                        f"created_at: {json.dumps(cre_at)}\n"
+                        f"updated_at: {json.dumps(ts_now)}\n"
+                        f"---\n\n"
+                        f"{body.strip()}\n"
+                    )
+                    new_rel = f"archive/{name}.md"
+                    prev_index_text = self.index_path.read_text(encoding="utf-8")
+                    atomic_write(dest, archived_raw)
+                    try:
+                        self._remove_index_line(old_rel)
+                        self._upsert_index_line("L4", title, new_rel, idx_desc)
+                    except Exception:
+                        dest.unlink(missing_ok=True)
+                        try:
+                            atomic_write(self.index_path, prev_index_text)
+                        except OSError:
+                            pass
+                        raise
+                    candidate.unlink(missing_ok=True)
+                    return {"from": old_rel, "to": new_rel, "layer": "L4", "updated_at": ts_now}
+
+        raise ValueError(f"Active entry not found: {name}")
+
+
+TOOLS = [
+    {
+        "name": "memory_search",
+        "description": "Search unified L0-L4 Markdown memories by keywords, Chinese phrases, or temporal cues (e.g. '最近工作', '刚刚做了什么').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords, phrase, or temporal cue."},
+                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
+                "include_archived": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_list",
+        "description": "List indexed L0-L4 and user-managed memory entries with created_at and updated_at timestamps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
+                "include_archived": {"type": "boolean", "default": False},
+                "sort": {"type": "string", "enum": ["updated", "created", "layer"], "default": "updated"},
+            },
+        },
+    },
+    {
+        "name": "memory_read",
+        "description": "Read a specific memory Markdown file by path relative to the memory root (e.g. 'MEMORY.md' or 'projects/example-project.md').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path inside the memory library."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "memory_upsert",
+        "description": "Apply the writing rules in MEMORY.md §0. Search for the topic first. Use its existing name and supply the complete revised body when updating. Synchronizes the L0-L4 index, or writes to user-managed/ when explicitly requested.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"]},
+                "name": {"type": "string", "description": "Kebab-case slug matching ^[a-z0-9][a-z0-9_-]{0,79}$."},
+                "title": {"type": "string", "description": "Single-line human-readable title."},
+                "description": {"type": "string", "description": "Concise single-line retrieval cue."},
+                "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates."},
+                "topic_type": {"type": "string", "enum": ["", "user", "feedback", "project", "reference"], "default": ""},
+                "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/."},
+            },
+            "required": ["layer", "name", "title", "description", "body"],
+        },
+    },
+    {
+        "name": "memory_archive",
+        "description": "Archive a user-managed entry or move an L0-L3 entry to archive/ (L4).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Entry slug name."},
+                "user_managed": {"type": "boolean", "default": False},
+            },
+            "required": ["name"],
+        },
+    },
+]
+
+
+def handle_tool_call(store, name, args):
+    """Dispatch an MCP tools/call invocation."""
+    if name == "memory_search":
+        data = store.search(
+            query=args.get("query", ""),
+            layer=args.get("layer", ""),
+            include_archived=bool(args.get("include_archived", False)),
+            limit=args.get("limit", 10),
+        )
+    elif name == "memory_list":
+        data = store.list_entries(
+            layer=args.get("layer", ""),
+            include_archived=bool(args.get("include_archived", False)),
+            sort=args.get("sort", "updated"),
+        )
+    elif name == "memory_read":
+        data = store.read_entry(args["path"])
+    elif name == "memory_upsert":
+        data = store.upsert_entry(
+            layer=args["layer"],
+            name=args["name"],
+            title=args["title"],
+            description=args["description"],
+            body=args["body"],
+            topic_type=args.get("topic_type", ""),
+            user_managed=bool(args.get("user_managed", False)),
+        )
+    elif name == "memory_archive":
+        data = store.archive_entry(
+            name=args["name"],
+            user_managed=bool(args.get("user_managed", False)),
+        )
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
+
+
+def process_one_message(store, msg):
+    """Process one JSON-RPC request dict; return response dict or None for notifications."""
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+
+    msg_id = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+
+    if msg_id is None:
+        return None
+
+    try:
+        if method == "initialize":
+            requested = params.get("protocolVersion", "")
+            negotiated = requested if requested in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
+            result = {
+                "protocolVersion": negotiated,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "unified-memory", "version": "1.2.0"},
+            }
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": TOOLS}
+        elif method == "tools/call":
+            result = handle_tool_call(store, params.get("name", ""), params.get("arguments") or {})
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+    except Exception as exc:
+        if method == "tools/call":
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"content": [{"type": "text", "text": f"Error: {exc}"}], "isError": True},
+            }
+        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(exc)}}
+
+
+def send_response(payload):
+    """Write a single newline-delimited JSON-RPC message to stdout."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def serve_stdio(store):
+    """Run JSON-RPC 2.0 MCP server loop over stdin/stdout (single & batch)."""
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+            continue
+
+        if isinstance(parsed, list):
+            if not parsed:
+                send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Empty batch"}})
+                continue
+            responses = [resp for item in parsed for resp in [process_one_message(store, item)] if resp is not None]
+            if responses:
+                send_response(responses)
+        else:
+            resp = process_one_message(store, parsed)
+            if resp is not None:
+                send_response(resp)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--memory-root", type=Path, default=DEFAULT_ROOT, help="Path to unified memory root.")
+    args = parser.parse_args()
+    store = MemoryStore(args.memory_root)
+    serve_stdio(store)
+
+
+if __name__ == "__main__":
+    main()

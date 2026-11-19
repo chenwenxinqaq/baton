@@ -1,0 +1,1342 @@
+#!/usr/bin/env python3
+"""Unified memory & skills control CLI."""
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime
+import fcntl
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+
+
+from library_paths import FRAMEWORK_ROOT, data_root
+
+
+MEMORY_ROOT = data_root()
+STATE_DIR = MEMORY_ROOT / ".state"
+RESTORE_DIR = STATE_DIR / "restore"
+SKILL_BACKUP_DIR = STATE_DIR / "skill-backups"
+LOCK_FILE = STATE_DIR / "integration.lock"
+MCP_SERVER = FRAMEWORK_ROOT / "mcp" / "server.py"
+SKILLS_DIR = MEMORY_ROOT / "skills"
+
+MD_START = "<!-- unified-memory:managed:start -->"
+MD_END = "<!-- unified-memory:managed:end -->"
+TOML_START = "# BEGIN unified-memory managed"
+TOML_END = "# END unified-memory managed"
+TOML_SECTION_HEADER = "[mcp_servers.unified_memory]"
+
+INDEX_LAYER_RE = re.compile(r"^## (L[0-4])(?:\s|$)")
+BULLET_LINK_PREFIX_RE = re.compile(r"^\s*[-*+]\s+\[")
+
+LIBRARY_TEMPLATE = FRAMEWORK_ROOT / "templates" / "library.md"
+# The first L0 heading starts the index. Only the public rules belong in client instructions.
+WRITING_POLICY, index_start, _ = LIBRARY_TEMPLATE.read_text(encoding="utf-8").partition("\n## L0 ")
+if not index_start:
+    raise ValueError("Missing L0 index heading in the public library template.")
+
+MANAGED_MD_BODY = f"""{MD_START}
+## 统一本地记忆
+
+当前用户的权威记忆库位于 `{MEMORY_ROOT}`。所有记忆读写都使用这个目录。客户端默认记忆目录不用于本库。MCP 不可用时，可运行 `UNIFIED_MEMORY_ROOT={shlex.quote(str(MEMORY_ROOT))} {shlex.quote(sys.executable)} {shlex.quote(str(FRAMEWORK_ROOT / "scripts" / "memoryctl.py"))} doctor` 检查接入状态，并按 `{MEMORY_ROOT}/MEMORY.md` 的 §0 手工维护正文与索引。
+
+{WRITING_POLICY.rstrip()}
+{MD_END}"""
+
+AGY_RULE_CONTENT = f"""---
+trigger: always_on
+---
+
+{MANAGED_MD_BODY}
+"""
+
+
+def initialize_library():
+    """Create missing directories and seed files while preserving existing data."""
+    MEMORY_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
+        (MEMORY_ROOT / folder).mkdir(exist_ok=True, mode=0o700)
+    seeds = {
+        "MEMORY.md": LIBRARY_TEMPLATE,
+        "skills/unified-memory/SKILL.md": FRAMEWORK_ROOT / "skills" / "unified-memory" / "SKILL.md",
+    }
+    for name in ("entry", "project", "incident"):
+        relative = f"templates/{name}.md"
+        seeds[relative] = FRAMEWORK_ROOT / relative
+    for relative, source in seeds.items():
+        destination = MEMORY_ROOT / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=destination.parent) as staged:
+            staged.write(source.read_bytes())
+            staged.flush()
+            try:
+                os.link(staged.name, destination)
+            except FileExistsError:
+                pass
+    return {"memory_root": str(MEMORY_ROOT)}
+
+
+def resolve_python_cmd():
+    return sys.executable
+
+
+def sha256_text(text):
+    """Return hex SHA-256 of UTF-8 text."""
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
+def atomic_write(path, content):
+    """Atomically write UTF-8 text to path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".tmp-", delete=False
+        ) as handle:
+            staged = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.replace(path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+@contextmanager
+def integration_lock():
+    """Serialize config mutations using an advisory flock."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def parse_skill_frontmatter(skill_md_path):
+    """Parse name and single-line description summary from SKILL.md frontmatter."""
+    text = skill_md_path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    if not text.startswith("---\n"):
+        return skill_md_path.parent.name, ""
+    header, sep, _ = text[4:].partition("\n---\n")
+    if not sep:
+        return skill_md_path.parent.name, ""
+
+    name = skill_md_path.parent.name
+    desc_lines = []
+    in_desc = False
+    for line in header.splitlines():
+        if in_desc:
+            if line.startswith((" ", "\t")):
+                desc_lines.append(line.strip())
+                continue
+            in_desc = False
+        key, colon, val = line.partition(":")
+        if not colon:
+            continue
+        k = key.strip()
+        v = val.strip()
+        if k == "name" and v:
+            name = v.strip("'\"")
+        elif k == "description":
+            if v in {"|", ">", "|-", ">-"} or not v:
+                in_desc = True
+            else:
+                desc_lines.append(v.strip("'\""))
+    desc = " ".join(desc_lines).strip()
+    return name, desc
+
+
+def load_disabled_skills(skills_dir=None):
+    """Return set of disabled skill folder names."""
+    sdir = skills_dir or SKILLS_DIR
+    cfg = sdir / "disabled.json"
+    if not cfg.is_file():
+        return set()
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        return {str(x) for x in data.get("disabled", [])}
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_disabled_skills(disabled_set, skills_dir=None):
+    """Persist sorted disabled skill folder names."""
+    sdir = skills_dir or SKILLS_DIR
+    cfg = sdir / "disabled.json"
+    payload = {"disabled": sorted(disabled_set)}
+    atomic_write(cfg, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def skill_category(folder_name):
+    """Classify a skill folder into a clean UI group."""
+    if folder_name == "unified-memory":
+        return "infra"
+    return "general"
+
+
+def discover_hub_skills(skills_dir=None):
+    """Discover all skills with SKILL.md inside MEMORY/skills/."""
+    sdir = skills_dir or SKILLS_DIR
+    disabled = load_disabled_skills(sdir)
+    items = []
+    if not sdir.is_dir():
+        return items
+    for entry in sorted(sdir.iterdir()):
+        if entry.name.startswith(".") or not entry.is_dir():
+            continue
+        skill_md = entry / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        name, desc = parse_skill_frontmatter(skill_md)
+        items.append(
+            {
+                "folder": entry.name,
+                "name": name,
+                "category": skill_category(entry.name),
+                "enabled": entry.name not in disabled,
+                "description": desc,
+                "path": str(entry),
+            }
+        )
+    return items
+
+
+def resource_catalog(skills_dir):
+    """Read optional, locally configured resource folders for each skill."""
+    path = skills_dir / "resources.json"
+    if not path.is_file():
+        return {}
+    catalog = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(catalog, dict):
+        raise ValueError("skills/resources.json must map skill names to folder lists.")
+    for owner, folders in catalog.items():
+        if not isinstance(folders, list) or not all(
+            isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+            for name in [owner, *folders]
+        ):
+            raise ValueError("Invalid skill or resource folder in skills/resources.json.")
+    return catalog
+
+
+def desired_skill_entries(skills_dir=None):
+    """Return (enabled_folders, disabled_folders)."""
+    sdir = skills_dir or SKILLS_DIR
+    hub = discover_hub_skills(sdir)
+    enabled = [item["folder"] for item in hub if item["enabled"]]
+    disabled = [item["folder"] for item in hub if not item["enabled"]]
+    catalog = resource_catalog(sdir)
+    skill_names = set(enabled + disabled)
+    all_resources = {name for folders in catalog.values() for name in folders}
+    active_resources = {name for owner in enabled for name in catalog.get(owner, [])}
+    if all_resources & skill_names:
+        raise ValueError("Resource folders must be separate from skill folders.")
+    for name in sorted(all_resources):
+        if name in active_resources:
+            if not (sdir / name).is_dir():
+                raise ValueError(f"Missing skill resource folder: {name}")
+            enabled.append(name)
+        else:
+            disabled.append(name)
+    return enabled, disabled
+
+
+def extract_block(text, start_marker, end_marker):
+    """Extract (before, block, after) if both markers exist in order."""
+    s_idx = text.find(start_marker)
+    if s_idx == -1:
+        return None
+    e_idx = text.find(end_marker, s_idx)
+    if e_idx == -1:
+        return None
+    e_end = e_idx + len(end_marker)
+    return text[:s_idx], text[s_idx:e_end], text[e_end:]
+
+
+def strip_block(before, after):
+    """Join remaining text cleanly after removing a managed block."""
+    combined = before.rstrip("\n")
+    tail = after.lstrip("\n")
+    if combined and tail:
+        return combined + "\n\n" + tail.rstrip("\n") + "\n"
+    if combined:
+        return combined + "\n"
+    if tail:
+        return tail.rstrip("\n") + "\n"
+    return ""
+
+
+def extract_toml_section(text, section_header=TOML_SECTION_HEADER):
+    """Locate [mcp_servers.unified_memory] with or without wrapper comments."""
+    marked = extract_block(text, TOML_START, TOML_END)
+    if marked is not None:
+        return marked
+
+    lines = text.splitlines(keepends=True)
+    start_line = None
+    end_line = len(lines)
+    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(?:#.*)?$")
+
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if start_line is None:
+            if stripped == section_header:
+                start_line = idx
+        else:
+            if header_re.match(stripped):
+                end_line = idx
+                break
+
+    if start_line is None:
+        return None
+
+    before = "".join(lines[:start_line])
+    section = "".join(lines[start_line:end_line]).rstrip("\n")
+    after = "".join(lines[end_line:])
+    return before, section, after
+
+
+def parse_toml_mcp_section(section_text):
+    """Parse command and args from a simple [mcp_servers.unified_memory] TOML section."""
+    cmd = None
+    args = None
+    for raw in section_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("["):
+            continue
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        k = key.strip()
+        v = val.strip()
+        try:
+            parsed_val = json.loads(v)
+        except json.JSONDecodeError:
+            parsed_val = v.strip("'\"")
+        if k == "command":
+            cmd = parsed_val
+        elif k == "args":
+            args = parsed_val
+    return cmd, args
+
+
+def get_codex_features_memories(toml_text):
+    """Return 'true', 'false', or 'absent' for [features] memories in Codex config.toml."""
+    header_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
+    in_features = False
+    for raw in toml_text.splitlines():
+        s = raw.strip()
+        m = header_re.match(s)
+        if m:
+            in_features = m.group(1).strip() == "features"
+            continue
+        if not in_features or not s or s.startswith("#"):
+            continue
+        key, sep, val = s.partition("=")
+        if sep and key.strip() == "memories":
+            v = val.split("#", 1)[0].strip().lower()
+            if v in {"true", "false"}:
+                return v
+            return v
+    return "absent"
+
+
+def set_codex_features_memories(toml_text, desired_state):
+    """Set or remove memories key inside [features] in Codex config.toml.
+
+    desired_state: 'false', 'true', or 'absent' (removes key, and removes empty [features]).
+    """
+    header_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
+    lines = toml_text.splitlines()
+    feat_idx = None
+    feat_end = len(lines)
+    mem_line_idx = None
+
+    for idx, raw in enumerate(lines):
+        m = header_re.match(raw.strip())
+        if m:
+            if feat_idx is not None:
+                feat_end = idx
+                break
+            if m.group(1).strip() == "features":
+                feat_idx = idx
+            continue
+        if feat_idx is not None:
+            s = raw.strip()
+            if s and not s.startswith("#"):
+                k, sep, _ = s.partition("=")
+                if sep and k.strip() == "memories":
+                    mem_line_idx = idx
+
+    if desired_state == "absent":
+        if mem_line_idx is None:
+            return toml_text
+        del lines[mem_line_idx]
+        # Check if [features] now has zero keys
+        has_other_keys = False
+        for idx in range(feat_idx + 1, feat_end - 1):
+            s = lines[idx].strip()
+            if s and not s.startswith("#"):
+                has_other_keys = True
+                break
+        if not has_other_keys:
+            del lines[feat_idx:feat_end - 1]
+        out = "\n".join(lines).strip()
+        return out + "\n" if out else ""
+
+    new_kv = f"memories = {desired_state}"
+    if feat_idx is not None:
+        if mem_line_idx is not None:
+            lines[mem_line_idx] = new_kv
+        else:
+            lines.insert(feat_idx + 1, new_kv)
+        return "\n".join(lines).rstrip() + "\n"
+
+    # Insert [features] cleanly before managed MCP block if present, else append
+    block_pos = toml_text.find(TOML_START)
+    if block_pos == -1:
+        block_pos = toml_text.find(TOML_SECTION_HEADER)
+    feat_section = f"[features]\n{new_kv}\n"
+    if block_pos != -1:
+        head = toml_text[:block_pos].rstrip()
+        tail = toml_text[block_pos:].lstrip("\n")
+        return (f"{head}\n\n{feat_section}\n{tail}" if head else f"{feat_section}\n{tail}")
+    prefix = toml_text.rstrip()
+    return f"{prefix}\n\n{feat_section}" if prefix else feat_section
+
+
+def scan_stray_agent_memories(home=None):
+    """Find any stray .md memory files written into hidden per-client default directories."""
+    home = home or Path.home()
+    stray = []
+    claude_projects = home / ".claude" / "projects"
+    if claude_projects.is_dir():
+        for mem_dir in sorted(claude_projects.glob("*/memory")):
+            if not mem_dir.is_dir() or mem_dir.is_symlink():
+                continue
+            for md in sorted(mem_dir.glob("*.md")):
+                if md.name == "MEMORY.md" and md.stat().st_size == 0:
+                    continue
+                stray.append(str(md))
+    return stray
+
+
+def agent_specs(home=None):
+    """Return per-agent paths and detection rules."""
+    home = home or Path.home()
+    return {
+        "claude": {
+            "name": "Claude Code",
+            "mode": "files",
+            "detect_paths": [home / ".claude", home / ".local" / "bin" / "claude"],
+            "instructions": home / ".claude" / "CLAUDE.md",
+            "mcp_type": "json",
+            "mcp_path": home / ".claude.json",
+            "mcp_key": "unified-memory",
+            "skills_dir": home / ".claude" / "skills",
+        },
+        "codex": {
+            "name": "Codex",
+            "mode": "files",
+            "detect_paths": [home / ".codex", home / ".local" / "bin" / "codex"],
+            "instructions": home / ".codex" / "AGENTS.md",
+            "mcp_type": "toml",
+            "mcp_path": home / ".codex" / "config.toml",
+            "mcp_key": "unified_memory",
+            "skills_dir": home / ".codex" / "skills",
+        },
+        "antigravity": {
+            "name": "Antigravity",
+            "mode": "agy_plugin",
+            "detect_paths": [home / ".gemini" / "antigravity", home / ".gemini" / "config"],
+            "plugin_dir": home / ".gemini" / "config" / "plugins" / "unified-memory",
+            "skills_dir": home / ".gemini" / "config" / "plugins" / "unified-memory" / "skills",
+            "legacy_gemini_md": home / ".gemini" / "GEMINI.md",
+            "legacy_mcp_json": home / ".gemini" / "config" / "mcp_config.json",
+            "legacy_skill_link": home / ".gemini" / "config" / "skills" / "unified-memory",
+        },
+    }
+
+
+def load_restore(agent_id):
+    """Load saved pre-integration metadata for an agent."""
+    path = RESTORE_DIR / f"{agent_id}.json"
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_restore(agent_id, payload):
+    """Persist pre-integration metadata for clean disconnect."""
+    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(RESTORE_DIR / f"{agent_id}.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def desired_mcp_args():
+    """Return (command, args) tuple for the MCP server."""
+    return resolve_python_cmd(), [str(MCP_SERVER), "--memory-root", str(MEMORY_ROOT)]
+
+
+def desired_json_mcp(mcp_path):
+    """Build expected mcpServers entry for JSON-configured agents."""
+    py_cmd, args = desired_mcp_args()
+    entry = {"command": py_cmd, "args": args}
+    if mcp_path.name == ".claude.json":
+        entry = {"type": "stdio", **entry, "env": {}}
+    return entry
+
+
+def desired_toml_block():
+    """Build expected Codex TOML managed block."""
+    py_cmd, args = desired_mcp_args()
+    args_json = json.dumps(args, ensure_ascii=False)
+    return (
+        f"{TOML_START}\n"
+        f"{TOML_SECTION_HEADER}\n"
+        f"command = {json.dumps(py_cmd)}\n"
+        f"args = {args_json}\n"
+        f"{TOML_END}"
+    )
+
+
+def desired_agy_plugin_files():
+    """Return expected core files inside ~/.gemini/config/plugins/unified-memory/."""
+    py_cmd, args = desired_mcp_args()
+    plugin_json = json.dumps(
+        {
+            "name": "unified-memory",
+            "displayName": "Unified Memory & Skills",
+            "version": "1.2.0",
+            "description": "Shared L0-L4 local memory library, MCP server, and unified skills hub across Claude Code, Codex, and Antigravity.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
+    mcp_json = json.dumps(
+        {"mcpServers": {"unified-memory": {"command": py_cmd, "args": args}}},
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
+    return {
+        "plugin.json": plugin_json,
+        "mcp_config.json": mcp_json,
+        "rules/unified-memory.md": AGY_RULE_CONTENT,
+    }
+
+
+def is_linked_to_hub(target_path, hub_source):
+    """Check whether target_path is a symlink pointing to hub_source."""
+    if not target_path.is_symlink():
+        return False
+    try:
+        return os.path.realpath(target_path) == os.path.realpath(hub_source)
+    except OSError:
+        return False
+
+
+def inspect_skills_dir(target_skills_dir):
+    """Inspect how well target_skills_dir matches enabled/disabled hub skills."""
+    enabled_folders, disabled_folders = desired_skill_entries()
+    if not target_skills_dir.exists():
+        return "unmanaged", 0, len(enabled_folders), []
+
+    linked_ok = 0
+    unlinked = []
+    stale_disabled = []
+    for slug in enabled_folders:
+        src = SKILLS_DIR / slug
+        dest = target_skills_dir / slug
+        if is_linked_to_hub(dest, src):
+            linked_ok += 1
+        else:
+            unlinked.append(slug)
+
+    for slug in disabled_folders:
+        src = SKILLS_DIR / slug
+        dest = target_skills_dir / slug
+        if is_linked_to_hub(dest, src):
+            stale_disabled.append(slug)
+
+    issues = []
+    if linked_ok == len(enabled_folders) and not stale_disabled:
+        return "managed", linked_ok, len(enabled_folders), issues
+    if linked_ok == 0 and not stale_disabled:
+        return "unmanaged", 0, len(enabled_folders), issues
+    if unlinked:
+        preview = ", ".join(unlinked[:4]) + ("…" if len(unlinked) > 4 else "")
+        issues.append(f"待同步技能 ({len(unlinked)}): {preview}")
+    if stale_disabled:
+        issues.append(f"已停用技能仍挂载: {', '.join(stale_disabled)}")
+    return "drifted", linked_ok, len(enabled_folders), issues
+
+
+def sync_skills_into_dir(agent_id, target_skills_dir, restore, changes):
+    """Symlink all enabled hub skills into target_skills_dir, backing up standalone copies."""
+    enabled_folders, disabled_folders = desired_skill_entries()
+    target_skills_dir.mkdir(parents=True, exist_ok=True)
+    backed_up = set(restore.get("backed_up_skills", []))
+    backup_root = SKILL_BACKUP_DIR / agent_id
+
+    for slug in enabled_folders:
+        src = SKILLS_DIR / slug
+        dest = target_skills_dir / slug
+        if is_linked_to_hub(dest, src):
+            continue
+        if dest.is_symlink():
+            # Repoint existing symlink
+            prev_links = restore.setdefault("previous_skill_symlinks", {})
+            if slug not in prev_links:
+                prev_links[slug] = os.readlink(dest)
+            dest.unlink()
+        elif dest.exists():
+            # Move standalone folder/file safely to .state/skill-backups/<agent>/<slug>
+            backup_dest = backup_root / slug
+            backup_dest.parent.mkdir(parents=True, exist_ok=True)
+            if backup_dest.exists() or backup_dest.is_symlink():
+                if backup_dest.is_dir() and not backup_dest.is_symlink():
+                    shutil.rmtree(backup_dest)
+                else:
+                    backup_dest.unlink()
+            shutil.move(str(dest), str(backup_dest))
+            backed_up.add(slug)
+            changes.append(f"backed up standalone skill {dest} -> {backup_dest}")
+        dest.symlink_to(src)
+        changes.append(f"linked skill {dest} -> {src}")
+
+    for slug in disabled_folders:
+        src = SKILLS_DIR / slug
+        dest = target_skills_dir / slug
+        if is_linked_to_hub(dest, src):
+            dest.unlink()
+            changes.append(f"unlinked disabled skill {dest}")
+
+    restore["backed_up_skills"] = sorted(backed_up)
+
+
+def restore_skills_dir(agent_id, target_skills_dir, restore, changes):
+    """Remove hub symlinks and restore any backed-up standalone skills."""
+    enabled, disabled = desired_skill_entries()
+    all_hub_names = enabled + disabled
+    if target_skills_dir.is_dir():
+        for slug in all_hub_names:
+            src = SKILLS_DIR / slug
+            dest = target_skills_dir / slug
+            if is_linked_to_hub(dest, src):
+                dest.unlink()
+                changes.append(f"unlinked skill {dest}")
+
+    # Restore previous symlinks if any
+    for slug, old_target in (restore.get("previous_skill_symlinks") or {}).items():
+        dest = target_skills_dir / slug
+        if not dest.exists() and not dest.is_symlink():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(old_target, dest)
+            changes.append(f"restored previous symlink {dest} -> {old_target}")
+
+    # Restore backed-up standalone directories
+    backup_root = SKILL_BACKUP_DIR / agent_id
+    for slug in restore.get("backed_up_skills") or []:
+        bpath = backup_root / slug
+        dest = target_skills_dir / slug
+        if (bpath.exists() or bpath.is_symlink()) and not dest.exists() and not dest.is_symlink():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(bpath), str(dest))
+            changes.append(f"restored standalone skill {dest}")
+    if backup_root.is_dir() and not any(backup_root.iterdir()):
+        backup_root.rmdir()
+
+
+def inspect_agy_plugin(agent_id, spec):
+    """Inspect Antigravity plugin bundle state."""
+    detected = any(p.exists() for p in spec["detect_paths"])
+    restore = load_restore(agent_id)
+    pdir = spec["plugin_dir"]
+    expected = desired_agy_plugin_files()
+    issues = []
+
+    rule_path = pdir / "rules" / "unified-memory.md"
+    mcp_path = pdir / "mcp_config.json"
+    manifest_path = pdir / "plugin.json"
+
+    if not pdir.exists():
+        _, total = desired_skill_entries()
+        return {
+            "id": agent_id,
+            "name": spec["name"],
+            "detected": detected,
+            "state": "unmanaged",
+            "components": {
+                "instructions": {"path": str(rule_path), "state": "unmanaged"},
+                "mcp": {"path": str(mcp_path), "state": "unmanaged"},
+                "skill": {"path": str(spec["skills_dir"]), "state": "unmanaged", "linked": 0, "total": len(desired_skill_entries()[0])},
+            },
+            "issues": issues,
+        }
+
+    if not rule_path.is_file():
+        inst_state = "missing"
+        issues.append("plugin rules/unified-memory.md missing")
+    else:
+        rtext = rule_path.read_text(encoding="utf-8")
+        if rtext == expected["rules/unified-memory.md"]:
+            inst_state = "managed"
+        else:
+            saved_hash = restore.get("agy_rule_hash")
+            if saved_hash and sha256_text(rtext) != saved_hash:
+                inst_state = "modified"
+                issues.append("plugin rules/unified-memory.md was manually edited")
+            else:
+                inst_state = "drifted"
+                issues.append("plugin rules/unified-memory.md differs from current template")
+
+    if not mcp_path.is_file() or not manifest_path.is_file():
+        mcp_state = "missing"
+        issues.append("plugin.json or mcp_config.json missing")
+    elif (
+        mcp_path.read_text(encoding="utf-8") == expected["mcp_config.json"]
+        and manifest_path.read_text(encoding="utf-8") == expected["plugin.json"]
+    ):
+        mcp_state = "managed"
+    else:
+        mcp_state = "drifted"
+        issues.append("plugin mcp_config.json or plugin.json drifted")
+
+    skill_state, linked_cnt, total_cnt, skill_issues = inspect_skills_dir(spec["skills_dir"])
+    issues.extend(skill_issues)
+
+    states = {inst_state, mcp_state, skill_state}
+    if states == {"managed"}:
+        overall = "managed"
+    elif states & {"modified", "drifted"}:
+        overall = "drifted"
+    else:
+        overall = "partial"
+
+    return {
+        "id": agent_id,
+        "name": spec["name"],
+        "detected": detected,
+        "state": overall,
+        "components": {
+            "instructions": {"path": str(rule_path), "state": inst_state},
+            "mcp": {"path": str(mcp_path), "state": mcp_state},
+            "skill": {
+                "path": str(spec["skills_dir"]),
+                "state": skill_state,
+                "linked": linked_cnt,
+                "total": total_cnt,
+            },
+        },
+        "issues": issues,
+    }
+
+
+def inspect_agent(agent_id, spec):
+    """Inspect detection and integration state without modifying anything."""
+    if spec.get("mode") == "agy_plugin":
+        return inspect_agy_plugin(agent_id, spec)
+
+    detected = any(p.exists() for p in spec["detect_paths"])
+    restore = load_restore(agent_id)
+    inst_path = spec["instructions"]
+    issues = []
+
+    if inst_path.is_symlink():
+        inst_state = "symlink"
+        issues.append(f"instructions is a symlink ({inst_path})")
+    elif inst_path.is_file():
+        text = inst_path.read_text(encoding="utf-8")
+        parsed = extract_block(text, MD_START, MD_END)
+        if parsed is None:
+            inst_state = "unmanaged"
+        else:
+            block = parsed[1]
+            expected_hash = sha256_text(MANAGED_MD_BODY)
+            saved_hash = restore.get("instructions_block_hash")
+            if sha256_text(block) == expected_hash:
+                inst_state = "managed"
+            elif saved_hash and sha256_text(block) != saved_hash:
+                inst_state = "modified"
+                issues.append("managed instruction block was manually edited")
+            else:
+                inst_state = "drifted"
+                issues.append("managed instruction block drifted or conflicts with legacy block")
+    else:
+        inst_state = "missing"
+
+    mcp_path = spec["mcp_path"]
+    exp_cmd, exp_args = desired_mcp_args()
+    if spec["mcp_type"] == "json":
+        if mcp_path.is_file():
+            data = json.loads(mcp_path.read_text(encoding="utf-8"))
+            current = (data.get("mcpServers") or {}).get(spec["mcp_key"])
+            if current is None:
+                mcp_state = "unmanaged"
+            elif current == desired_json_mcp(mcp_path):
+                mcp_state = "managed"
+            else:
+                mcp_state = "drifted"
+                issues.append("MCP entry differs from current server path/args")
+        else:
+            mcp_state = "missing"
+    else:
+        if mcp_path.is_file():
+            text = mcp_path.read_text(encoding="utf-8")
+            sec = extract_toml_section(text)
+            feat_mem = get_codex_features_memories(text)
+            if sec is None:
+                mcp_state = "unmanaged"
+            else:
+                cmd, args = parse_toml_mcp_section(sec[1])
+                if cmd == exp_cmd and args == exp_args and feat_mem == "false":
+                    mcp_state = "managed"
+                else:
+                    mcp_state = "drifted"
+                    if cmd != exp_cmd or args != exp_args:
+                        issues.append("Codex [mcp_servers.unified_memory] drifted")
+                    if feat_mem != "false":
+                        issues.append(f"Codex native [features] memories={feat_mem} (should be false to prevent split-brain)")
+        else:
+            mcp_state = "missing"
+
+    skill_state, linked_cnt, total_cnt, skill_issues = inspect_skills_dir(spec["skills_dir"])
+    issues.extend(skill_issues)
+
+    states = {inst_state, mcp_state, skill_state}
+    if states == {"managed"}:
+        overall = "managed"
+    elif states & {"modified", "conflict", "drifted", "symlink"}:
+        overall = "drifted"
+    elif "managed" in states:
+        overall = "partial"
+    else:
+        overall = "unmanaged"
+
+    return {
+        "id": agent_id,
+        "name": spec["name"],
+        "detected": detected,
+        "state": overall,
+        "components": {
+            "instructions": {"path": str(inst_path), "state": inst_state},
+            "mcp": {"path": str(mcp_path), "state": mcp_state},
+            "skill": {
+                "path": str(spec["skills_dir"]),
+                "state": skill_state,
+                "linked": linked_cnt,
+                "total": total_cnt,
+            },
+        },
+        "issues": issues,
+    }
+
+
+def _cleanup_legacy_agy_loose_files(spec, changes):
+    """Remove any loose legacy ~/.gemini/GEMINI.md block or skill symlink if present."""
+    gem_md = spec["legacy_gemini_md"]
+    if gem_md.is_file() and not gem_md.is_symlink():
+        txt = gem_md.read_text(encoding="utf-8")
+        parsed = extract_block(txt, MD_START, MD_END)
+        if parsed is not None:
+            cleaned = strip_block(parsed[0], parsed[2])
+            if cleaned:
+                atomic_write(gem_md, cleaned)
+            else:
+                gem_md.unlink()
+            changes.append(f"cleaned legacy block from {gem_md}")
+
+    mcp_json = spec["legacy_mcp_json"]
+    if mcp_json.is_file():
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+        servers = data.get("mcpServers") or {}
+        if "unified-memory" in servers:
+            del servers["unified-memory"]
+            atomic_write(mcp_json, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            changes.append(f"migrated unified-memory out of loose {mcp_json} into plugin")
+
+    slink = spec["legacy_skill_link"]
+    if slink.is_symlink():
+        slink.unlink()
+        changes.append(f"removed loose skill symlink {slink}")
+
+
+def connect_agent(agent_id, spec, dry_run=False):
+    """Connect one agent safely with marker-block, MCP merge, and unified skills sync."""
+    if dry_run:
+        info = inspect_agent(agent_id, spec)
+        return {"id": agent_id, "dry_run": True, "current_state": info["state"], "issues": info["issues"]}
+
+    restore = load_restore(agent_id)
+    changes = []
+
+    with integration_lock():
+        if spec.get("mode") == "agy_plugin":
+            pdir = spec["plugin_dir"]
+            expected = desired_agy_plugin_files()
+            for rel, content in expected.items():
+                dest = pdir / rel
+                if not dest.is_file() or dest.read_text(encoding="utf-8") != content:
+                    atomic_write(dest, content)
+                    changes.append(f"wrote {dest}")
+            # Remove old copied unified-memory directory inside plugin/skills if non-symlink
+            old_copied_um = spec["skills_dir"] / "unified-memory"
+            if old_copied_um.is_dir() and not old_copied_um.is_symlink():
+                shutil.rmtree(old_copied_um)
+            sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
+            _cleanup_legacy_agy_loose_files(spec, changes)
+            restore["agy_rule_hash"] = sha256_text(expected["rules/unified-memory.md"])
+            restore["connected_at"] = datetime.now().isoformat(timespec="seconds")
+            save_restore(agent_id, restore)
+            return {"id": agent_id, "state": "managed", "changes": changes or ["already up to date"]}
+
+        inst_path = spec["instructions"]
+        mcp_path = spec["mcp_path"]
+
+        # 1. Instructions marker block
+        if inst_path.is_symlink():
+            raise RuntimeError(f"{inst_path} is a symlink; remove or convert it to a regular file first.")
+        existed_before = inst_path.is_file()
+        orig_text = inst_path.read_text(encoding="utf-8") if existed_before else ""
+        if "instructions_existed" not in restore:
+            restore["instructions_existed"] = existed_before
+            if existed_before:
+                restore["instructions_backup"] = orig_text
+
+        working_text = orig_text
+        parsed = extract_block(working_text, MD_START, MD_END)
+        if parsed is None:
+            prefix = working_text.rstrip("\n")
+            new_text = f"{prefix}\n\n{MANAGED_MD_BODY}\n" if prefix else f"{MANAGED_MD_BODY}\n"
+            if new_text != orig_text:
+                atomic_write(inst_path, new_text)
+                changes.append(f"injected managed block into {inst_path}")
+        else:
+            rebuilt = parsed[0] + MANAGED_MD_BODY + parsed[2]
+            if rebuilt != orig_text:
+                atomic_write(inst_path, rebuilt)
+                changes.append(f"updated managed block in {inst_path}")
+        restore["instructions_block_hash"] = sha256_text(MANAGED_MD_BODY)
+
+        # 2. MCP config
+        if spec["mcp_type"] == "json":
+            data = json.loads(mcp_path.read_text(encoding="utf-8")) if mcp_path.is_file() else {}
+            servers = data.setdefault("mcpServers", {})
+            desired = desired_json_mcp(mcp_path)
+            if "mcp_had_previous" not in restore:
+                if spec["mcp_key"] in servers:
+                    restore["mcp_had_previous"] = True
+                    restore["previous_mcp"] = servers[spec["mcp_key"]]
+                else:
+                    restore["mcp_had_previous"] = False
+            if servers.get(spec["mcp_key"]) != desired:
+                servers[spec["mcp_key"]] = desired
+                atomic_write(mcp_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                changes.append(f"updated mcpServers.{spec['mcp_key']} in {mcp_path}")
+        else:
+            toml_text = mcp_path.read_text(encoding="utf-8") if mcp_path.is_file() else ""
+            orig_toml = toml_text
+            if "previous_codex_features_memories" not in restore:
+                restore["previous_codex_features_memories"] = get_codex_features_memories(toml_text)
+            if get_codex_features_memories(toml_text) != "false":
+                toml_text = set_codex_features_memories(toml_text, "false")
+                changes.append(f"set [features] memories = false in {mcp_path}")
+
+            block = desired_toml_block()
+            exp_cmd, exp_args = desired_mcp_args()
+            sec = extract_toml_section(toml_text)
+            if sec is None:
+                prefix = toml_text.rstrip("\n")
+                toml_text = f"{prefix}\n\n{block}\n" if prefix else f"{block}\n"
+                changes.append(f"added {TOML_SECTION_HEADER} to {mcp_path}")
+            else:
+                cur_cmd, cur_args = parse_toml_mcp_section(sec[1])
+                if "toml_had_previous" not in restore and cur_cmd and str(MCP_SERVER) not in " ".join(cur_args or []):
+                    restore["toml_had_previous"] = True
+                    restore["previous_toml_section"] = sec[1]
+                if cur_cmd != exp_cmd or cur_args != exp_args:
+                    rebuilt_toml = strip_block(sec[0], sec[2]).rstrip("\n")
+                    toml_text = f"{rebuilt_toml}\n\n{block}\n" if rebuilt_toml else f"{block}\n"
+                    changes.append(f"updated {TOML_SECTION_HEADER} in {mcp_path}")
+            if toml_text != orig_toml:
+                atomic_write(mcp_path, toml_text)
+            restore["expected_mcp_cmd"] = exp_cmd
+            restore["expected_mcp_args"] = exp_args
+
+        # 3. Sync all enabled hub skills
+        sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
+
+        restore["connected_at"] = datetime.now().isoformat(timespec="seconds")
+        save_restore(agent_id, restore)
+
+    return {"id": agent_id, "state": "managed", "changes": changes or ["already up to date"]}
+
+
+def disconnect_agent(agent_id, spec, force=False):
+    """Revert unified-memory managed blocks/keys/plugins and restore backed-up skills."""
+    restore = load_restore(agent_id)
+    changes = []
+
+    with integration_lock():
+        if spec.get("mode") == "agy_plugin":
+            pdir = spec["plugin_dir"]
+            rule_path = pdir / "rules" / "unified-memory.md"
+            if rule_path.is_file():
+                saved_hash = restore.get("agy_rule_hash")
+                cur_hash = sha256_text(rule_path.read_text(encoding="utf-8"))
+                if saved_hash and cur_hash != saved_hash and not force:
+                    raise RuntimeError(
+                        f"Managed rule in {rule_path} was edited manually; reconcile or re-run with --force."
+                    )
+            if pdir.exists():
+                shutil.rmtree(pdir)
+                changes.append(f"removed Antigravity plugin {pdir}")
+            _cleanup_legacy_agy_loose_files(spec, changes)
+            restore_file = RESTORE_DIR / f"{agent_id}.json"
+            if restore_file.exists():
+                restore_file.unlink()
+            return {"id": agent_id, "state": "unmanaged", "changes": changes or ["nothing to remove"]}
+
+        inst_path = spec["instructions"]
+        mcp_path = spec["mcp_path"]
+
+        if inst_path.is_file() and not inst_path.is_symlink():
+            text = inst_path.read_text(encoding="utf-8")
+            parsed = extract_block(text, MD_START, MD_END)
+            if parsed is not None:
+                saved_hash = restore.get("instructions_block_hash")
+                if saved_hash and sha256_text(parsed[1]) != saved_hash and not force:
+                    raise RuntimeError(
+                        f"Managed block in {inst_path} was edited manually; reconcile or re-run with --force."
+                    )
+                cleaned = strip_block(parsed[0], parsed[2])
+                if not cleaned and not restore.get("instructions_existed", True):
+                    inst_path.unlink()
+                    changes.append(f"removed empty {inst_path}")
+                else:
+                    atomic_write(inst_path, cleaned)
+                    changes.append(f"removed managed block from {inst_path}")
+
+        if spec["mcp_type"] == "json" and mcp_path.is_file():
+            data = json.loads(mcp_path.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers") or {}
+            if spec["mcp_key"] in servers:
+                if restore.get("mcp_had_previous"):
+                    servers[spec["mcp_key"]] = restore["previous_mcp"]
+                    changes.append(f"restored previous mcpServers.{spec['mcp_key']} in {mcp_path}")
+                else:
+                    del servers[spec["mcp_key"]]
+                    changes.append(f"removed mcpServers.{spec['mcp_key']} from {mcp_path}")
+                atomic_write(mcp_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        elif spec["mcp_type"] == "toml" and mcp_path.is_file():
+            text = mcp_path.read_text(encoding="utf-8")
+            orig_toml = text
+            sec = extract_toml_section(text)
+            if sec is not None:
+                cur_cmd, cur_args = parse_toml_mcp_section(sec[1])
+                exp_cmd = restore.get("expected_mcp_cmd")
+                exp_args = restore.get("expected_mcp_args")
+                if exp_cmd and (cur_cmd != exp_cmd or cur_args != exp_args) and not force:
+                    raise RuntimeError(
+                        f"TOML section {TOML_SECTION_HEADER} in {mcp_path} was edited manually; reconcile or re-run with --force."
+                    )
+                base = strip_block(sec[0], sec[2])
+                if restore.get("toml_had_previous") and restore.get("previous_toml_section"):
+                    prev_sec = restore["previous_toml_section"].strip()
+                    text = f"{base.rstrip()}\n\n{prev_sec}\n" if base.strip() else f"{prev_sec}\n"
+                    changes.append(f"restored previous {TOML_SECTION_HEADER} in {mcp_path}")
+                else:
+                    text = base
+                    changes.append(f"removed {TOML_SECTION_HEADER} from {mcp_path}")
+            prev_feat_mem = restore.get("previous_codex_features_memories")
+            if prev_feat_mem in {"true", "false", "absent"}:
+                text = set_codex_features_memories(text, prev_feat_mem)
+                changes.append(f"restored [features] memories -> {prev_feat_mem} in {mcp_path}")
+            if text != orig_toml:
+                atomic_write(mcp_path, text)
+
+        restore_skills_dir(agent_id, spec["skills_dir"], restore, changes)
+
+        restore_file = RESTORE_DIR / f"{agent_id}.json"
+        if restore_file.exists():
+            restore_file.unlink()
+
+    return {"id": agent_id, "state": "unmanaged", "changes": changes or ["nothing to remove"]}
+
+
+def set_skill_enabled(target_folder, enabled, home=None):
+    """Enable or disable a skill (or 'all') and automatically re-sync connected agents."""
+    hub = discover_hub_skills()
+    known = {item["folder"] for item in hub}
+    if target_folder != "all" and target_folder not in known:
+        raise ValueError(f"Unknown skill '{target_folder}'.")
+
+    disabled = load_disabled_skills()
+    if target_folder == "all":
+        if enabled:
+            disabled.clear()
+        else:
+            disabled = set(known) - {"unified-memory"}
+    else:
+        if enabled:
+            disabled.discard(target_folder)
+        else:
+            disabled.add(target_folder)
+    save_disabled_skills(disabled)
+
+    # Re-sync any agent that is already connected (managed/drifted/partial)
+    synced_agents = []
+    specs = agent_specs(home=home)
+    for aid, spec in specs.items():
+        st = inspect_agent(aid, spec)["state"]
+        if st != "unmanaged":
+            connect_agent(aid, spec)
+            synced_agents.append(aid)
+    return {"skill": target_folder, "enabled": enabled, "synced_agents": synced_agents}
+
+
+def inspect_skills_matrix(home=None):
+    """Return full list of hub skills with per-agent attachment states."""
+    hub = discover_hub_skills()
+    specs = agent_specs(home=home)
+    out = []
+    for item in hub:
+        slug = item["folder"]
+        src = SKILLS_DIR / slug
+        per_agent = {}
+        for aid, spec in specs.items():
+            dest = spec["skills_dir"] / slug
+            if is_linked_to_hub(dest, src):
+                per_agent[aid] = "linked"
+            elif dest.exists() or dest.is_symlink():
+                per_agent[aid] = "standalone"
+            else:
+                per_agent[aid] = "absent"
+        out.append({**item, "agents": per_agent})
+    return out
+
+
+def check_library_integrity(memory_root=MEMORY_ROOT):
+    """Run bidirectional index <-> disk and syntax checks on the memory library."""
+    sys.path.insert(0, str(FRAMEWORK_ROOT / "manager"))
+    import manager as web_manager
+
+    findings = []
+    lib = web_manager.Library(memory_root, "统一记忆")
+    raw_index, topics = lib.read_index()
+
+    missing_topics = [p for p in topics if not (memory_root / p).is_file()]
+    if missing_topics:
+        findings.append(
+            {"area": "index", "severity": "error", "detail": f"Missing indexed files: {missing_topics}"}
+        )
+
+    disk_files = sorted(
+        p.relative_to(memory_root).as_posix()
+        for folder in ("constraints", "methods", "preferences", "projects", "archive")
+        if (memory_root / folder).is_dir()
+        for p in (memory_root / folder).glob("*.md")
+        if p.name != "README.md"
+    )
+    orphan_files = [p for p in disk_files if p not in topics]
+    if orphan_files:
+        findings.append(
+            {"area": "index", "severity": "error", "detail": f"Unindexed disk files: {orphan_files}"}
+        )
+
+    unparsed_bullets = []
+    current_layer = ""
+    for lineno, line in enumerate(raw_index.splitlines(), start=1):
+        if line.startswith("#"):
+            m = INDEX_LAYER_RE.match(line)
+            current_layer = m.group(1) if m else ""
+            continue
+        if current_layer and BULLET_LINK_PREFIX_RE.match(line) and not web_manager.INDEX_LINK.match(line):
+            unparsed_bullets.append(f"L{lineno}: {line.strip()[:80]}")
+    if unparsed_bullets:
+        findings.append(
+            {"area": "index", "severity": "error", "detail": f"Malformed index bullets: {unparsed_bullets}"}
+        )
+
+    _, unreadable = lib.list()
+    if unreadable:
+        findings.append(
+            {"area": "user-managed", "severity": "error", "detail": f"Unreadable entries: {unreadable}"}
+        )
+
+    return len(topics), len(disk_files), findings
+
+
+def run_doctor(fix=False, home=None):
+    """Diagnose library integrity, MCP health, skills, and agent drift; optionally repair."""
+    indexed_count, disk_count, findings = check_library_integrity(MEMORY_ROOT)
+    repaired = []
+
+    probe_reqs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+    probe = subprocess.run(
+        [resolve_python_cmd(), str(MCP_SERVER), "--memory-root", str(MEMORY_ROOT)],
+        input="\n".join(json.dumps(r) for r in probe_reqs) + "\n",
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode != 0 or '"memory_search"' not in probe.stdout:
+        findings.append({"area": "mcp", "severity": "error", "detail": f"MCP probe failed: {probe.stderr.strip()}"})
+
+    specs = agent_specs(home=home)
+    agent_reports = []
+    for agent_id, spec in specs.items():
+        report = inspect_agent(agent_id, spec)
+        if report["state"] in {"drifted", "partial"}:
+            if fix and "modified" not in {
+                c["state"] for c in report["components"].values()
+            }:
+                try:
+                    res = connect_agent(agent_id, spec)
+                    repaired.append({"agent": agent_id, "changes": res["changes"]})
+                    report = inspect_agent(agent_id, spec)
+                except Exception as exc:
+                    findings.append({"area": f"agent:{agent_id}", "severity": "error", "detail": str(exc)})
+            if report["state"] in {"drifted", "partial"}:
+                findings.append(
+                    {
+                        "area": f"agent:{agent_id}",
+                        "severity": "warn",
+                        "detail": "; ".join(report["issues"]) or report["state"],
+                    }
+                )
+        agent_reports.append(report)
+
+    stray = scan_stray_agent_memories(home=home)
+    if stray:
+        findings.append(
+            {
+                "area": "stray-memory",
+                "severity": "warn",
+                "detail": f"Stray native client memory files found outside unified hub: {stray}",
+            }
+        )
+
+    hub = discover_hub_skills()
+    return {
+        "ok": not any(f["severity"] == "error" for f in findings),
+        "indexed_topics": indexed_count,
+        "disk_topics": disk_count,
+        "total_skills": len(hub),
+        "enabled_skills": sum(s["enabled"] for s in hub),
+        "stray_memories": stray,
+        "findings": findings,
+        "repaired": repaired,
+        "agents": agent_reports,
+    }
+
+
+def resolve_targets(target, home=None):
+    """Resolve 'all' or a specific agent id."""
+    specs = agent_specs(home=home)
+    if target == "all":
+        return list(specs.items())
+    if target not in specs:
+        raise SystemExit(f"Unknown agent '{target}'. Choose from: all, {', '.join(specs)}")
+    return [(target, specs[target])]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init", help="Initialize an empty private library or fill missing seed files.")
+    sub.add_parser("interface", help="Emit machine-readable paths and capabilities.")
+
+    p_agent = sub.add_parser("agent", help="Inspect or manage agent integrations.")
+    agent_sub = p_agent.add_subparsers(dest="agent_cmd", required=True)
+    agent_sub.add_parser("list", help="Inspect detected agents and integration states.")
+
+    p_skill = sub.add_parser("skill", help="Inspect, enable, or disable unified skills.")
+    skill_sub = p_skill.add_subparsers(dest="skill_cmd", required=True)
+    skill_sub.add_parser("list", help="List all skills in the unified hub and per-agent link status.")
+    p_sen = skill_sub.add_parser("enable", help="Enable a skill (folder name or 'all') and sync connected agents.")
+    p_sen.add_argument("folder")
+    p_sdis = skill_sub.add_parser("disable", help="Disable a skill (folder name) and unlink from connected agents.")
+    p_sdis.add_argument("folder")
+
+    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, antigravity, or all).")
+    p_conn.add_argument("target", nargs="?", default="all")
+    p_conn.add_argument("--dry-run", action="store_true")
+
+    p_disc = sub.add_parser("disconnect", help="Cleanly remove unified-memory integration from an agent.")
+    p_disc.add_argument("target", nargs="?", default="all")
+    p_disc.add_argument("--force", action="store_true", help="Remove even if managed blocks were manually edited.")
+
+    p_doc = sub.add_parser("doctor", help="Diagnose index, MCP server, skills, and agent integration drift.")
+    p_doc.add_argument("--fix", action="store_true", help="Automatically reconcile drifted/partial integrations.")
+    p_doc.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    args = parser.parse_args()
+
+    if args.command == "init":
+        print(json.dumps(initialize_library(), ensure_ascii=False, indent=2))
+    elif args.command == "interface":
+        hub = discover_hub_skills()
+        print(
+            json.dumps(
+                {
+                    "protocol_version": 3,
+                    "python_command": resolve_python_cmd(),
+                    "capabilities": {
+                        "marker_block_injection": True,
+                        "antigravity_plugin_bundle": True,
+                        "unified_skills_hub": True,
+                        "section_aware_toml": True,
+                        "bidirectional_index_doctor": True,
+                        "reversible_disconnect": True,
+                        "conflict_detection": True,
+                    },
+                    "paths": {
+                        "memory_root": str(MEMORY_ROOT),
+                        "index": str(MEMORY_ROOT / "MEMORY.md"),
+                        "mcp_server": str(MCP_SERVER),
+                        "skills_dir": str(SKILLS_DIR),
+                        "state": str(STATE_DIR),
+                    },
+                    "skills_count": len(hub),
+                    "agents": list(agent_specs().keys()),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "agent" and args.agent_cmd == "list":
+        reports = [inspect_agent(aid, spec) for aid, spec in agent_specs().items()]
+        print(json.dumps({"agents": reports}, ensure_ascii=False, indent=2))
+    elif args.command == "skill":
+        if args.skill_cmd == "list":
+            print(json.dumps({"skills": inspect_skills_matrix()}, ensure_ascii=False, indent=2))
+        elif args.skill_cmd == "enable":
+            print(json.dumps(set_skill_enabled(args.folder, True), ensure_ascii=False, indent=2))
+        elif args.skill_cmd == "disable":
+            print(json.dumps(set_skill_enabled(args.folder, False), ensure_ascii=False, indent=2))
+    elif args.command == "connect":
+        results = [connect_agent(aid, spec, dry_run=args.dry_run) for aid, spec in resolve_targets(args.target)]
+        print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
+    elif args.command == "disconnect":
+        results = [disconnect_agent(aid, spec, force=args.force) for aid, spec in resolve_targets(args.target)]
+        print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
+    elif args.command == "doctor":
+        report = run_doctor(fix=args.fix)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

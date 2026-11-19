@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unified Memory &amp; Skills · $library</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#detail-title">跳到内容区</a>
+
+  <header class="topbar">
+    <div class="wrapper topbar-inner">
+      <div class="brand-group">
+        <a class="brand" href="$home_link">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span class="brand-text">
+            <strong>Unified Hub</strong>
+            <small>$library</small>
+          </span>
+        </a>
+        <nav class="mode-switch" aria-label="工作台模块切换">
+          $mode_tabs
+        </nav>
+        $library_nav
+      </div>
+      <div class="topbar-actions">
+        $topbar_cta
+      </div>
+    </div>
+  </header>
+
+  <section class="wrapper agents-section" aria-label="跨 Agent 统一接入控制">
+    $agent_panel
+  </section>
+
+  <main class="wrapper workspace">
+    <aside class="sidebar" aria-label="检索与分类导航">
+      <search class="search-box">
+        <form class="search-form" action="/" method="get" aria-label="站内检索">
+          $search_hidden_fields
+          <label class="visually-hidden" for="filter-q">搜索关键字</label>
+          <div class="search-input-row">
+            <input id="filter-q" name="q" type="search" value="$q"
+                   autocorrect="off" autocapitalize="none" spellcheck="false"
+                   placeholder="$search_placeholder">
+            <button class="btn btn-secondary btn-compact" type="submit">搜索</button>
+            $clear_search
+          </div>
+        </form>
+      </search>
+
+      <nav class="filter-block" aria-label="分类筛选">
+        <p class="filter-caption">$filter_caption</p>
+        <div class="layer-pills">$layer_tabs</div>
+      </nav>
+
+      <nav class="filter-block" aria-label="状态与来源筛选">
+        <div class="$segment_class">$source_tabs</div>
+      </nav>
+
+      <div class="list-header">
+        <div class="list-header-left">
+          <span>$list_title</span>
+          <span class="count">$count 条</span>
+        </div>
+        $sort_controls
+      </div>
+      $unreadable
+      $listing
+    </aside>
+
+    <section class="detail-pane">
+      $feedback
+      <div class="detail-header">
+        <div class="detail-heading-wrap">
+          $detail_badges
+          <h1 class="detail-title" id="detail-title" tabindex="-1">$heading</h1>
+          $detail_submeta
+        </div>
+        <div class="detail-actions">
+          $detail_toolbar
+        </div>
+      </div>
+
+      $reader
+      $editor
+      $confirm_dialog
+    </section>
+  </main>
+
+  <footer class="wrapper footer">
+    <span>记忆入口：<code>$index_path</code></span>
+    <span>统一技能库：<code>$skills_path</code></span>
+    <span>个人手记：<code>$folder</code></span>
+  </footer>
+</body>
+</html>

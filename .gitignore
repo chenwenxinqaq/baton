@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+/.state/
+/MEMORY.md
+/constraints/
+/methods/
+/preferences/
+/projects/
+/archive/
+/user-managed/
+/skills/*
+!/skills/unified-memory/
