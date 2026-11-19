@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+import difflib
 import errno
 import fcntl
 from hashlib import sha256
@@ -1201,7 +1202,7 @@ def library_nav_html(libraries, current_key):
 
 
 def render_library_sync_bar(library, key, token, tab=""):
-    """Render Git sync status and one-click sync/rebuild controls for the active library."""
+    """Build compact status summary chips and quick sync action for the collapsible ops strip."""
     sync_cfg = library.sync_config or {}
     remote = sync_cfg.get("remote") or "origin"
     branch = sync_cfg.get("branch") or ""
@@ -1213,7 +1214,7 @@ def render_library_sync_bar(library, key, token, tab=""):
         br_txt = st.get("branch") or "main"
         parts.append(f'<span class="meta-chip">Git: {escape(br_txt)}</span>')
         if st.get("remote_url"):
-            parts.append(f'<span class="chip-ok">✓ 远端已配</span>')
+            parts.append('<span class="chip-ok">✓ 远端已配</span>')
             if st.get("behind"):
                 parts.append(f'<span class="chip-warn">↓ 落后 {st["behind"]}</span>')
             if st.get("ahead"):
@@ -1221,11 +1222,17 @@ def render_library_sync_bar(library, key, token, tab=""):
         else:
             parts.append('<span class="chip-off">○ 未绑远端</span>')
         if st.get("dirty_count"):
-            parts.append(f'<span class="chip-warn">● {st["dirty_count"]} 项未提交</span>')
+            parts.append(f'<span class="chip-warn">● {st["dirty_count"]} 未提交</span>')
     else:
         parts.append('<span class="chip-off">○ 未启用 Git</span>')
 
     actions = []
+    conflicts = st.get("conflicts") or []
+    if conflicts:
+        conflict_href = query(library=key, view="conflicts") + "#detail-title"
+        actions.append(
+            f'<a class="btn btn-warn btn-compact" href="{escape(conflict_href)}">⚠ 处理 {len(conflicts)} 个冲突</a>'
+        )
     if st.get("is_repo") and st.get("remote_url"):
         sync_label = "拉取更新" if library.is_readonly else "Git 同步"
         actions.append(
@@ -1234,30 +1241,14 @@ def render_library_sync_bar(library, key, token, tab=""):
             f'<button class="btn btn-secondary btn-compact" type="submit">{sync_label}</button>'
             f"</form>"
         )
-    if not library.is_readonly:
-        actions.append(
-            f'<form method="post" action="/rebuild_index#feedback">'
-            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}'
-            f'<button class="btn btn-ghost btn-compact" type="submit">重建索引</button>'
-            f"</form>"
-        )
-
-    conflict_html = ""
-    if st.get("conflicts"):
-        c_names = "、".join(escape(c) for c in st["conflicts"])
-        conflict_html = (
-            f'<p class="agent-issue">发现待人工合并的同步冲突副本（合并并删除后方可推送）：{c_names}</p>'
-        )
-
-    return f"""
-      <div class="sync-bar">
-        <div class="sync-bar-meta">
-          <strong>当前库：{escape(library.label)}</strong>
-          <div class="check-chips">{"".join(parts)}</div>
-        </div>
-        <div class="agents-global-actions">{"".join(actions)}</div>
-      </div>
-      {conflict_html}"""
+    hub_href = query(library=key, view="sync_hub") + "#detail-title"
+    actions.append(f'<a class="btn btn-ghost btn-compact" href="{escape(hub_href)}">共享与同步</a>')
+    return {
+        "chips": "".join(parts),
+        "actions": "".join(actions),
+        "conflicts": conflicts,
+        "status": st,
+    }
 
 
 def format_comp_chip(label, state, suffix=""):
@@ -1269,14 +1260,16 @@ def format_comp_chip(label, state, suffix=""):
     return f'<span class="chip-off">○ {escape(label)}未配</span>'
 
 
-def render_agent_panel(token, key, tab="", agent_home=None):
-    """Render integration status and controls for each supported client."""
+def render_agent_panel(token, key, tab="", agent_home=None, library=None):
+    """Render compact collapsible ops bar (sync + agent summary) with expandable client cards."""
+    sync_meta = render_library_sync_bar(library, key, token, tab=tab) if library is not None else None
     try:
         import memoryctl
 
         specs = memoryctl.agent_specs(home=agent_home)
         cards = []
         managed_count = 0
+        drifted_count = 0
         for aid, spec in specs.items():
             info = memoryctl.inspect_agent(aid, spec)
             state = info["state"]
@@ -1284,7 +1277,7 @@ def render_agent_panel(token, key, tab="", agent_home=None):
                 managed_count += 1
                 item_cls = "agent-item agent-item-managed"
                 pill_cls = "status-pill status-pill-managed"
-                pill_txt = "● 已连通"
+                pill_txt = "● 已配置"
                 btn_html = f"""
                   <form method="post" action="/agent#feedback">
                     {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
@@ -1292,6 +1285,7 @@ def render_agent_panel(token, key, tab="", agent_home=None):
                     <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
                   </form>"""
             elif state in {"drifted", "partial"}:
+                drifted_count += 1
                 item_cls = "agent-item agent-item-drifted"
                 pill_cls = "status-pill status-pill-drifted"
                 pill_txt = "▲ 待同步"
@@ -1356,34 +1350,71 @@ def render_agent_panel(token, key, tab="", agent_home=None):
                 <button class="btn btn-primary btn-compact" type="submit">一键同步全部</button>
               </form>"""
 
-        summary_note = (
-            f"客户端已全部连通（{managed_count}/{len(specs)}）"
-            if managed_count == len(specs)
-            else f"已完整同步 {managed_count}/{len(specs)} 个客户端"
-        )
+        rebuild_btn = ""
+        if library is not None and not library.is_readonly:
+            rebuild_btn = f"""
+              <form method="post" action="/rebuild_index#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                <button class="btn btn-ghost btn-compact" type="submit">重建索引</button>
+              </form>"""
+
         stray_list = memoryctl.scan_stray_agent_memories(home=agent_home)
         stray_alert = (
             f'<p class="agent-issue">发现未归集的隐藏目录散落记忆（请合并后清理）：{escape(", ".join(stray_list))}</p>'
             if stray_list
             else ""
         )
+        agent_chip = (
+            f'<span class="chip-warn">▲ 客户端待同步 ({drifted_count})</span>'
+            if drifted_count
+            else f'<span class="chip-ok">✓ 客户端 {managed_count}/{len(specs)} 已配</span>'
+        )
+        sync_chips = sync_meta["chips"] if sync_meta else ""
+        sync_actions = sync_meta["actions"] if sync_meta else ""
+        conflict_banner = ""
+        if sync_meta and sync_meta["conflicts"]:
+            c_href = query(library=key, view="conflicts") + "#detail-title"
+            conflict_banner = (
+                f'<p class="agent-issue">发现 {len(sync_meta["conflicts"])} 个同步冲突副本，合并并清理后方可推送：'
+                f'{escape("、".join(sync_meta["conflicts"]))} · '
+                f'<a href="{escape(c_href)}">进入可视化对比合并 →</a></p>'
+            )
+
         return f"""
-        <div class="agents-ribbon">
-          <div class="agents-ribbon-top">
-            <div class="agents-title-row">
-              <h2>跨 Agent 统一接入控制</h2>
-              <span class="agents-subtitle">· {escape(summary_note)}</span>
+        <div class="ops-strip">
+          <div class="ops-strip-top">
+            <div class="ops-strip-left">
+              <div class="check-chips">{sync_chips}{agent_chip}</div>
             </div>
-            <div class="agents-global-actions">
-              {connect_all_btn}
-              <form method="post" action="/doctor#feedback">
-                {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
-                <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
-              </form>
+            <div class="ops-strip-right">
+              {sync_actions}
             </div>
           </div>
+          {conflict_banner}
           {stray_alert}
-          <div class="agents-cards">{"".join(cards)}</div>
+          <details class="ops-drawer">
+            <summary class="ops-drawer-summary">
+              <span>客户端接入与运维面板（{managed_count}/{len(specs)} 客户端已配置）</span>
+              <span class="ops-drawer-hint">展开管理 ▾</span>
+            </summary>
+            <div class="ops-drawer-body">
+              <div class="agents-ribbon-top">
+                <div class="agents-title-row">
+                  <h2>跨 Agent 统一接入控制</h2>
+                  <span class="agents-subtitle">· 状态反映本机配置与技能软链接，实际连接以各客户端进程为准</span>
+                </div>
+                <div class="agents-global-actions">
+                  {connect_all_btn}
+                  {rebuild_btn}
+                  <form method="post" action="/doctor#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
+                  </form>
+                </div>
+              </div>
+              <div class="agents-cards">{"".join(cards)}</div>
+            </div>
+          </details>
         </div>"""
     except OSError:
         return (
@@ -1391,6 +1422,408 @@ def render_agent_panel(token, key, tab="", agent_home=None):
             '<p class="agents-subtitle">当前进程受沙盒限制无法直接检测客户端目录；在本地终端运行 python3 manager/manager.py 即可启用客户端接入管理。</p>'
             "</div>"
         )
+
+
+def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
+    """Render native modal dialog to promote/share a personal topic into a writable shared library."""
+    if not writable_shared_libs:
+        return ""
+    lib_options = []
+    for lk, lib in writable_shared_libs:
+        layers_str = "/".join(sorted(lib.allowed_layers))
+        lib_options.append(
+            f'<option value="{escape(lk)}">{escape(lib.label)}（允许：{escape(layers_str)}）</option>'
+        )
+    # Collect union of allowed layers across writable shared libs, preferring topic's own layer if allowed.
+    default_lib = writable_shared_libs[0][1]
+    default_layer = topic_entry.layer if topic_entry.layer in default_lib.allowed_layers else sorted(default_lib.allowed_layers)[0]
+    layer_options = []
+    for lyr in ALL_LAYERS:
+        sel = " selected" if lyr == default_layer else ""
+        lname = LAYERS[lyr][0]
+        layer_options.append(f'<option value="{lyr}"{sel}>{lyr} · {escape(lname)}</option>')
+
+    return f"""
+    <dialog id="share-dialog" class="confirm-dialog share-dialog" closedby="any" aria-labelledby="share-dialog-title">
+      <div class="dialog-body">
+        <h2 id="share-dialog-title">分享个人记忆到共享库</h2>
+        <p>将当前条目 <strong>{escape(topic_entry.title)}</strong>（<code>{escape(topic_entry.slug)}.md</code>）复制到选定的团队共享库。</p>
+        <form action="/share_topic#feedback" method="post" class="share-form">
+          {hidden("csrf", token)}
+          {hidden("library", key)}
+          {hidden("topic", topic_entry.path)}
+          <div class="field-group">
+            <label class="field-label" for="share-target-lib">目标共享库</label>
+            <select id="share-target-lib" name="target_library" required>{"".join(lib_options)}</select>
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="share-target-layer">写入层级</label>
+            <select id="share-target-layer" name="target_layer" required>{"".join(layer_options)}</select>
+            <p class="field-hint">共享库默认只允许 L1 / L3 / L4；如原条目为 L0/L2，建议改选 L1 方法或 L3 项目后分享。</p>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" name="overwrite" value="1">
+            <span>若目标库已存在同名条目则覆盖更新（旧版自动进本机回收站）</span>
+          </label>
+          <div class="dialog-actions">
+            <button class="btn btn-ghost" type="button" commandfor="share-dialog" command="close">取消</button>
+            <button class="btn btn-primary" type="submit">确认分享</button>
+          </div>
+        </form>
+      </div>
+    </dialog>"""
+
+
+def render_layer_checkboxes(selected_layers, prefix="layer_"):
+    boxes = []
+    selected = set(selected_layers)
+    for lyr in ALL_LAYERS:
+        chk = " checked" if lyr in selected else ""
+        boxes.append(
+            f'<label class="layer-check-chip">'
+            f'<input type="checkbox" name="{prefix}{lyr}" value="1"{chk}>'
+            f'<span>{lyr} {LAYER_SHORT[lyr]}</span>'
+            f"</label>"
+        )
+    return f'<div class="layer-check-row">{"".join(boxes)}</div>'
+
+
+def render_sync_hub_html(token, key, libraries, agent_home=None):
+    """Render graphical Multi-Library Mount & Git Sync Hub management view."""
+    import memoryctl
+
+    all_libs = memoryctl.mount_list(home=agent_home)
+    personal_info = next((item for item in all_libs if item["id"] == "personal"), None)
+    personal_sync = (personal_info or {}).get("sync") or {}
+    personal_git = (personal_info or {}).get("git") or {}
+    personal_remote = personal_sync.get("remote_url") or personal_git.get("remote_url") or ""
+    personal_branch = personal_sync.get("branch") or personal_git.get("branch") or "main"
+    personal_auto_commit = personal_sync.get("auto_commit", True)
+
+    cards = []
+    for item in all_libs:
+        lid = item["id"]
+        nav_key = "primary" if lid == "personal" else lid
+        git = item.get("git") or {}
+        sync_cfg = item.get("sync") or {}
+        is_personal = lid == "personal"
+        is_ro = item["mode"] == "ro"
+        role_txt = "个人主库 · 读写" if is_personal else ("团队共享 · 只读" if is_ro else "团队共享 · 共写")
+        status_chips = [
+            f'<span class="meta-chip">{role_txt}</span>',
+            f'<span class="meta-chip">层级: {escape("/".join(item["layers"]))}</span>',
+        ]
+        if not item.get("enabled", True):
+            status_chips.append('<span class="chip-off">已停用</span>')
+        if git.get("is_repo"):
+            status_chips.append(f'<span class="meta-chip">Git: {escape(git.get("branch") or "main")}</span>')
+            if git.get("remote_url"):
+                status_chips.append('<span class="chip-ok">✓ 远端已绑</span>')
+            else:
+                status_chips.append('<span class="chip-off">○ 仅本地 Git</span>')
+            if git.get("dirty_count"):
+                status_chips.append(f'<span class="chip-warn">● {git["dirty_count"]} 未提交</span>')
+            if git.get("ahead"):
+                status_chips.append(f'<span class="chip-warn">↑ {git["ahead"]}</span>')
+            if git.get("behind"):
+                status_chips.append(f'<span class="chip-warn">↓ {git["behind"]}</span>')
+            if git.get("conflicts"):
+                status_chips.append(f'<span class="chip-warn">⚠ {len(git["conflicts"])} 冲突</span>')
+        else:
+            status_chips.append('<span class="chip-off">○ 未初始化 Git</span>')
+
+        remote_line = (
+            f'<p class="hub-card-path">远端：<code>{escape(git.get("remote_url") or sync_cfg.get("remote_url") or "")}</code></p>'
+            if (git.get("remote_url") or sync_cfg.get("remote_url"))
+            else ""
+        )
+
+        act_btns = []
+        if nav_key in libraries:
+            act_btns.append(f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=nav_key))}">浏览条目</a>')
+        if git.get("conflicts") and nav_key in libraries:
+            act_btns.append(
+                f'<a class="btn btn-warn btn-compact" href="{escape(query(library=nav_key, view="conflicts"))}#detail-title">处理冲突</a>'
+            )
+        if git.get("is_repo") and git.get("remote_url") and nav_key in libraries:
+            s_lbl = "拉取更新" if is_ro else "立即同步"
+            act_btns.append(
+                f'<form method="post" action="/sync#feedback">'
+                f'{hidden("csrf", token)}{hidden("library", nav_key)}{hidden("return_view", "sync_hub")}'
+                f'<button class="btn btn-secondary btn-compact" type="submit">{s_lbl}</button>'
+                f"</form>"
+            )
+        if not is_ro and nav_key in libraries:
+            act_btns.append(
+                f'<form method="post" action="/rebuild_index#feedback">'
+                f'{hidden("csrf", token)}{hidden("library", nav_key)}{hidden("return_view", "sync_hub")}'
+                f'<button class="btn btn-ghost btn-compact" type="submit">重建索引</button>'
+                f"</form>"
+            )
+
+        manage_drawer = ""
+        if not is_personal:
+            cur_remote = sync_cfg.get("remote_url") or git.get("remote_url") or ""
+            cur_branch = sync_cfg.get("branch") or git.get("branch") or "main"
+            ro_sel = " selected" if is_ro else ""
+            rw_sel = " selected" if not is_ro else ""
+            en_chk = " checked" if item.get("enabled", True) else ""
+            ac_chk = " checked" if sync_cfg.get("auto_commit", True) else ""
+            manage_drawer = f"""
+            <details class="mount-edit-drawer">
+              <summary>修改挂载与同步设置 / 解除挂载 ▾</summary>
+              <form method="post" action="/mount_update#feedback" class="hub-inline-form">
+                {hidden("csrf", token)}{hidden("library", key)}{hidden("mount_id", lid)}
+                <div class="form-row-two">
+                  <div class="field-group">
+                    <label class="field-label">显示名称</label>
+                    <input type="text" name="label" value="{escape(item['label'])}" required maxlength="60">
+                  </div>
+                  <div class="field-group">
+                    <label class="field-label">协作权限</label>
+                    <select name="mode">
+                      <option value="ro"{ro_sel}>只读订阅（ro）</option>
+                      <option value="rw"{rw_sel}>团队共写（rw）</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-row-two">
+                  <div class="field-group">
+                    <label class="field-label">Git 远端地址（可选）</label>
+                    <input type="text" name="remote_url" value="{escape(cur_remote)}" placeholder="git@github.com:org/repo.git 或 https://...">
+                  </div>
+                  <div class="field-group">
+                    <label class="field-label">分支</label>
+                    <input type="text" name="branch" value="{escape(cur_branch)}" placeholder="main">
+                  </div>
+                </div>
+                <div class="field-group">
+                  <label class="field-label">允许生效的记忆层级</label>
+                  {render_layer_checkboxes(item["layers"])}
+                </div>
+                <div class="checkbox-inline-group">
+                  <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{en_chk}><span>启用挂载</span></label>
+                  <label class="checkbox-row"><input type="checkbox" name="auto_commit" value="1"{ac_chk}><span>写入时自动本地 Git 提交</span></label>
+                </div>
+                <div class="form-actions">
+                  <button class="btn btn-primary btn-compact" type="submit">保存设置</button>
+                </div>
+              </form>
+              <form method="post" action="/mount_remove#feedback" class="mount-remove-form">
+                {hidden("csrf", token)}{hidden("library", key)}{hidden("mount_id", lid)}
+                <button class="btn btn-danger-ghost btn-compact" type="submit">解除挂载（保留本地目录文件）</button>
+              </form>
+            </details>"""
+
+        cards.append(
+            f"""
+          <article class="hub-card">
+            <div class="hub-card-head">
+              <div>
+                <strong>{escape(item["label"])}</strong>
+                <span class="hub-card-id"><code>{escape(lid)}</code></span>
+              </div>
+              <div class="hub-card-actions">{"".join(act_btns)}</div>
+            </div>
+            <div class="check-chips">{"".join(status_chips)}</div>
+            <p class="hub-card-path">目录：<code>{escape(item["path"])}</code></p>
+            {remote_line}
+            {manage_drawer}
+          </article>"""
+        )
+
+    p_ac_chk = " checked" if personal_auto_commit else ""
+    return f"""
+    <div class="sync-hub">
+      <section class="hub-section">
+        <h2 class="hub-section-title">已挂载记忆库（{len(all_libs)}）</h2>
+        <p class="hub-section-desc">MCP 会跨所有已启用的库联合检索，写入默认只落个人主库；共享库默认隔离 L0 个人红线与 L2 个人偏好。</p>
+        <div class="hub-card-list">{"".join(cards)}</div>
+      </section>
+
+      <section class="hub-section">
+        <h2 class="hub-section-title">个人主库跨设备同步（GitHub / Gitee / 自建 Git）</h2>
+        <p class="hub-section-desc">将个人库绑定到私有 Git 仓库；在另一台电脑克隆同一仓库并指向 <code>UNIFIED_MEMORY_ROOT</code> 即可多机共享。</p>
+        <form method="post" action="/sync_setup#feedback" class="hub-form">
+          {hidden("csrf", token)}{hidden("library", key)}{hidden("target_library", "personal")}
+          <div class="form-row-two">
+            <div class="field-group">
+              <label class="field-label" for="p-remote-url">Git 仓库地址</label>
+              <input id="p-remote-url" type="text" name="remote_url" value="{escape(personal_remote)}" required
+                     placeholder="git@github.com:you/my-memory.git 或 https://gitee.com/...">
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="p-branch">分支</label>
+              <input id="p-branch" type="text" name="branch" value="{escape(personal_branch)}" placeholder="main">
+            </div>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" name="auto_commit" value="1"{p_ac_chk}>
+            <span>Agent 或网页每次修改后自动在本地 Git 提交快照</span>
+          </label>
+          <div class="form-actions">
+            <button class="btn btn-primary" type="submit">保存个人库 Git 绑定</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="hub-section">
+        <h2 class="hub-section-title">挂载新的共享记忆库</h2>
+        <p class="hub-section-desc">支持挂载本地目录或直接克隆远端 Git 仓库（GitHub / Gitee / 自建 Gitea），按库选择只读订阅或团队共写。</p>
+        <form method="post" action="/mount_add#feedback" class="hub-form">
+          {hidden("csrf", token)}{hidden("library", key)}
+          <div class="form-row-two">
+            <div class="field-group">
+              <label class="field-label" for="m-id">库标识 ID（英文短名）</label>
+              <input id="m-id" type="text" name="mount_id" required pattern="[a-z0-9][a-z0-9_-]{{0,39}}"
+                     placeholder="例如 team-kb">
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="m-label">显示名称</label>
+              <input id="m-label" type="text" name="label" required maxlength="60" placeholder="例如 研发共享库">
+            </div>
+          </div>
+          <div class="form-row-two">
+            <div class="field-group">
+              <label class="field-label" for="m-path">本地保存目录</label>
+              <input id="m-path" type="text" name="path" required placeholder="~/UnifiedMemory-Team">
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="m-mode">权限模式</label>
+              <select id="m-mode" name="mode">
+                <option value="ro">只读订阅（ro · 仅拉取检索，禁止修改）</option>
+                <option value="rw">团队共写（rw · 允许更新与推送）</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row-two">
+            <div class="field-group">
+              <label class="field-label" for="m-git">Git 仓库地址（可选，填写则自动克隆）</label>
+              <input id="m-git" type="text" name="git_url" placeholder="git@gitee.com:team/memory-kb.git">
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="m-branch">分支</label>
+              <input id="m-branch" type="text" name="branch" value="main" placeholder="main">
+            </div>
+          </div>
+          <div class="field-group">
+            <label class="field-label">允许生效的记忆层级（推荐保持默认以保护个人红线与偏好）</label>
+            {render_layer_checkboxes(["L1", "L3", "L4"])}
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" name="auto_commit" value="1" checked>
+            <span>共写模式下写入后自动在本地 Git 提交</span>
+          </label>
+          <div class="form-actions">
+            <button class="btn btn-primary" type="submit">挂载共享库</button>
+          </div>
+        </form>
+      </section>
+    </div>"""
+
+
+def render_conflicts_view_html(token, key, library):
+    """Render side-by-side diff and one-click conflict resolution workbench."""
+    conflicts = sync_git.find_conflict_files(library.root)
+    if not conflicts:
+        return (
+            '<div class="empty-state-card">'
+            "<h3>当前记忆库没有待处理的同步冲突</h3>"
+            f'<p>所有条目状态一致。<a href="{escape(query(library=key))}">返回记忆库概览</a></p>'
+            "</div>"
+        )
+
+    blocks = []
+    for idx, conflict_rel in enumerate(conflicts, start=1):
+        orig_rel = sync_git.original_path_for_conflict(conflict_rel)
+        orig_path = library.root / orig_rel
+        conflict_path = library.root / conflict_rel
+        local_text = orig_path.read_text(encoding="utf-8", errors="replace") if orig_path.is_file() else ""
+        remote_text = conflict_path.read_text(encoding="utf-8", errors="replace") if conflict_path.is_file() else ""
+
+        diff_lines = list(
+            difflib.unified_diff(
+                local_text.splitlines(),
+                remote_text.splitlines(),
+                fromfile=f"本地当前版 ({orig_rel})",
+                tofile=f"远端冲突版 ({conflict_rel})",
+                lineterm="",
+                n=3,
+            )
+        )
+        diff_html_rows = []
+        for line in diff_lines:
+            if line.startswith("+++") or line.startswith("---"):
+                cls = "diff-meta"
+            elif line.startswith("@@"):
+                cls = "diff-hunk"
+            elif line.startswith("+"):
+                cls = "diff-add"
+            elif line.startswith("-"):
+                cls = "diff-del"
+            else:
+                cls = "diff-ctx"
+            diff_html_rows.append(f'<div class="diff-line {cls}">{escape(line)}</div>')
+        diff_box = (
+            f'<div class="diff-view">{"".join(diff_html_rows)}</div>'
+            if diff_html_rows
+            else '<p class="field-hint">两份文件内容完全相同，可直接点击「保留本地版本」清理冲突副本。</p>'
+        )
+
+        blocks.append(
+            f"""
+        <article class="conflict-card">
+          <div class="conflict-card-head">
+            <div>
+              <strong>冲突 #{idx}：<code>{escape(orig_rel)}</code></strong>
+              <p class="hub-card-path">远端副本：<code>{escape(conflict_rel)}</code></p>
+            </div>
+            <div class="conflict-quick-actions">
+              <form method="post" action="/resolve_conflict#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("conflict_file", conflict_rel)}{hidden("strategy", "keep_local")}
+                <button class="btn btn-secondary btn-compact" type="submit">保留本地版本</button>
+              </form>
+              <form method="post" action="/resolve_conflict#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("conflict_file", conflict_rel)}{hidden("strategy", "use_remote")}
+                <button class="btn btn-primary btn-compact" type="submit">采用远端版本</button>
+              </form>
+            </div>
+          </div>
+
+          <h3 class="conflict-subhead">行级差异（红 = 本地，绿 = 远端）</h3>
+          {diff_box}
+
+          <div class="conflict-columns">
+            <div class="conflict-col">
+              <p class="conflict-col-title">本地当前版本（{escape(orig_rel)}）</p>
+              <pre class="markdown-raw conflict-pre">{escape(local_text)}</pre>
+            </div>
+            <div class="conflict-col">
+              <p class="conflict-col-title">远端同步版本（{escape(conflict_rel)}）</p>
+              <pre class="markdown-raw conflict-pre">{escape(remote_text)}</pre>
+            </div>
+          </div>
+
+          <details class="mount-edit-drawer">
+            <summary>手工合并两边内容后保存 ▾</summary>
+            <form method="post" action="/resolve_conflict#feedback" class="edit-form hub-inline-form">
+              {hidden("csrf", token)}{hidden("library", key)}
+              {hidden("conflict_file", conflict_rel)}{hidden("strategy", "custom_merge")}
+              <div class="field-group">
+                <label class="field-label">合并后的完整 Markdown（含 frontmatter）</label>
+                <textarea name="merged_content" rows="14" required>{escape(local_text)}</textarea>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn-primary btn-compact" type="submit">保存合并结果并清除冲突</button>
+              </div>
+            </form>
+          </details>
+        </article>"""
+        )
+
+    return f'<div class="conflict-list">{"".join(blocks)}</div>'
 
 
 def filter_and_score(library, topics, entries, q, layer, status, source, window="", sort_by="updated"):
@@ -1836,7 +2269,7 @@ def render_skills_tab(
         index_path=escape(str(library.index)),
         skills_path=escape(str(library.root / "skills")),
         folder=escape(str(library.folder)),
-        agent_panel=render_agent_panel(token, key, tab="skills", agent_home=agent_home),
+        agent_panel=render_agent_panel(token, key, tab="skills", agent_home=agent_home, library=library),
         detail_badges=detail_badges,
         detail_submeta=detail_submeta,
         detail_toolbar=detail_toolbar,
@@ -2169,6 +2602,19 @@ def render(
             )
         )
         reader = summary_html + body_html
+    elif view == "sync_hub":
+        heading = "共享记忆库与 Git 同步中心"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'
+        detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
+        reader = render_sync_hub_html(token, key, libraries, agent_home=agent_home)
+    elif view == "conflicts":
+        heading = f"同步冲突对比与合并 · {library.label}"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">行级 Diff · 双方内容完整保留</span></div>'
+        detail_toolbar = (
+            f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=key, view="sync_hub"))}#detail-title">共享与同步</a>'
+            f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
+        )
+        reader = render_conflicts_view_html(token, key, library)
     elif view == "index":
         heading = "MEMORY.md · 记忆维护规则与总索引"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
@@ -2225,8 +2671,19 @@ def render(
                         {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
                         <button class="btn btn-ghost btn-compact" type="submit">归档至 L4</button>
                       </form>"""
+                writable_shared = [
+                    (lk, lib)
+                    for lk, lib in libraries.items()
+                    if lib.role == "shared" and not lib.is_readonly
+                ]
+                share_btn = ""
+                share_dialog = ""
+                if library.role == "personal" and writable_shared:
+                    share_btn = '<button class="btn btn-secondary btn-compact" type="button" commandfor="share-dialog" command="show-modal">分享到共享库</button>'
+                    share_dialog = render_share_dialog_html(token, key, t_entry, writable_shared)
                 detail_toolbar = f"""
                   <a class="btn btn-primary btn-compact" href="{escape(edit_topic_href)}">编辑记忆</a>
+                  {share_btn}
                   <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
                   {archive_btn}
                   <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
@@ -2237,7 +2694,7 @@ def render(
                     target_id=t_entry.path,
                     display_path=t_entry.path,
                     revision=t_entry.revision,
-                )
+                ) + share_dialog
             summary_html = (
                 f'<div class="doc-summary-banner">{escape(t_entry.description)}</div>'
                 if t_entry.description
@@ -2298,10 +2755,7 @@ def render(
     )
     topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
 
-    agent_and_sync_html = (
-        render_agent_panel(token, key, tab="", agent_home=agent_home)
-        + render_library_sync_bar(library, key, token, tab="")
-    )
+    agent_and_sync_html = render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
 
     return load_template().substitute(
         library=escape(library.label),
@@ -2381,10 +2835,10 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _refresh_mounts(self):
+    def _refresh_mounts(self, force=False):
         loader = getattr(self.server, "reload_mounts", None)
         if loader is not None:
-            loader()
+            loader(force=force)
 
     def do_GET(self):
         if not self.known_host():
@@ -2430,7 +2884,7 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in {"", "new", "edit", "edit_topic", "index", "edit_index"}
+                or view not in {"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts"}
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -2453,8 +2907,14 @@ class Handler(BaseHTTPRequestHandler):
             "skill_enabled": "技能已启用并同步到已连通客户端。",
             "skill_disabled": "技能已停用并从已连通客户端卸载。",
             "synced": "Git 同步完成。",
-            "synced_conflicts": "已合并远端更新，发现正文冲突副本，请人工合并并删除冲突文件后再推送。",
+            "synced_conflicts": "已合并远端更新，发现正文冲突副本，请前往冲突对比页合并后再推送。",
             "index_rebuilt": "MEMORY.md 索引已按磁盘条目重新生成。",
+            "sync_setup_saved": "Git 远端同步配置已保存。",
+            "mount_added": "共享记忆库已挂载生效，顶栏可直接切换。",
+            "mount_updated": "共享库挂载设置已更新。",
+            "mount_removed": "已解除挂载（本地目录与文件已完整保留）。",
+            "conflict_resolved": "冲突已解决并清理冲突副本。",
+            "topic_shared": "已将该个人记忆分享到目标共享库。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -2495,6 +2955,12 @@ class Handler(BaseHTTPRequestHandler):
             "/skill",
             "/sync",
             "/rebuild_index",
+            "/sync_setup",
+            "/mount_add",
+            "/mount_update",
+            "/mount_remove",
+            "/resolve_conflict",
+            "/share_topic",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
@@ -2510,7 +2976,7 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(
                 self.rfile.read(size).decode("utf-8"),
                 keep_blank_values=True,
-                max_num_fields=20,
+                max_num_fields=32,
                 errors="strict",
             )
             if any(len(values) != 1 for values in params.values()):
@@ -2525,7 +2991,19 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.FORBIDDEN, "请刷新页面后重试。", "text/plain; charset=utf-8")
             return
 
-        if self.path in {"/agent", "/doctor", "/skill", "/sync", "/rebuild_index"}:
+        if self.path in {
+            "/agent",
+            "/doctor",
+            "/skill",
+            "/sync",
+            "/rebuild_index",
+            "/sync_setup",
+            "/mount_add",
+            "/mount_update",
+            "/mount_remove",
+            "/resolve_conflict",
+            "/share_topic",
+        }:
             self.handle_control_action(fields)
             return
         if self.path == "/save_index":
@@ -2567,8 +3045,8 @@ class Handler(BaseHTTPRequestHandler):
                 lib_obj = self.server.libraries[key]
                 lib_obj._ensure_writable()
                 sync_git.rebuild_index(lib_obj.root)
-                notice = "index_rebuilt"
-                loc = query(library=key, tab=return_tab, notice=notice)
+                return_view = fields.get("return_view", "")
+                loc = query(library=key, tab=return_tab, view=return_view, notice="index_rebuilt")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/sync":
@@ -2580,8 +3058,148 @@ class Handler(BaseHTTPRequestHandler):
                     branch=sync_cfg.get("branch") or "",
                     mode=lib_obj.mode,
                 )
-                notice = "synced_conflicts" if res.get("status") == "needs_manual_merge" else "synced"
-                loc = query(library=key, tab=return_tab, notice=notice)
+                return_view = fields.get("return_view", "")
+                if res.get("status") == "needs_manual_merge":
+                    loc = query(library=key, view="conflicts", notice="synced_conflicts")
+                else:
+                    loc = query(library=key, tab=return_tab, view=return_view, notice="synced")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/sync_setup":
+                target_lib = fields.get("target_library", "personal").strip() or "personal"
+                remote_url = fields.get("remote_url", "").strip()
+                if not remote_url:
+                    raise InvalidEntry("请填写 Git 仓库地址。")
+                branch = fields.get("branch", "main").strip() or "main"
+                auto_commit = fields.get("auto_commit") == "1"
+                memoryctl.setup_library_sync(
+                    target_lib,
+                    remote_url=remote_url,
+                    branch=branch,
+                    auto_commit=auto_commit,
+                    home=agent_home,
+                )
+                self._refresh_mounts(force=True)
+                loc = query(library=key, view="sync_hub", notice="sync_setup_saved")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/mount_add":
+                mount_id = fields.get("mount_id", "").strip()
+                label = fields.get("label", "").strip()
+                path_val = fields.get("path", "").strip()
+                mode_val = fields.get("mode", "ro").strip()
+                git_url = fields.get("git_url", "").strip()
+                branch = fields.get("branch", "main").strip()
+                auto_commit = fields.get("auto_commit") == "1"
+                selected_layers = [lyr for lyr in ALL_LAYERS if fields.get(f"layer_{lyr}") == "1"]
+                if not selected_layers:
+                    raise InvalidEntry("请至少勾选一个允许生效的记忆层级。")
+                memoryctl.mount_add(
+                    mount_id,
+                    path_val,
+                    label=label or mount_id,
+                    mode=mode_val,
+                    layers=selected_layers,
+                    git_url=git_url,
+                    branch=branch,
+                    auto_commit=auto_commit,
+                    home=agent_home,
+                )
+                self._refresh_mounts(force=True)
+                loc = query(library=key, view="sync_hub", notice="mount_added")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/mount_update":
+                mount_id = fields.get("mount_id", "").strip()
+                label = fields.get("label", "").strip()
+                mode_val = fields.get("mode", "ro").strip()
+                remote_url = fields.get("remote_url", "").strip()
+                branch = fields.get("branch", "main").strip()
+                enabled = fields.get("enabled") == "1"
+                auto_commit = fields.get("auto_commit") == "1"
+                selected_layers = [lyr for lyr in ALL_LAYERS if fields.get(f"layer_{lyr}") == "1"]
+                if not selected_layers:
+                    raise InvalidEntry("请至少勾选一个允许生效的记忆层级。")
+                memoryctl.mount_update(
+                    mount_id,
+                    label=label,
+                    mode=mode_val,
+                    layers=selected_layers,
+                    enabled=enabled,
+                    remote_url=remote_url if remote_url else None,
+                    branch=branch if remote_url else None,
+                    auto_commit=auto_commit if remote_url else None,
+                    home=agent_home,
+                )
+                self._refresh_mounts(force=True)
+                dest_key = key if key in self.server.libraries else "primary"
+                loc = query(library=dest_key, view="sync_hub", notice="mount_updated")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/mount_remove":
+                mount_id = fields.get("mount_id", "").strip()
+                memoryctl.mount_remove(mount_id, home=agent_home)
+                self._refresh_mounts(force=True)
+                dest_key = key if key in self.server.libraries else "primary"
+                loc = query(library=dest_key, view="sync_hub", notice="mount_removed")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/resolve_conflict":
+                lib_obj = self.server.libraries[key]
+                lib_obj._ensure_writable()
+                conflict_file = fields.get("conflict_file", "").strip()
+                strategy = fields.get("strategy", "").strip()
+                merged_content = fields.get("merged_content", "")
+                sync_cfg = lib_obj.sync_config or {}
+                res = sync_git.resolve_conflict(
+                    lib_obj.root,
+                    conflict_file,
+                    strategy,
+                    merged_content=merged_content,
+                    auto_commit_enabled=bool(sync_cfg.get("driver") == "git" and sync_cfg.get("auto_commit", True)),
+                    library_id=lib_obj.library_id,
+                )
+                next_view = "conflicts" if res.get("remaining_conflicts") else ""
+                loc = query(library=key, view=next_view, notice="conflict_resolved")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/share_topic":
+                src_lib = self.server.libraries[key]
+                topic_path = fields.get("topic", "").strip()
+                target_key = fields.get("target_library", "").strip()
+                target_layer = fields.get("target_layer", "").strip()
+                overwrite = fields.get("overwrite") == "1"
+                if target_key not in self.server.libraries:
+                    raise InvalidEntry("目标共享库不存在或未启用。")
+                dst_lib = self.server.libraries[target_key]
+                dst_lib._ensure_writable(layer=target_layer)
+                t_entry = src_lib.read_topic(topic_path)
+                dst_folder = mcp_server.LAYER_DIRS[target_layer]
+                dst_file = dst_lib.root / dst_folder / f"{t_entry.slug}.md"
+                if dst_file.exists() and not overwrite:
+                    raise InvalidEntry(
+                        f"目标库「{dst_lib.label}」已存在 {dst_folder}/{t_entry.slug}.md；如需覆盖请勾选确认项。"
+                    )
+                dst_store = mcp_server.MemoryStore(
+                    dst_lib.root,
+                    library_id=dst_lib.library_id,
+                    label=dst_lib.label,
+                    role=dst_lib.role,
+                    mode=dst_lib.mode,
+                    allowed_layers=dst_lib.allowed_layers,
+                    allow_user_managed=dst_lib.allow_user_managed,
+                    sync_config=dst_lib.sync_config,
+                )
+                saved = dst_store.upsert_entry(
+                    layer=target_layer,
+                    name=t_entry.slug,
+                    title=t_entry.title,
+                    description=t_entry.description or t_entry.file_description or t_entry.title,
+                    body=t_entry.body,
+                    topic_type=t_entry.entry_type,
+                    user_managed=False,
+                )
+                loc = query(library=target_key, topic=saved["path"], notice="topic_shared")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/doctor":
@@ -2611,10 +3229,20 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise InvalidEntry("不支持的控制操作。")
         except (RuntimeError, ValueError, OSError, SystemExit) as exc:
+            err_view = ""
+            err_topic = ""
+            if self.path in {"/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
+                err_view = "sync_hub"
+            elif self.path == "/resolve_conflict":
+                err_view = "conflicts"
+            elif self.path == "/share_topic":
+                err_topic = fields.get("topic", "").strip()
             self.page(
                 HTTPStatus.CONFLICT,
                 key=key,
                 tab=return_tab or "memory",
+                view=err_view,
+                topic_path=err_topic,
                 error=f"操作未完成：{exc}",
             )
             return
@@ -2931,12 +3559,12 @@ def main():
         cfg_file = mounts_config_path()
         state_holder = {"mtime": cfg_file.stat().st_mtime if cfg_file.is_file() else None}
 
-        def reload_mounts():
+        def reload_mounts(force=False):
             try:
                 cur_mtime = cfg_file.stat().st_mtime if cfg_file.is_file() else None
             except OSError:
                 cur_mtime = None
-            if cur_mtime != state_holder["mtime"]:
+            if force or cur_mtime != state_holder["mtime"]:
                 server.libraries = build_libraries_map(primary, also_root=args.also_root)
                 state_holder["mtime"] = cur_mtime
 

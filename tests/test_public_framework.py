@@ -3,11 +3,13 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
-from urllib.request import urlopen
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 CODE = Path(__file__).resolve().parent.parent
@@ -265,6 +267,104 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertTrue(copy_path.is_file())
         self.assertIn("A机的修订", copy_path.read_text(encoding="utf-8"))
         self.assertIn("B机的修订", (lib_b / "methods/shared-tip.md").read_text(encoding="utf-8"))
+
+    def test_web_p0_sync_hub_share_and_conflict_resolution(self):
+        self.tool("memory_upsert", dict(layer="L1", name="deploy-tip", title="发布经验",
+                                        description="灰度步骤", body="先切 10% 流量"))
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0",
+                   "--memory-root", str(self.library)]
+        with subprocess.Popen(command, env=self.environment(), stdout=subprocess.PIPE, text=True) as process:
+            try:
+                address = process.stdout.readline().strip().rstrip("/")
+
+                def get_html(path):
+                    with urlopen(address + path, timeout=5) as resp:
+                        return resp.read().decode("utf-8")
+
+                def post_form(path, data):
+                    encoded = urlencode(data).encode("utf-8")
+                    req = Request(
+                        address + path,
+                        data=encoded,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": address,
+                        },
+                        method="POST",
+                    )
+                    with urlopen(req, timeout=5) as resp:
+                        return resp.read().decode("utf-8")
+
+                home_html = get_html("/")
+                self.assertIn("ops-strip", home_html)
+                self.assertIn("ops-drawer", home_html)
+                m_csrf = re.search(r'name="csrf"\s+value="([^"]+)"', home_html)
+                self.assertIsNotNone(m_csrf)
+                csrf = m_csrf.group(1)
+
+                # 1. Mount a writable shared library via Sync Hub web form.
+                hub_html = get_html("/?view=sync_hub")
+                self.assertIn("共享记忆库与 Git 同步中心", hub_html)
+                team_dir = self.home / "team-ui-kb"
+                after_mount = post_form(
+                    "/mount_add",
+                    {
+                        "csrf": csrf,
+                        "library": "primary",
+                        "mount_id": "team-ui",
+                        "label": "前端团队库",
+                        "path": str(team_dir),
+                        "mode": "rw",
+                        "layer_L1": "1",
+                        "layer_L3": "1",
+                        "layer_L4": "1",
+                        "auto_commit": "1",
+                    },
+                )
+                self.assertIn("前端团队库", after_mount)
+
+                # 2. Share a personal topic to the mounted team library via web action.
+                topic_html = get_html("/?topic=methods/deploy-tip.md")
+                self.assertIn("分享到共享库", topic_html)
+                after_share = post_form(
+                    "/share_topic",
+                    {
+                        "csrf": csrf,
+                        "library": "primary",
+                        "topic": "methods/deploy-tip.md",
+                        "target_library": "team-ui",
+                        "target_layer": "L1",
+                    },
+                )
+                self.assertIn("已将该个人记忆分享到目标共享库", after_share)
+                self.assertTrue((team_dir / "methods/deploy-tip.md").is_file())
+
+                # 3. Create a conflict copy and resolve it via visual conflict workbench.
+                conflict_file = self.library / "methods/deploy-tip.conflict-20261120-010101.md"
+                conflict_file.write_text(
+                    "---\nname: deploy-tip\ndescription: \"远端灰度步骤\"\ntype: reference\n---\n\n# 发布经验\n\n先切 20% 流量\n",
+                    encoding="utf-8",
+                )
+                conflict_html = get_html("/?view=conflicts")
+                self.assertIn("diff-view", conflict_html)
+                self.assertIn("先切 20% 流量", conflict_html)
+                post_form(
+                    "/resolve_conflict",
+                    {
+                        "csrf": csrf,
+                        "library": "primary",
+                        "conflict_file": "methods/deploy-tip.conflict-20261120-010101.md",
+                        "strategy": "custom_merge",
+                        "merged_content": (
+                            "---\nname: deploy-tip\ndescription: \"合并后的灰度步骤\"\ntype: reference\n---\n\n"
+                            "# 发布经验\n\n先切 10% 再扩到 20% 流量\n"
+                        ),
+                    },
+                )
+                self.assertFalse(conflict_file.exists())
+                self.assertIn("扩到 20% 流量", (self.library / "methods/deploy-tip.md").read_text(encoding="utf-8"))
+            finally:
+                process.terminate()
 
 
 if __name__ == "__main__":

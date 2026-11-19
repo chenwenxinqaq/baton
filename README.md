@@ -10,7 +10,7 @@
 | --- | --- |
 | `mcp/`、`manager/`、`scripts/` | `MEMORY.md` 和 L0–L4 五个条目目录 |
 | `templates/`、内置的 `skills/unified-memory/` | `user-managed/` 和使用者自己的 `skills/` |
-| `tests/` 及其虚构样本 | `.state/` 中的锁、备份、回收站和客户端恢复信息 |
+| `tests/` 及其虚构样本 | 本机运行状态位于 `~/.local/state/unified-memory/`（锁、回收站、恢复信息），不污染记忆仓库 |
 
 ## 从空库开始
 
@@ -43,6 +43,22 @@ python3 scripts/memoryctl.py connect codex
 需要解除接入时，在相同数据目录配置下运行 `python3 scripts/memoryctl.py disconnect codex`。更换数据目录时先解除旧接入。自己的技能放在数据目录的 `skills/<名称>/SKILL.md`，可通过管理页或 CLI 启用、停用和同步。
 
 技能使用的共享文档也可以留在私有库。例如在 `skills/resources.json` 写入 `{"report-helper": ["shared-guides"]}`，并在 `skills/shared-guides/` 放置文档。启用 report-helper 时，客户端会同步挂载该资源目录。多个技能可以引用同一资源。
+
+## 多设备与团队共享（Git 同步与多库挂载）
+
+支持将个人库绑定到私有 Git 仓库（GitHub / Gitee / 自建 Gitea 等）实现多设备同步，同时按库挂载只读（`ro`）或共写（`rw`）的团队共享库。共享库默认仅开放 `L1 / L3 / L4`，不会改写本机 `L0` 红线与 `L2` 个人偏好。
+
+```sh
+# 1. 为个人主库绑定私有 Git 远端并同步
+python3 scripts/memoryctl.py sync setup personal --remote-url git@github.com:you/my-memory.git
+python3 scripts/memoryctl.py sync run personal
+
+# 2. 挂载团队共享库（支持自动克隆，按需选 ro 或 rw）
+python3 scripts/memoryctl.py mount add team-kb --path ~/UnifiedMemory-Team --label "研发共享库" --mode rw --git git@gitee.com:team/memory-kb.git
+python3 scripts/memoryctl.py sync run all
+```
+
+也可以直接在 Web 管理页顶部点击「共享与同步」图形化配置远端、增删共享库，或在条目页一键将个人记忆分享到共享库；多端同时改同一篇条目时，系统会保留冲突副本并在管理页提供行级 Diff 对比与一键合并。
 
 ## 验证与分发
 

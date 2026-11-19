@@ -21,7 +21,7 @@ LAYER_HEADINGS = (
     ("L3", "projects", "## L3 项目快照"),
     ("L4", "archive", "## L4 事故归档"),
 )
-CONFLICT_MARKER_RE = re.compile(r"\.conflict-\d{8}-\d{6}(?:-[a-f0-9]+)?\.md$", re.IGNORECASE)
+CONFLICT_MARKER_RE = re.compile(r"\.conflict-\d{8}-\d{6}(?:-\d+|-[a-f0-9]+)?\.md$", re.IGNORECASE)
 DEFAULT_GITIGNORE = ".DS_Store\n.state/\n__pycache__/\n*.pyc\n*.conflict-*.md\n"
 
 
@@ -89,6 +89,84 @@ def _extract_title(body, fallback):
 
 def is_conflict_filename(name):
     return bool(CONFLICT_MARKER_RE.search(name))
+
+
+def original_path_for_conflict(conflict_rel_path):
+    """Derive the original entry relative path from a *.conflict-*.md relative path."""
+    p = Path(conflict_rel_path)
+    if not is_conflict_filename(p.name):
+        raise ValueError(f"Not a conflict copy filename: {conflict_rel_path}")
+    orig_name = CONFLICT_MARKER_RE.sub(".md", p.name)
+    return p.with_name(orig_name).as_posix()
+
+
+def resolve_conflict(
+    root,
+    conflict_rel_path,
+    strategy,
+    *,
+    merged_content="",
+    auto_commit_enabled=False,
+    library_id="personal",
+):
+    """Resolve one *.conflict-*.md copy safely by keeping local, taking remote, or saving merged content."""
+    import secrets
+    import shutil
+
+    root = Path(root).expanduser().resolve()
+    conflict_path = (root / conflict_rel_path).resolve()
+    if not conflict_path.is_relative_to(root) or not conflict_path.is_file():
+        raise ValueError(f"Conflict copy not found: {conflict_rel_path}")
+    if not is_conflict_filename(conflict_path.name):
+        raise ValueError(f"Not a conflict copy: {conflict_rel_path}")
+
+    orig_rel = original_path_for_conflict(conflict_path.relative_to(root).as_posix())
+    orig_path = (root / orig_rel).resolve()
+    if not orig_path.is_relative_to(root):
+        raise ValueError("Resolved original path escapes library root.")
+    if strategy not in {"keep_local", "use_remote", "custom_merge"}:
+        raise ValueError(f"Unknown conflict resolution strategy: {strategy}")
+
+    trash_dir = library_state_dir(root) / "trash"
+
+    def _backup(src, tag):
+        if not src.is_file():
+            return
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag)[:80] or "conflict"
+        shutil.copy2(src, trash_dir / f"{stamp}-{safe}-{secrets.token_hex(2)}.md")
+
+    with _library_lock(root):
+        if strategy == "keep_local":
+            _backup(conflict_path, f"conflict-discard-{conflict_path.stem}")
+            conflict_path.unlink()
+        elif strategy == "use_remote":
+            remote_text = conflict_path.read_text(encoding="utf-8")
+            _backup(orig_path, f"conflict-local-{orig_path.stem}")
+            _backup(conflict_path, f"conflict-remote-{conflict_path.stem}")
+            _atomic_write(orig_path, remote_text)
+            conflict_path.unlink()
+            rebuild_index(root, lock=False)
+        else:
+            cleaned = merged_content.replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not cleaned:
+                raise ValueError("合并后的正文不能为空。")
+            _backup(orig_path, f"conflict-local-{orig_path.stem}")
+            _backup(conflict_path, f"conflict-remote-{conflict_path.stem}")
+            _atomic_write(orig_path, cleaned + "\n")
+            conflict_path.unlink()
+            rebuild_index(root, lock=False)
+
+        if auto_commit_enabled and is_git_repo(root):
+            auto_commit(root, f"sync({library_id}): resolve conflict for {orig_rel} ({strategy})")
+
+    return {
+        "resolved": conflict_rel_path,
+        "original": orig_rel,
+        "strategy": strategy,
+        "remaining_conflicts": find_conflict_files(root),
+    }
 
 
 def find_conflict_files(memory_root):
