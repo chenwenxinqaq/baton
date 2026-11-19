@@ -21,6 +21,7 @@ import shutil
 import stat
 from string import Template
 import sys
+import time
 from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
@@ -33,6 +34,7 @@ if str(ROOT_DIR / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
+import audit_log  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
 
@@ -1317,6 +1319,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None):
             chips = "".join(
                 [
                     format_comp_chip("指令规则", comp["instructions"]["state"]) if "instructions" in comp else "",
+                    format_comp_chip("自动读写 Hooks", comp["hooks"]["state"]) if "hooks" in comp else "",
                     format_comp_chip("MCP 服务", comp["mcp"]["state"]),
                     format_comp_chip("Skills", sk_comp["state"], sk_suffix),
                 ]
@@ -1931,6 +1934,114 @@ def filter_skills(skills_matrix, q, cat, sk_state):
     return [r[1] for r in out]
 
 
+def _ago_zh(epoch, now=None):
+    now = now or time.time()
+    diff = max(0, int(now - epoch))
+    if diff < 60:
+        return "刚刚"
+    if diff < 3600:
+        return f"{diff // 60} 分钟前"
+    if diff < 86400:
+        return f"{diff // 3600} 小时前"
+    return f"{diff // 86400} 天前"
+
+
+def _ref_link(ref, key):
+    """Return an HTML link for 'library:path' (or bare path) refs."""
+    ref = str(ref or "")
+    lib, _, path = ref.partition(":") if ":" in ref else ("", "", ref)
+    if not path:
+        return escape(ref)
+    href = query(library=lib or key, topic=path) + "#detail-title"
+    return f'<a href="{escape(href)}">{escape(ref)}</a>'
+
+
+def render_activity_panel(key, agent_home=None):
+    """First-screen dashboard: what AI clients searched/read/wrote locally (from the audit log)."""
+    try:
+        summary = audit_log.summarize()
+    except Exception:
+        return ""
+    now = summary["now"]
+    seen = {c["client"]: c for c in summary["clients"]}
+
+    client_rows = []
+    configured = []
+    try:
+        import memoryctl
+
+        for aid, spec in memoryctl.agent_specs(home=agent_home).items():
+            info = memoryctl.inspect_agent(aid, spec)
+            if info["state"] in {"managed", "partial", "drifted"}:
+                configured.append(info)
+    except Exception:
+        configured = []
+    names_done = set()
+    for info in configured:
+        name = info["name"]
+        names_done.add(name)
+        hooks = info["components"].get("hooks")
+        auto = ""
+        if hooks is not None:
+            auto = (
+                '<span class="chip-ok">✓ 自动读写已就绪</span>'
+                if hooks["state"] == "managed"
+                else '<span class="chip-warn">! 仅工具就绪，自动读写未接管（点「同步」）</span>'
+            )
+        elif "instructions" in info["components"]:
+            auto = (
+                '<span class="chip-ok">✓ 规则已注入</span>'
+                if info["components"]["instructions"]["state"] == "managed"
+                else '<span class="chip-warn">! 规则未就绪</span>'
+            )
+        c = seen.get(name)
+        if c:
+            act = (
+                f'最近调用 {escape(_ago_zh(c["last_t"], now))} · 今日查 {c["reads_today"]} / 写 {c["writes_today"]}'
+                + (f' · <span class="act-err">{c["errors_today"]} 次失败</span>' if c["errors_today"] else "")
+            )
+        else:
+            act = '<span class="act-err">近 7 天没有任何调用：配置了但可能没生效，重载该客户端的 MCP / 重启它</span>'
+        client_rows.append(f'<li><strong>{escape(name)}</strong> {auto}<span class="act-meta">{act}</span></li>')
+    for name, c in seen.items():
+        if name not in names_done:
+            client_rows.append(
+                f'<li><strong>{escape(name)}</strong><span class="act-meta">最近调用 {escape(_ago_zh(c["last_t"], now))}'
+                f' · 今日查 {c["reads_today"]} / 写 {c["writes_today"]}</span></li>'
+            )
+
+    write_rows = "".join(
+        f'<li><span class="act-meta">{escape(_ago_zh(e["t"], now))} · {escape(str(e.get("client", "")))}</span> '
+        f'{_ref_link(e.get("ref") or "", key)}'
+        f'{" <em>(归档)</em>" if e.get("tool") == "memory_archive" else ""}</li>'
+        for e in summary["recent_writes"][:5]
+    ) or '<li class="act-meta">近 7 天 AI 还没有写入任何记忆</li>'
+    query_rows = "".join(
+        f'<li><span class="act-meta">{escape(_ago_zh(q["t"], now))} · {escape(str(q.get("client", "")))}</span> '
+        f'“{escape(str(q.get("query", "")))}” → {q.get("hits", 0)} 条</li>'
+        for q in summary["recent_queries"][:4]
+    ) or '<li class="act-meta">近 7 天 AI 还没有查询过记忆</li>'
+    hit_rows = "".join(
+        f'<li>{_ref_link(h["ref"], key)} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
+    ) or '<li class="act-meta">暂无高频命中</li>'
+
+    return f"""
+      <section class="activity-panel" aria-labelledby="activity-heading">
+        <div class="recent-panel-head">
+          <div class="recent-panel-title">
+            <h2 id="activity-heading">🤖 AI 读写动态</h2>
+            <span class="recent-stats">今日查询 {summary["reads_today"]} 次 · 今日写入 {summary["writes_today"]} 次 · 空结果搜索 {summary["empty_searches_today"]} 次 · 沉淀提醒 {summary["nudges_today"]} 次</span>
+          </div>
+        </div>
+        <ul class="activity-clients" role="list">{"".join(client_rows) or '<li class="act-meta">尚无已接入客户端</li>'}</ul>
+        <div class="activity-cols">
+          <div><h3>最近写入</h3><ul role="list">{write_rows}</ul></div>
+          <div><h3>最近查询</h3><ul role="list">{query_rows}</ul></div>
+          <div><h3>近 7 天高频命中</h3><ul role="list">{hit_rows}</ul></div>
+        </div>
+      </section>"""
+
+
 def render_overview(topics, entries, key):
     """Render Recent Work timeline + L0-L4 overview dashboard when no topic is selected."""
     now_dt = datetime.now().astimezone()
@@ -2027,6 +2138,7 @@ def render_overview(topics, entries, key):
 
     active_user_cnt = sum(e.status == "active" for e in entries)
     return f"""
+      {render_activity_panel(key)}
       {recent_panel}
       <p class="overview-section-label">按 L0–L4 记忆性质浏览</p>
       <div class="overview-grid">{"".join(cards)}</div>

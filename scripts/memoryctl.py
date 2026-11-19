@@ -40,6 +40,9 @@ RESTORE_DIR = STATE_DIR / "restore"
 SKILL_BACKUP_DIR = STATE_DIR / "skill-backups"
 LOCK_FILE = STATE_DIR / "integration.lock"
 MCP_SERVER = FRAMEWORK_ROOT / "mcp" / "server.py"
+CURSOR_HOOK_SCRIPT = FRAMEWORK_ROOT / "scripts" / "cursor_hook.py"
+CURSOR_HOOK_MARKER = "cursor_hook.py"
+CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "stop")
 SKILLS_DIR = MEMORY_ROOT / "skills"
 
 MD_START = "<!-- unified-memory:managed:start -->"
@@ -480,6 +483,7 @@ def agent_specs(home=None):
             "mcp_path": home / ".cursor" / "mcp.json",
             "mcp_key": "unified_memory",
             "skills_dir": home / ".cursor" / "skills",
+            "hooks_path": home / ".cursor" / "hooks.json",
         },
         "antigravity": {
             "name": "Antigravity",
@@ -770,6 +774,96 @@ def inspect_agy_plugin(agent_id, spec):
     }
 
 
+def desired_cursor_hooks():
+    """Return {event: hook-entry} that wire Cursor into the memory read/write contract."""
+    entries = {}
+    for event in CURSOR_HOOK_EVENTS:
+        command = " ".join(
+            shlex.quote(part)
+            for part in [resolve_python_cmd(), str(CURSOR_HOOK_SCRIPT), event, "--memory-root", str(MEMORY_ROOT)]
+        )
+        entry = {"command": command, "timeout": 10}
+        if event == "stop":
+            entry["loop_limit"] = 1
+        entries[event] = entry
+    return entries
+
+
+def _is_our_hook(entry):
+    return isinstance(entry, dict) and CURSOR_HOOK_MARKER in str(entry.get("command", ""))
+
+
+def inspect_cursor_hooks(hooks_path):
+    """Return (state, issues) for Cursor user hooks: managed|drifted|missing."""
+    if not hooks_path.is_file():
+        return "missing", []
+    try:
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return "drifted", [f"{hooks_path} is not valid JSON"]
+    hooks = data.get("hooks") or {}
+    desired = desired_cursor_hooks()
+    found, exact = 0, 0
+    for event, want in desired.items():
+        ours = [e for e in (hooks.get(event) or []) if _is_our_hook(e)]
+        if ours:
+            found += 1
+            if len(ours) == 1 and ours[0] == want:
+                exact += 1
+    if found == 0:
+        return "missing", []
+    if exact == len(desired):
+        return "managed", []
+    return "drifted", ["Cursor hooks differ from current script path/args (re-sync to fix)"]
+
+
+def apply_cursor_hooks(hooks_path, restore, changes):
+    """Merge managed hook entries into ~/.cursor/hooks.json, preserving unrelated hooks."""
+    existed = hooks_path.is_file()
+    data = json.loads(hooks_path.read_text(encoding="utf-8")) if existed else {}
+    if "cursor_hooks_file_existed" not in restore:
+        restore["cursor_hooks_file_existed"] = existed
+    data.setdefault("version", 1)
+    hooks = data.setdefault("hooks", {})
+    original = json.dumps(data, sort_keys=True)
+    for event, want in desired_cursor_hooks().items():
+        kept = [e for e in (hooks.get(event) or []) if not _is_our_hook(e)]
+        hooks[event] = kept + [want]
+    if json.dumps(data, sort_keys=True) != original or not existed:
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        changes.append(f"wired Cursor hooks in {hooks_path}")
+
+
+def remove_cursor_hooks(hooks_path, restore, changes):
+    """Remove only managed hook entries; delete the file if we created it and nothing else is left."""
+    if not hooks_path.is_file():
+        return
+    try:
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    hooks = data.get("hooks") or {}
+    touched = False
+    for event in list(hooks):
+        kept = [e for e in (hooks.get(event) or []) if not _is_our_hook(e)]
+        if len(kept) != len(hooks.get(event) or []):
+            touched = True
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not touched:
+        return
+    if not hooks and not restore.get("cursor_hooks_file_existed", True):
+        hooks_path.unlink()
+        changes.append(f"removed {hooks_path}")
+    else:
+        data["hooks"] = hooks
+        atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        changes.append(f"removed managed Cursor hooks from {hooks_path}")
+
+
 def inspect_agent(agent_id, spec):
     """Inspect detection and integration state without modifying anything."""
     if spec.get("mode") == "agy_plugin":
@@ -842,9 +936,17 @@ def inspect_agent(agent_id, spec):
     skill_state, linked_cnt, total_cnt, skill_issues = inspect_skills_dir(spec["skills_dir"])
     issues.extend(skill_issues)
 
+    hooks_path = spec.get("hooks_path")
+    hooks_state = None
+    if hooks_path is not None:
+        hooks_state, hook_issues = inspect_cursor_hooks(hooks_path)
+        issues.extend(hook_issues)
+
     states = {mcp_state, skill_state}
     if inst_state is not None:
         states.add(inst_state)
+    if hooks_state is not None:
+        states.add(hooks_state)
     if states == {"managed"}:
         overall = "managed"
     elif states & {"modified", "conflict", "drifted", "symlink"}:
@@ -861,6 +963,7 @@ def inspect_agent(agent_id, spec):
         "state": overall,
         "components": {
             **({"instructions": {"path": str(inst_path), "state": inst_state}} if inst_path else {}),
+            **({"hooks": {"path": str(hooks_path), "state": hooks_state}} if hooks_path else {}),
             "mcp": {"path": str(mcp_path), "state": mcp_state},
             "skill": {
                 "path": str(spec["skills_dir"]),
@@ -1004,6 +1107,10 @@ def connect_agent(agent_id, spec, dry_run=False):
             restore["expected_mcp_cmd"] = exp_cmd
             restore["expected_mcp_args"] = exp_args
 
+        # 2b. Cursor hooks (deterministic read/write triggers)
+        if spec.get("hooks_path") is not None:
+            apply_cursor_hooks(spec["hooks_path"], restore, changes)
+
         # 3. Sync all enabled hub skills
         sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
 
@@ -1095,6 +1202,9 @@ def disconnect_agent(agent_id, spec, force=False):
                 changes.append(f"restored [features] memories -> {prev_feat_mem} in {mcp_path}")
             if text != orig_toml:
                 atomic_write(mcp_path, text)
+
+        if spec.get("hooks_path") is not None:
+            remove_cursor_hooks(spec["hooks_path"], restore, changes)
 
         restore_skills_dir(agent_id, spec["skills_dir"], restore, changes)
 

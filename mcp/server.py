@@ -12,11 +12,13 @@ import re
 import secrets
 import shutil
 import sys
+import time
 from tempfile import NamedTemporaryFile
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
+import audit_log
 import sync_git
 
 DEFAULT_ROOT = data_root()
@@ -1186,8 +1188,55 @@ TOOLS = [
 ]
 
 
+CLIENT_NAME = "unknown"
+AUDIT_HOME = None
+
+
+def _audit_event(name, args, data, ok, ms, error=""):
+    """Build a body-free audit event for one tool call."""
+    ev = {
+        "source": "mcp",
+        "client": CLIENT_NAME,
+        "tool": name,
+        "ok": ok,
+        "ms": ms,
+        "library": args.get("library") if isinstance(args, dict) else None,
+    }
+    if isinstance(args, dict):
+        if name == "memory_search":
+            ev["query"] = str(args.get("query", ""))[:120]
+        if args.get("layer"):
+            ev["layer"] = args.get("layer")
+    if not ok:
+        ev["error"] = error[:160]
+        return ev
+    if name == "memory_search" and isinstance(data, list):
+        ev["hits"] = len(data)
+        ev["refs"] = [h.get("ref") for h in data[:5] if isinstance(h, dict) and h.get("ref")]
+    elif name == "memory_list" and isinstance(data, list):
+        ev["hits"] = len(data)
+    elif isinstance(data, dict):
+        ev["ref"] = data.get("ref") or data.get("path") or data.get("to")
+        ev["library"] = data.get("library") or ev.get("library")
+        if name in ("memory_upsert", "memory_archive"):
+            ev["action"] = data.get("status") or data.get("action")
+    return ev
+
+
 def handle_tool_call(store, name, args):
-    """Dispatch an MCP tools/call invocation."""
+    """Dispatch a tools/call invocation and record a local audit event."""
+    started = time.monotonic()
+    try:
+        result, data = _handle_tool_call(store, name, args)
+    except Exception as exc:
+        audit_log.record(_audit_event(name, args, None, False, int((time.monotonic() - started) * 1000), str(exc)), home=AUDIT_HOME)
+        raise
+    audit_log.record(_audit_event(name, args, data, True, int((time.monotonic() - started) * 1000)), home=AUDIT_HOME)
+    return result
+
+
+def _handle_tool_call(store, name, args):
+    """Dispatch an MCP tools/call invocation; return (mcp_result, raw_data)."""
     if name == "memory_libraries":
         data = store.list_libraries() if hasattr(store, "list_libraries") else []
     elif name == "memory_search":
@@ -1237,7 +1286,7 @@ def handle_tool_call(store, name, args):
         data = store.archive_entry(**kwargs)
     else:
         raise ValueError(f"Unknown tool: {name}")
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}, data
 
 
 def process_one_message(store, msg):
@@ -1254,6 +1303,8 @@ def process_one_message(store, msg):
 
     try:
         if method == "initialize":
+            global CLIENT_NAME
+            CLIENT_NAME = audit_log.normalize_client((params.get("clientInfo") or {}).get("name", ""))
             requested = params.get("protocolVersion", "")
             negotiated = requested if requested in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
             result = {

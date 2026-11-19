@@ -149,6 +149,91 @@ class PublicFrameworkTests(unittest.TestCase):
         report = self.cli("doctor")
         self.assertTrue(report["ok"], report["findings"])
 
+    def test_cursor_hooks_are_merged_reversible_and_honestly_reported(self):
+        (self.home / ".cursor").mkdir()
+        hooks_file = self.home / ".cursor/hooks.json"
+        mine = {"command": "./hooks/mine.sh"}
+        hooks_file.write_text(json.dumps({"version": 1, "hooks": {"stop": [mine]}}), encoding="utf-8")
+        self.cli("connect", "cursor")
+        data = json.loads(hooks_file.read_text())
+        self.assertEqual(set(data["hooks"]), {"stop", "sessionStart", "beforeSubmitPrompt"})
+        self.assertEqual(data["hooks"]["stop"][0], mine)
+        stop_ours = data["hooks"]["stop"][1]
+        self.assertEqual(stop_ours["loop_limit"], 1)
+        self.assertIn("cursor_hook.py", stop_ours["command"])
+        cursor = next(a for a in self.cli("doctor")["agents"] if a["id"] == "cursor")
+        self.assertEqual(cursor["components"]["hooks"]["state"], "managed")
+        self.cli("connect", "cursor")  # idempotent
+        self.assertEqual(json.loads(hooks_file.read_text()), data)
+        # Tampering shows up as drift instead of a false green.
+        data["hooks"]["sessionStart"][0]["command"] += " --stale"
+        hooks_file.write_text(json.dumps(data), encoding="utf-8")
+        cursor = next(a for a in self.cli("doctor")["agents"] if a["id"] == "cursor")
+        self.assertEqual((cursor["components"]["hooks"]["state"], cursor["state"]), ("drifted", "drifted"))
+        self.cli("disconnect", "cursor")
+        self.assertEqual(json.loads(hooks_file.read_text()), {"version": 1, "hooks": {"stop": [mine]}})
+
+        # When we created the file ourselves, disconnect removes it entirely.
+        hooks_file.unlink()
+        self.cli("connect", "cursor")
+        self.assertTrue(hooks_file.is_file())
+        self.cli("disconnect", "cursor")
+        self.assertFalse(hooks_file.exists())
+
+    def test_audit_log_hooks_and_dashboard(self):
+        def mcp_session(*calls):
+            lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2024-11-05", "clientInfo": {"name": "cursor-vscode"}}}]
+            for i, (name, args) in enumerate(calls, start=2):
+                lines.append({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}})
+            subprocess.check_output([sys.executable, str(CODE / "mcp/server.py")],
+                                    input="".join(json.dumps(m) + "\n" for m in lines),
+                                    env=self.environment(), cwd=self.home, text=True)
+
+        mcp_session(("memory_upsert", dict(layer="L2", name="csv-pref", title="周报用 CSV",
+                                           description="周报一律 CSV", body="SECRET-BODY-TEXT")),
+                    ("memory_search", {"query": "CSV"}), ("memory_search", {"query": "不存在的主题"}))
+        audit = (self.home / ".local/state/unified-memory/global/audit.jsonl").read_text()
+        events = [json.loads(line) for line in audit.splitlines()]
+        self.assertEqual([e["tool"] for e in events], ["memory_upsert", "memory_search", "memory_search"])
+        self.assertTrue(all(e["client"] == "Cursor" for e in events))
+        self.assertEqual((events[1]["hits"], events[2]["hits"]), (1, 0))
+        self.assertNotIn("SECRET-BODY-TEXT", audit)  # bodies are never logged
+
+        def hook(event, payload, **extra):
+            out = subprocess.check_output(
+                [sys.executable, str(CODE / "scripts/cursor_hook.py"), event, "--memory-root", str(self.library)],
+                input=json.dumps(payload), env={**self.environment(), **extra}, cwd=self.home, text=True)
+            return json.loads(out)
+
+        context = hook("sessionStart", {"conversation_id": "c1"})["additional_context"]
+        self.assertIn("memory_search", context)
+        self.assertIn("周报用 CSV", context)
+        fast = {"UNIFIED_MEMORY_NUDGE_MIN_SECONDS": "0"}
+        hook("beforeSubmitPrompt", {"conversation_id": "c1", "prompt": "做点事"})
+        stop = {"conversation_id": "c1", "status": "completed", "loop_count": 0}
+        self.assertEqual(hook("stop", stop), {})  # short turn: stay silent
+        self.assertEqual(hook("stop", {**stop, "loop_count": 1}, **fast), {})  # never loops
+        self.assertIn("followup_message", hook("stop", stop, **fast))
+        self.assertEqual(hook("stop", stop, **fast), {})  # cooldown
+        # A write during the turn suppresses the nudge.
+        hook("beforeSubmitPrompt", {"conversation_id": "c2", "prompt": "再做点事"})
+        mcp_session(("memory_upsert", dict(layer="L2", name="csv-pref", title="周报用 CSV",
+                                           description="周报一律 CSV(更新)", body="x")))
+        self.assertEqual(hook("stop", {**stop, "conversation_id": "c2"}, **fast), {})
+
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0", "--memory-root", str(self.library)]
+        with subprocess.Popen(command, env=self.environment(), stdout=subprocess.PIPE, text=True) as process:
+            try:
+                address = process.stdout.readline().strip()
+                with urlopen(address, timeout=5) as response:
+                    page = response.read().decode()
+                for expected in ("AI 读写动态", "今日写入 2 次", "不存在的主题", "沉淀提醒 1 次"):
+                    self.assertIn(expected, page)
+            finally:
+                process.terminate()
+
     def test_multi_library_mounts_permissions_and_web_ro_guard(self):
         team_rw = self.home / "team-rw"
         team_ro = self.home / "team-ro"
