@@ -17,11 +17,25 @@ import sys
 from tempfile import NamedTemporaryFile
 
 
-from library_paths import FRAMEWORK_ROOT, data_root
+from library_paths import (
+    ALL_LAYERS,
+    DEFAULT_SHARED_LAYERS,
+    FRAMEWORK_ROOT,
+    data_root,
+    global_state_dir,
+    load_mounts_config,
+    normalize_layers,
+    resolve_libraries,
+    save_mounts_config,
+    validate_library_path,
+    validate_mount_id,
+)
+import sync_git
 
 
 MEMORY_ROOT = data_root()
-STATE_DIR = MEMORY_ROOT / ".state"
+STATE_DIR = global_state_dir()
+LEGACY_STATE_DIR = MEMORY_ROOT / ".state"
 RESTORE_DIR = STATE_DIR / "restore"
 SKILL_BACKUP_DIR = STATE_DIR / "skill-backups"
 LOCK_FILE = STATE_DIR / "integration.lock"
@@ -59,20 +73,23 @@ trigger: always_on
 """
 
 
-def initialize_library():
+def initialize_library(target_root=None, shared=False):
     """Create missing directories and seed files while preserving existing data."""
-    MEMORY_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
-        (MEMORY_ROOT / folder).mkdir(exist_ok=True, mode=0o700)
-    seeds = {
-        "MEMORY.md": LIBRARY_TEMPLATE,
-        "skills/unified-memory/SKILL.md": FRAMEWORK_ROOT / "skills" / "unified-memory" / "SKILL.md",
-    }
+    root = validate_library_path(target_root) if target_root is not None else MEMORY_ROOT
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    folders = ("constraints", "methods", "preferences", "projects", "archive")
+    if not shared:
+        folders = folders + ("user-managed",)
+    for folder in folders:
+        (root / folder).mkdir(exist_ok=True, mode=0o700)
+    seeds = {"MEMORY.md": LIBRARY_TEMPLATE}
+    if not shared:
+        seeds["skills/unified-memory/SKILL.md"] = FRAMEWORK_ROOT / "skills" / "unified-memory" / "SKILL.md"
     for name in ("entry", "project", "incident"):
         relative = f"templates/{name}.md"
         seeds[relative] = FRAMEWORK_ROOT / relative
     for relative, source in seeds.items():
-        destination = MEMORY_ROOT / relative
+        destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(dir=destination.parent) as staged:
             staged.write(source.read_bytes())
@@ -81,7 +98,7 @@ def initialize_library():
                 os.link(staged.name, destination)
             except FileExistsError:
                 pass
-    return {"memory_root": str(MEMORY_ROOT)}
+    return {"memory_root": str(root), "shared": shared}
 
 
 def resolve_python_cmd():
@@ -478,9 +495,12 @@ def agent_specs(home=None):
 
 
 def load_restore(agent_id):
-    """Load saved pre-integration metadata for an agent."""
+    """Load saved pre-integration metadata for an agent (with legacy .state fallback)."""
     path = RESTORE_DIR / f"{agent_id}.json"
     if not path.is_file():
+        legacy = LEGACY_STATE_DIR / "restore" / f"{agent_id}.json"
+        if legacy.is_file():
+            return json.loads(legacy.read_text(encoding="utf-8"))
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -1137,32 +1157,34 @@ def inspect_skills_matrix(home=None):
     return out
 
 
-def check_library_integrity(memory_root=MEMORY_ROOT):
-    """Run bidirectional index <-> disk and syntax checks on the memory library."""
+def check_library_integrity(memory_root=MEMORY_ROOT, allow_user_managed=True, library_id="personal"):
+    """Run bidirectional index <-> disk and syntax checks on a memory library."""
     sys.path.insert(0, str(FRAMEWORK_ROOT / "manager"))
     import manager as web_manager
 
+    root = Path(memory_root).expanduser().resolve()
     findings = []
-    lib = web_manager.Library(memory_root, "统一记忆")
+    area_prefix = "" if library_id == "personal" else f"{library_id}:"
+    lib = web_manager.Library(root, library_id, allow_user_managed=allow_user_managed)
     raw_index, topics = lib.read_index()
 
-    missing_topics = [p for p in topics if not (memory_root / p).is_file()]
+    missing_topics = [p for p in topics if not (root / p).is_file()]
     if missing_topics:
         findings.append(
-            {"area": "index", "severity": "error", "detail": f"Missing indexed files: {missing_topics}"}
+            {"area": f"{area_prefix}index", "severity": "error", "detail": f"Missing indexed files: {missing_topics}"}
         )
 
     disk_files = sorted(
-        p.relative_to(memory_root).as_posix()
+        p.relative_to(root).as_posix()
         for folder in ("constraints", "methods", "preferences", "projects", "archive")
-        if (memory_root / folder).is_dir()
-        for p in (memory_root / folder).glob("*.md")
-        if p.name != "README.md"
+        if (root / folder).is_dir()
+        for p in (root / folder).glob("*.md")
+        if p.name != "README.md" and not sync_git.is_conflict_filename(p.name)
     )
     orphan_files = [p for p in disk_files if p not in topics]
     if orphan_files:
         findings.append(
-            {"area": "index", "severity": "error", "detail": f"Unindexed disk files: {orphan_files}"}
+            {"area": f"{area_prefix}index", "severity": "error", "detail": f"Unindexed disk files: {orphan_files}"}
         )
 
     unparsed_bullets = []
@@ -1176,22 +1198,366 @@ def check_library_integrity(memory_root=MEMORY_ROOT):
             unparsed_bullets.append(f"L{lineno}: {line.strip()[:80]}")
     if unparsed_bullets:
         findings.append(
-            {"area": "index", "severity": "error", "detail": f"Malformed index bullets: {unparsed_bullets}"}
+            {"area": f"{area_prefix}index", "severity": "error", "detail": f"Malformed index bullets: {unparsed_bullets}"}
         )
 
-    _, unreadable = lib.list()
-    if unreadable:
+    if allow_user_managed:
+        _, unreadable = lib.list()
+        if unreadable:
+            findings.append(
+                {"area": f"{area_prefix}user-managed", "severity": "error", "detail": f"Unreadable entries: {unreadable}"}
+            )
+
+    conflicts = sync_git.find_conflict_files(root)
+    if conflicts:
         findings.append(
-            {"area": "user-managed", "severity": "error", "detail": f"Unreadable entries: {unreadable}"}
+            {
+                "area": f"{area_prefix}sync-conflict",
+                "severity": "warn",
+                "detail": f"Unresolved sync conflict copies: {conflicts}",
+            }
         )
 
     return len(topics), len(disk_files), findings
 
 
+def mount_list(home=None):
+    """List personal library and all configured mounted libraries with Git sync status."""
+    libs = resolve_libraries(primary_root=MEMORY_ROOT, home=home, include_disabled=True)
+    out = []
+    for lib in libs:
+        path = lib["path"]
+        exists = path.is_dir() and (path / "MEMORY.md").is_file()
+        sync_cfg = lib.get("sync") or {}
+        st = sync_git.git_status(
+            path,
+            remote=sync_cfg.get("remote") or "origin",
+            branch=sync_cfg.get("branch") or "",
+        ) if path.is_dir() else {"is_repo": False, "conflicts": []}
+        out.append(
+            {
+                "id": lib["id"],
+                "label": lib["label"],
+                "path": str(path),
+                "role": lib["role"],
+                "mode": lib["mode"],
+                "layers": list(lib["layers"]),
+                "allow_user_managed": bool(lib["allow_user_managed"]),
+                "enabled": bool(lib["enabled"]),
+                "available": exists,
+                "sync": sync_cfg or None,
+                "git": st,
+            }
+        )
+    return out
+
+
+def mount_add(
+    mount_id,
+    path,
+    *,
+    label="",
+    mode="ro",
+    layers=None,
+    git_url="",
+    remote="origin",
+    branch="",
+    auto_commit=True,
+    role="shared",
+    home=None,
+):
+    """Mount an existing or remote Git shared memory library."""
+    mid = validate_mount_id(mount_id)
+    mpath = validate_library_path(path)
+    mode = str(mode or "ro").strip().lower()
+    if mode not in {"ro", "rw"}:
+        raise ValueError("mode must be 'ro' or 'rw'.")
+    role = str(role or "shared").strip().lower()
+    if role not in {"shared", "personal"}:
+        raise ValueError("role must be 'shared' or 'personal'.")
+    resolved_layers = normalize_layers(
+        layers,
+        default=ALL_LAYERS if role == "personal" else DEFAULT_SHARED_LAYERS,
+    )
+
+    cfg = load_mounts_config(home=home)
+    if any(item.get("id") == mid for item in cfg["mounts"]):
+        raise ValueError(f"Mount '{mid}' already exists. Use 'mount update' or remove it first.")
+    if mpath == MEMORY_ROOT:
+        raise ValueError("Mount path cannot be the same as the personal memory root.")
+    if any(validate_library_path(item["path"]) == mpath for item in cfg["mounts"] if item.get("path")):
+        raise ValueError(f"Path already mounted: {mpath}")
+
+    cloned = False
+    if git_url and (not mpath.exists() or not any(mpath.iterdir())):
+        clone_info = sync_git.clone_repo(git_url, mpath, branch=branch)
+        branch = branch or clone_info["branch"]
+        cloned = True
+
+    if not (mpath / "MEMORY.md").is_file():
+        if mode == "ro" and not git_url and mpath.exists() and any(mpath.iterdir()):
+            raise ValueError(f"MEMORY.md not found in read-only directory: {mpath}")
+        initialize_library(target_root=mpath, shared=(role == "shared"))
+
+    sync_cfg = None
+    if git_url or sync_git.is_git_repo(mpath):
+        info = sync_git.ensure_repo(
+            mpath,
+            remote_url=git_url,
+            remote=remote or "origin",
+            branch=branch or "main",
+        )
+        sync_cfg = {
+            "driver": "git",
+            "remote": info["remote"],
+            "branch": branch or info["branch"],
+            "remote_url": info["remote_url"],
+            "auto_commit": bool(auto_commit and mode == "rw"),
+            "auto_push": False,
+        }
+
+    entry = {
+        "id": mid,
+        "label": (label or mid).strip(),
+        "path": str(mpath),
+        "role": role,
+        "mode": mode,
+        "layers": resolved_layers,
+        "enabled": True,
+        "sync": sync_cfg,
+    }
+    cfg["mounts"].append(entry)
+    save_mounts_config(cfg, home=home)
+    return {"mounted": entry, "cloned": cloned}
+
+
+def mount_update(
+    mount_id,
+    *,
+    label=None,
+    mode=None,
+    layers=None,
+    enabled=None,
+    remote_url=None,
+    remote=None,
+    branch=None,
+    auto_commit=None,
+    home=None,
+):
+    """Update settings of an existing mounted shared library."""
+    mid = validate_mount_id(mount_id)
+    cfg = load_mounts_config(home=home)
+    target = None
+    for item in cfg["mounts"]:
+        if item.get("id") == mid:
+            target = item
+            break
+    if target is None:
+        raise ValueError(f"Mount '{mid}' not found.")
+
+    if label is not None:
+        target["label"] = label.strip() or mid
+    if mode is not None:
+        m = mode.strip().lower()
+        if m not in {"ro", "rw"}:
+            raise ValueError("mode must be 'ro' or 'rw'.")
+        target["mode"] = m
+    if layers is not None:
+        target["layers"] = normalize_layers(layers)
+    if enabled is not None:
+        target["enabled"] = bool(enabled)
+
+    if any(v is not None for v in (remote_url, remote, branch, auto_commit)):
+        cur_sync = dict(target.get("sync") or {"driver": "git", "remote": "origin", "branch": "main", "auto_commit": True, "auto_push": False})
+        if remote is not None:
+            cur_sync["remote"] = remote.strip() or "origin"
+        if branch is not None:
+            cur_sync["branch"] = branch.strip()
+        if remote_url is not None:
+            cur_sync["remote_url"] = remote_url.strip()
+        if auto_commit is not None:
+            cur_sync["auto_commit"] = bool(auto_commit)
+        info = sync_git.ensure_repo(
+            Path(target["path"]),
+            remote_url=cur_sync.get("remote_url") or "",
+            remote=cur_sync.get("remote") or "origin",
+            branch=cur_sync.get("branch") or "main",
+        )
+        cur_sync["branch"] = cur_sync.get("branch") or info["branch"]
+        cur_sync["remote_url"] = info["remote_url"]
+        target["sync"] = cur_sync
+
+    save_mounts_config(cfg, home=home)
+    return {"updated": target}
+
+
+def mount_remove(mount_id, home=None):
+    """Unmount a shared library from mounts.json without deleting local files."""
+    mid = validate_mount_id(mount_id)
+    cfg = load_mounts_config(home=home)
+    before = len(cfg["mounts"])
+    cfg["mounts"] = [item for item in cfg["mounts"] if item.get("id") != mid]
+    if len(cfg["mounts"]) == before:
+        raise ValueError(f"Mount '{mid}' not found.")
+    save_mounts_config(cfg, home=home)
+    return {"removed": mid, "files_preserved": True}
+
+
+def setup_library_sync(
+    library_id="personal",
+    *,
+    remote_url="",
+    remote="origin",
+    branch="main",
+    auto_commit=True,
+    auto_push=False,
+    home=None,
+):
+    """Initialize Git and configure remote sync settings for personal or a mounted library."""
+    libs = {lib["id"]: lib for lib in resolve_libraries(primary_root=MEMORY_ROOT, home=home, include_disabled=True)}
+    if library_id not in libs:
+        raise ValueError(f"Unknown library '{library_id}'. Available: {', '.join(libs)}")
+    lib = libs[library_id]
+    info = sync_git.ensure_repo(
+        lib["path"],
+        remote_url=remote_url,
+        remote=remote or "origin",
+        branch=branch or "main",
+    )
+    sync_cfg = {
+        "driver": "git",
+        "remote": info["remote"],
+        "branch": branch or info["branch"],
+        "remote_url": info["remote_url"],
+        "auto_commit": bool(auto_commit and lib["mode"] == "rw"),
+        "auto_push": bool(auto_push and lib["mode"] == "rw"),
+    }
+    cfg = load_mounts_config(home=home)
+    if library_id == "personal":
+        cfg["personal_sync"] = sync_cfg
+    else:
+        for item in cfg["mounts"]:
+            if item.get("id") == library_id:
+                item["sync"] = sync_cfg
+                break
+    save_mounts_config(cfg, home=home)
+    return {"library": library_id, "repo": info, "sync": sync_cfg}
+
+
+def rebuild_library_index(target="personal", home=None):
+    """Deterministically rebuild MEMORY.md for one library or all enabled libraries."""
+    libs = resolve_libraries(primary_root=MEMORY_ROOT, home=home)
+    if target == "all":
+        selected = libs
+    else:
+        selected = [lib for lib in libs if lib["id"] == target]
+        if not selected:
+            raise ValueError(f"Unknown library '{target}'. Available: all, {', '.join(l['id'] for l in libs)}")
+    results = []
+    for lib in selected:
+        res = sync_git.rebuild_index(lib["path"])
+        results.append({"library": lib["id"], **res})
+    return {"results": results}
+
+
+def sync_libraries(target="all", *, pull_only=False, push_only=False, status_only=False, home=None):
+    """Inspect or execute Git synchronization for personal and/or mounted libraries."""
+    libs = resolve_libraries(primary_root=MEMORY_ROOT, home=home)
+    if target == "all":
+        selected = libs
+    else:
+        selected = [lib for lib in libs if lib["id"] == target]
+        if not selected:
+            raise ValueError(f"Unknown library '{target}'. Available: all, {', '.join(l['id'] for l in libs)}")
+
+    results = []
+    for lib in selected:
+        sync_cfg = lib.get("sync") or {}
+        remote = sync_cfg.get("remote") or "origin"
+        branch = sync_cfg.get("branch") or ""
+        if status_only:
+            st = sync_git.git_status(lib["path"], remote=remote, branch=branch)
+            results.append({"library": lib["id"], "mode": lib["mode"], "status": st})
+            continue
+        if not sync_git.is_git_repo(lib["path"]):
+            results.append({"library": lib["id"], "skipped": True, "reason": "not_a_git_repo"})
+            continue
+        st = sync_git.git_status(lib["path"], remote=remote, branch=branch)
+        if not st.get("remote_url"):
+            results.append({"library": lib["id"], "skipped": True, "reason": "no_remote_configured"})
+            continue
+        res = sync_git.sync(
+            lib["path"],
+            remote=remote,
+            branch=branch,
+            mode=lib["mode"],
+            pull_only=pull_only,
+            push_only=push_only,
+        )
+        results.append({"library": lib["id"], **res})
+    return {"results": results}
+
+
 def run_doctor(fix=False, home=None):
-    """Diagnose library integrity, MCP health, skills, and agent drift; optionally repair."""
-    indexed_count, disk_count, findings = check_library_integrity(MEMORY_ROOT)
+    """Diagnose library integrity, mounted libraries, MCP health, skills, and agent drift."""
+    indexed_count, disk_count, findings = check_library_integrity(MEMORY_ROOT, allow_user_managed=True, library_id="personal")
     repaired = []
+
+    if fix and any(f["area"] == "index" for f in findings):
+        rb = sync_git.rebuild_index(MEMORY_ROOT)
+        if rb["changed"]:
+            repaired.append({"library": "personal", "action": "rebuild_index", "indexed_topics": rb["indexed_topics"]})
+            indexed_count, disk_count, findings = check_library_integrity(
+                MEMORY_ROOT, allow_user_managed=True, library_id="personal"
+            )
+
+    library_reports = []
+    for lib in resolve_libraries(primary_root=MEMORY_ROOT, home=home):
+        lib_id = lib["id"]
+        sync_cfg = lib.get("sync") or {}
+        git_st = sync_git.git_status(
+            lib["path"],
+            remote=sync_cfg.get("remote") or "origin",
+            branch=sync_cfg.get("branch") or "",
+        ) if lib["path"].is_dir() else {"is_repo": False, "conflicts": []}
+        if lib_id != "personal":
+            if not (lib["path"] / "MEMORY.md").is_file():
+                findings.append(
+                    {"area": f"{lib_id}:mount", "severity": "error", "detail": f"Mounted library missing MEMORY.md: {lib['path']}"}
+                )
+                lib_indexed, lib_disk = 0, 0
+            else:
+                lib_indexed, lib_disk, lib_findings = check_library_integrity(
+                    lib["path"],
+                    allow_user_managed=lib["allow_user_managed"],
+                    library_id=lib_id,
+                )
+                if fix and lib["mode"] == "rw" and any(f["area"] == f"{lib_id}:index" for f in lib_findings):
+                    rb = sync_git.rebuild_index(lib["path"])
+                    if rb["changed"]:
+                        repaired.append({"library": lib_id, "action": "rebuild_index", "indexed_topics": rb["indexed_topics"]})
+                        lib_indexed, lib_disk, lib_findings = check_library_integrity(
+                            lib["path"],
+                            allow_user_managed=lib["allow_user_managed"],
+                            library_id=lib_id,
+                        )
+                findings.extend(lib_findings)
+        else:
+            lib_indexed, lib_disk = indexed_count, disk_count
+
+        library_reports.append(
+            {
+                "id": lib_id,
+                "label": lib["label"],
+                "role": lib["role"],
+                "mode": lib["mode"],
+                "layers": list(lib["layers"]),
+                "path": str(lib["path"]),
+                "indexed_topics": lib_indexed,
+                "disk_topics": lib_disk,
+                "git": git_st,
+            }
+        )
 
     probe_reqs = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
@@ -1250,6 +1616,7 @@ def run_doctor(fix=False, home=None):
         "stray_memories": stray,
         "findings": findings,
         "repaired": repaired,
+        "libraries": library_reports,
         "agents": agent_reports,
     }
 
@@ -1264,12 +1631,74 @@ def resolve_targets(target, home=None):
     return [(target, specs[target])]
 
 
+def _parse_bool_flag(val):
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected true/false, got: {val}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="Initialize an empty private library or fill missing seed files.")
+    p_init = sub.add_parser("init", help="Initialize an empty private or shared library.")
+    p_init.add_argument("--path", help="Optional target library path (defaults to UNIFIED_MEMORY_ROOT).")
+    p_init.add_argument("--shared", action="store_true", help="Initialize as a shared library (no personal skills/user-managed).")
+
     sub.add_parser("interface", help="Emit machine-readable paths and capabilities.")
+
+    p_rb = sub.add_parser("rebuild-index", help="Deterministically rebuild MEMORY.md index from disk entries.")
+    p_rb.add_argument("target", nargs="?", default="personal", help="Library id ('personal', mount id, or 'all').")
+
+    p_mount = sub.add_parser("mount", help="Manage mounted shared memory libraries.")
+    mount_sub = p_mount.add_subparsers(dest="mount_cmd", required=True)
+    mount_sub.add_parser("list", help="List personal and mounted libraries with sync status.")
+    p_madd = mount_sub.add_parser("add", help="Mount a local or Git-backed shared library.")
+    p_madd.add_argument("id", help="Mount identifier (e.g. team-kb).")
+    p_madd.add_argument("--path", required=True, help="Local directory for the mounted library.")
+    p_madd.add_argument("--label", default="", help="Human-readable label shown in UI.")
+    p_madd.add_argument("--mode", choices=("ro", "rw"), default="ro", help="Access mode: ro (read-only) or rw (read-write).")
+    p_madd.add_argument("--layers", default="", help="Comma-separated allowed layers (default for shared: L1,L3,L4).")
+    p_madd.add_argument("--git", default="", dest="git_url", help="Optional Git remote URL (GitHub/Gitee/self-hosted Git).")
+    p_madd.add_argument("--remote", default="origin", help="Git remote name (default: origin).")
+    p_madd.add_argument("--branch", default="", help="Git branch name.")
+    p_madd.add_argument("--auto-commit", type=_parse_bool_flag, default=True, help="Auto-commit writes on rw Git mounts.")
+    p_madd.add_argument("--role", choices=("shared", "personal"), default="shared", help="Library role.")
+
+    p_mupd = mount_sub.add_parser("update", help="Update an existing mount configuration.")
+    p_mupd.add_argument("id")
+    p_mupd.add_argument("--label", default=None)
+    p_mupd.add_argument("--mode", choices=("ro", "rw"), default=None)
+    p_mupd.add_argument("--layers", default=None)
+    p_mupd.add_argument("--enabled", type=_parse_bool_flag, default=None)
+    p_mupd.add_argument("--git", default=None, dest="remote_url")
+    p_mupd.add_argument("--remote", default=None)
+    p_mupd.add_argument("--branch", default=None)
+    p_mupd.add_argument("--auto-commit", type=_parse_bool_flag, default=None)
+
+    p_mrm = mount_sub.add_parser("remove", help="Unmount a shared library (keeps local files intact).")
+    p_mrm.add_argument("id")
+
+    p_sync = sub.add_parser("sync", help="Configure or execute Git sync across personal and mounted libraries.")
+    sync_sub = p_sync.add_subparsers(dest="sync_cmd", required=True)
+    p_srun = sync_sub.add_parser("run", help="Pull and push Git-backed libraries.")
+    p_srun.add_argument("target", nargs="?", default="all", help="Library id ('personal', mount id, or 'all').")
+    p_srun.add_argument("--pull-only", action="store_true")
+    p_srun.add_argument("--push-only", action="store_true")
+
+    p_sstat = sync_sub.add_parser("status", help="Inspect local Git sync status without hitting network.")
+    p_sstat.add_argument("target", nargs="?", default="all")
+
+    p_ssetup = sync_sub.add_parser("setup", help="Initialize Git and attach a remote URL to a library.")
+    p_ssetup.add_argument("library", nargs="?", default="personal", help="Library id (default: personal).")
+    p_ssetup.add_argument("--remote-url", required=True, help="Git remote URL (GitHub/Gitee/self-hosted Git).")
+    p_ssetup.add_argument("--remote", default="origin")
+    p_ssetup.add_argument("--branch", default="main")
+    p_ssetup.add_argument("--auto-commit", type=_parse_bool_flag, default=True)
+    p_ssetup.add_argument("--auto-push", type=_parse_bool_flag, default=False)
 
     p_agent = sub.add_parser("agent", help="Inspect or manage agent integrations.")
     agent_sub = p_agent.add_subparsers(dest="agent_cmd", required=True)
@@ -1298,13 +1727,64 @@ def main():
     args = parser.parse_args()
 
     if args.command == "init":
-        print(json.dumps(initialize_library(), ensure_ascii=False, indent=2))
+        print(json.dumps(initialize_library(target_root=args.path, shared=args.shared), ensure_ascii=False, indent=2))
+    elif args.command == "rebuild-index":
+        print(json.dumps(rebuild_library_index(args.target), ensure_ascii=False, indent=2))
+    elif args.command == "mount":
+        if args.mount_cmd == "list":
+            print(json.dumps({"libraries": mount_list()}, ensure_ascii=False, indent=2))
+        elif args.mount_cmd == "add":
+            res = mount_add(
+                args.id,
+                args.path,
+                label=args.label,
+                mode=args.mode,
+                layers=args.layers or None,
+                git_url=args.git_url,
+                remote=args.remote,
+                branch=args.branch,
+                auto_commit=args.auto_commit,
+                role=args.role,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif args.mount_cmd == "update":
+            res = mount_update(
+                args.id,
+                label=args.label,
+                mode=args.mode,
+                layers=args.layers,
+                enabled=args.enabled,
+                remote_url=args.remote_url,
+                remote=args.remote,
+                branch=args.branch,
+                auto_commit=args.auto_commit,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif args.mount_cmd == "remove":
+            print(json.dumps(mount_remove(args.id), ensure_ascii=False, indent=2))
+    elif args.command == "sync":
+        if args.sync_cmd == "run":
+            res = sync_libraries(args.target, pull_only=args.pull_only, push_only=args.push_only)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif args.sync_cmd == "status":
+            res = sync_libraries(args.target, status_only=True)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif args.sync_cmd == "setup":
+            res = setup_library_sync(
+                args.library,
+                remote_url=args.remote_url,
+                remote=args.remote,
+                branch=args.branch,
+                auto_commit=args.auto_commit,
+                auto_push=args.auto_push,
+            )
+            print(json.dumps(res, ensure_ascii=False, indent=2))
     elif args.command == "interface":
         hub = discover_hub_skills()
         print(
             json.dumps(
                 {
-                    "protocol_version": 3,
+                    "protocol_version": 4,
                     "python_command": resolve_python_cmd(),
                     "capabilities": {
                         "marker_block_injection": True,
@@ -1314,6 +1794,10 @@ def main():
                         "bidirectional_index_doctor": True,
                         "reversible_disconnect": True,
                         "conflict_detection": True,
+                        "externalized_local_state": True,
+                        "multi_library_mounts": True,
+                        "git_sync_driver": True,
+                        "deterministic_index_rebuild": True,
                     },
                     "paths": {
                         "memory_root": str(MEMORY_ROOT),
@@ -1323,6 +1807,7 @@ def main():
                         "state": str(STATE_DIR),
                     },
                     "skills_count": len(hub),
+                    "libraries": [l["id"] for l in resolve_libraries(primary_root=MEMORY_ROOT)],
                     "agents": list(agent_specs().keys()),
                 },
                 ensure_ascii=False,

@@ -9,12 +9,15 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import sys
 from tempfile import NamedTemporaryFile
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from library_paths import data_root
+from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
+import sync_git
 
 DEFAULT_ROOT = data_root()
 LAYER_DIRS = {
@@ -318,14 +321,34 @@ def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
 
 
 class MemoryStore:
-    """Read, search, upsert, and archive entries in the L0-L4 Markdown library."""
+    """Read, search, upsert, and archive entries in one L0-L4 Markdown library."""
 
-    def __init__(self, root):
+    def __init__(
+        self,
+        root,
+        *,
+        library_id="personal",
+        label="统一本地记忆",
+        role="personal",
+        mode="rw",
+        allowed_layers=None,
+        allow_user_managed=True,
+        sync_config=None,
+    ):
         self.root = data_root(root).resolve(strict=True)
         self.index_path = self.root / "MEMORY.md"
         if not self.index_path.is_file():
             raise ValueError(f"MEMORY.md not found under {self.root}")
-        self.lock_path = self.root / ".state" / "library.lock"
+        self.library_id = library_id
+        self.label = label
+        self.role = role
+        self.mode = mode
+        self.allowed_layers = frozenset(allowed_layers if allowed_layers is not None else ALL_LAYERS)
+        self.allow_user_managed = bool(allow_user_managed)
+        self.sync_config = sync_config
+        self.state_dir = library_state_dir(self.root)
+        self.lock_path = self.state_dir / "library.lock"
+        self.trash_dir = self.state_dir / "trash"
 
     @contextmanager
     def write_lock(self):
@@ -337,6 +360,28 @@ class MemoryStore:
                 yield
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _backup_to_trash(self, src_path, slug_hint):
+        """Save a safety backup copy into local state trash before overwriting or removing a file."""
+        if not src_path.is_file():
+            return None
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug_hint)[:80] or "entry"
+        dest = self.trash_dir / f"{stamp}-{safe_slug}-{secrets.token_hex(2)}.md"
+        shutil.copy2(src_path, dest)
+        return str(dest)
+
+    def _maybe_auto_commit(self, message):
+        """Auto-commit to Git when configured on this library; never fail the primary write."""
+        if not self.sync_config or self.sync_config.get("driver") != "git":
+            return None
+        if not self.sync_config.get("auto_commit", True):
+            return None
+        try:
+            return sync_git.auto_commit(self.root, message)
+        except Exception:
+            return None
 
     def resolve_safe(self, rel_path):
         """Resolve a relative path and enforce confinement inside self.root."""
@@ -376,11 +421,13 @@ class MemoryStore:
         items = []
 
         for layer, folder in LAYER_DIRS.items():
+            if layer not in self.allowed_layers:
+                continue
             dir_path = self.root / folder
             if not dir_path.is_dir():
                 continue
             for md in sorted(dir_path.glob("*.md")):
-                if md.name == "README.md":
+                if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
                 raw = md.read_text(encoding="utf-8")
@@ -389,6 +436,9 @@ class MemoryStore:
                 idx = indexed.get(rel, {})
                 items.append(
                     {
+                        "library": self.library_id,
+                        "library_role": self.role,
+                        "library_mode": self.mode,
                         "path": rel,
                         "source": "index",
                         "layer": idx.get("layer", layer),
@@ -406,9 +456,9 @@ class MemoryStore:
                 )
 
         user_dir = self.root / "user-managed"
-        if user_dir.is_dir():
+        if self.allow_user_managed and user_dir.is_dir():
             for md in sorted(user_dir.glob("*.md")):
-                if md.name == "README.md":
+                if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
                 raw = md.read_text(encoding="utf-8")
@@ -416,12 +466,18 @@ class MemoryStore:
                 status = meta.get("status", "active")
                 if status == "archived" and not include_archived:
                     continue
+                layer_val = meta.get("layer", "L2")
+                if layer_val not in self.allowed_layers:
+                    continue
                 cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
                 items.append(
                     {
+                        "library": self.library_id,
+                        "library_role": self.role,
+                        "library_mode": self.mode,
                         "path": rel,
                         "source": "user-managed",
-                        "layer": meta.get("layer", "L2"),
+                        "layer": layer_val,
                         "name": meta.get("name", md.stem),
                         "title": meta.get("title") or extract_title(body, md.stem),
                         "description": meta.get("description", ""),
@@ -438,6 +494,9 @@ class MemoryStore:
         if include_archived:
             return items
         return [item for item in items if item.get("status", "active") != "archived"]
+
+    def _entry_ref(self, rel_path):
+        return rel_path if self.library_id == "personal" else f"{self.library_id}:{rel_path}"
 
     def search(self, query, layer="", include_archived=False, limit=10):
         """Search entries by query terms, CJK bigrams, and temporal recency cues."""
@@ -465,6 +524,10 @@ class MemoryStore:
             return [
                 {
                     "score": 10,
+                    "library": self.library_id,
+                    "library_role": self.role,
+                    "library_mode": self.mode,
+                    "ref": self._entry_ref(it["path"]),
                     "path": it["path"],
                     "source": it["source"],
                     "layer": it["layer"],
@@ -512,6 +575,10 @@ class MemoryStore:
             results.append(
                 {
                     "score": score,
+                    "library": self.library_id,
+                    "library_role": self.role,
+                    "library_mode": self.mode,
+                    "ref": self._entry_ref(item["path"]),
                     "path": item["path"],
                     "source": item["source"],
                     "layer": item["layer"],
@@ -545,6 +612,10 @@ class MemoryStore:
 
         return [
             {
+                "library": self.library_id,
+                "library_role": self.role,
+                "library_mode": self.mode,
+                "ref": self._entry_ref(item["path"]),
                 "path": item["path"],
                 "source": item["source"],
                 "layer": item["layer"],
@@ -562,15 +633,33 @@ class MemoryStore:
         target = self.resolve_safe(rel_path)
         if not target.is_file() or target.suffix.lower() != ".md":
             raise ValueError(f"Not a readable markdown file: {rel_path}")
+        rel_posix = target.relative_to(self.root).as_posix()
+        top_part = Path(rel_posix).parts[0] if Path(rel_posix).parts else ""
+        if top_part == "user-managed" and not self.allow_user_managed:
+            raise ValueError(f"user-managed/ is not enabled for library '{self.library_id}'.")
+        folder_to_layer = {folder: lyr for lyr, folder in LAYER_DIRS.items()}
+        if top_part in folder_to_layer and folder_to_layer[top_part] not in self.allowed_layers:
+            raise ValueError(
+                f"Layer {folder_to_layer[top_part]} is not enabled for library '{self.library_id}'."
+            )
         return {
-            "path": target.relative_to(self.root).as_posix(),
+            "library": self.library_id,
+            "ref": self._entry_ref(rel_posix),
+            "path": rel_posix,
             "content": target.read_text(encoding="utf-8"),
         }
 
     def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False):
-        """Create or update a memory entry under lock and synchronize MEMORY.md index."""
+        """Create or update a memory entry under lock, backing up previous versions to trash."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
         if layer not in LAYER_DIRS:
             raise ValueError(f"Invalid layer: {layer}. Expected L0-L4.")
+        if layer not in self.allowed_layers:
+            allowed_str = ", ".join(sorted(self.allowed_layers))
+            raise ValueError(f"Layer {layer} is not allowed in library '{self.library_id}' (allowed: {allowed_str}).")
+        if user_managed and not self.allow_user_managed:
+            raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
         if not NAME_RE.fullmatch(name) or name.lower() == "readme":
             raise ValueError("name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ and not be 'readme'.")
         title = title.strip()
@@ -595,6 +684,7 @@ class MemoryStore:
                 status = "active"
                 cre_at = ts_now
                 if target.is_file():
+                    self._backup_to_trash(target, f"user-{name}")
                     old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
                     status = old_meta.get("status", "active")
                     cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
@@ -612,8 +702,12 @@ class MemoryStore:
                 }
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body}\n")
+                rel_out = target.relative_to(self.root).as_posix()
+                self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_out}")
                 return {
-                    "path": target.relative_to(self.root).as_posix(),
+                    "library": self.library_id,
+                    "ref": self._entry_ref(rel_out),
+                    "path": rel_out,
                     "indexed": False,
                     "created_at": cre_at,
                     "updated_at": ts_now,
@@ -627,10 +721,11 @@ class MemoryStore:
             stale_files = []
             preserved_created = None
             if target.is_file():
+                self._backup_to_trash(target, name)
                 old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
                 preserved_created, _, _, _ = file_timestamps(target, old_meta)
             for other_layer, other_folder in LAYER_DIRS.items():
-                if other_layer == layer:
+                if other_layer == layer or other_layer not in self.allowed_layers:
                     continue
                 stale = self.root / other_folder / f"{name}.md"
                 if stale.is_file():
@@ -674,10 +769,14 @@ class MemoryStore:
 
             migrated_from = []
             for stale_path, stale_rel in stale_files:
+                self._backup_to_trash(stale_path, f"migrated-{name}")
                 stale_path.unlink(missing_ok=True)
                 migrated_from.append(stale_rel)
 
+            self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_path}")
             res = {
+                "library": self.library_id,
+                "ref": self._entry_ref(rel_path),
                 "path": rel_path,
                 "indexed": True,
                 "created_at": cre_at,
@@ -740,6 +839,12 @@ class MemoryStore:
 
     def archive_entry(self, name, user_managed=False):
         """Archive a user-managed entry or move a standard topic into archive/."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        if user_managed and not self.allow_user_managed:
+            raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
+        if not user_managed and "L4" not in self.allowed_layers:
+            raise ValueError(f"Layer L4 (archive) is not enabled in library '{self.library_id}'.")
         if not NAME_RE.fullmatch(name):
             raise ValueError("Invalid entry name.")
         ts_now = now_iso()
@@ -748,6 +853,7 @@ class MemoryStore:
                 target = self.root / "user-managed" / f"{name}.md"
                 if not target.is_file():
                     raise ValueError(f"User-managed entry not found: {name}")
+                self._backup_to_trash(target, f"archive-user-{name}")
                 meta, body = parse_frontmatter(target.read_text(encoding="utf-8"))
                 cre_at = meta.get("created_at") or meta.get("updated_at") or ts_now
                 ordered = {
@@ -762,11 +868,18 @@ class MemoryStore:
                 }
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
-                return {"path": target.relative_to(self.root).as_posix(), "status": "archived", "updated_at": ts_now}
+                rel_out = target.relative_to(self.root).as_posix()
+                self._maybe_auto_commit(f"memory({self.library_id}): archive {rel_out}")
+                return {
+                    "library": self.library_id,
+                    "path": rel_out,
+                    "status": "archived",
+                    "updated_at": ts_now,
+                }
 
             indexed = self.parse_index()
             for layer, folder in LAYER_DIRS.items():
-                if layer == "L4":
+                if layer == "L4" or layer not in self.allowed_layers:
                     continue
                 candidate = self.root / folder / f"{name}.md"
                 if candidate.is_file():
@@ -797,6 +910,7 @@ class MemoryStore:
                     )
                     new_rel = f"archive/{name}.md"
                     prev_index_text = self.index_path.read_text(encoding="utf-8")
+                    self._backup_to_trash(candidate, f"archive-{name}")
                     atomic_write(dest, archived_raw)
                     try:
                         self._remove_index_line(old_rel)
@@ -809,15 +923,198 @@ class MemoryStore:
                             pass
                         raise
                     candidate.unlink(missing_ok=True)
-                    return {"from": old_rel, "to": new_rel, "layer": "L4", "updated_at": ts_now}
+                    self._maybe_auto_commit(f"memory({self.library_id}): archive {old_rel} -> {new_rel}")
+                    return {
+                        "library": self.library_id,
+                        "from": old_rel,
+                        "to": new_rel,
+                        "layer": "L4",
+                        "updated_at": ts_now,
+                    }
 
         raise ValueError(f"Active entry not found: {name}")
 
 
+class WorkspaceStore:
+    """Multi-library facade uniting the personal memory root with mounted shared libraries."""
+
+    def __init__(self, primary_root, home=None):
+        self.primary_root = data_root(primary_root).resolve(strict=True)
+        self.home = home
+        self._config_mtime = None
+        self._stores = {}
+        self._descriptors = []
+        self._load_stores(force=True)
+
+    def _load_stores(self, force=False):
+        cfg_path = mounts_config_path(home=self.home)
+        try:
+            cur_mtime = cfg_path.stat().st_mtime if cfg_path.is_file() else None
+        except OSError:
+            cur_mtime = None
+        if not force and cur_mtime == self._config_mtime and "personal" in self._stores:
+            return
+
+        descriptors = resolve_libraries(primary_root=self.primary_root, home=self.home)
+        stores = {}
+        for desc in descriptors:
+            lib_id = desc["id"]
+            try:
+                stores[lib_id] = MemoryStore(
+                    desc["path"],
+                    library_id=lib_id,
+                    label=desc["label"],
+                    role=desc["role"],
+                    mode=desc["mode"],
+                    allowed_layers=desc["layers"],
+                    allow_user_managed=desc["allow_user_managed"],
+                    sync_config=desc.get("sync"),
+                )
+            except (ValueError, OSError):
+                if lib_id == "personal":
+                    raise
+                # Skip temporarily unavailable mounted libraries instead of crashing MCP startup
+                continue
+        self._descriptors = descriptors
+        self._stores = stores
+        self._config_mtime = cur_mtime
+
+    def _target_stores(self, library="*"):
+        self._load_stores()
+        sel = (library or "*").strip()
+        if sel in {"*", "all"}:
+            return list(self._stores.values())
+        if sel not in self._stores:
+            known = ", ".join(self._stores.keys())
+            raise ValueError(f"Unknown or unavailable library '{sel}'. Available: {known}")
+        return [self._stores[sel]]
+
+    def _resolve_single_store(self, library="personal"):
+        self._load_stores()
+        sel = (library or "personal").strip()
+        if sel not in self._stores:
+            known = ", ".join(self._stores.keys())
+            raise ValueError(f"Unknown or unavailable library '{sel}'. Available: {known}")
+        return self._stores[sel]
+
+    def list_libraries(self):
+        self._load_stores()
+        out = []
+        for desc in self._descriptors:
+            lib_id = desc["id"]
+            store = self._stores.get(lib_id)
+            sync_cfg = desc.get("sync")
+            entry_count = len(store.collect_entries(include_archived=False)) if store else 0
+            out.append(
+                {
+                    "id": lib_id,
+                    "label": desc["label"],
+                    "role": desc["role"],
+                    "mode": desc["mode"],
+                    "allowed_layers": list(desc["layers"]),
+                    "allow_user_managed": bool(desc["allow_user_managed"]),
+                    "path": str(desc["path"]),
+                    "available": store is not None,
+                    "entry_count": entry_count,
+                    "sync_driver": sync_cfg.get("driver") if sync_cfg else "",
+                }
+            )
+        return out
+
+    def search(self, query, layer="", include_archived=False, limit=10, library="*"):
+        capped_limit = max(1, min(int(limit), 50))
+        stores = self._target_stores(library)
+        if len(stores) == 1:
+            return stores[0].search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+
+        merged = []
+        for st in stores:
+            hits = st.search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+            for hit in hits:
+                try:
+                    dt, _ = parse_timestamp(hit.get("updated_at", ""))
+                    upd_ep = dt.timestamp()
+                except ValueError:
+                    upd_ep = 0.0
+                merged.append((hit, upd_ep))
+        merged.sort(
+            key=lambda pair: (
+                -pair[0].get("score", 0),
+                -pair[1],
+                0 if pair[0].get("library") == "personal" else 1,
+                pair[0].get("layer", ""),
+                pair[0].get("path", ""),
+            )
+        )
+        return [pair[0] for pair in merged[:capped_limit]]
+
+    def list_entries(self, layer="", include_archived=False, sort="updated", library="*"):
+        stores = self._target_stores(library)
+        if len(stores) == 1:
+            return stores[0].list_entries(layer=layer, include_archived=include_archived, sort=sort)
+
+        merged = []
+        for st in stores:
+            for item in st.list_entries(layer=layer, include_archived=include_archived, sort=sort):
+                try:
+                    upd_ep = parse_timestamp(item.get("updated_at", ""))[0].timestamp()
+                except ValueError:
+                    upd_ep = 0.0
+                try:
+                    cre_ep = parse_timestamp(item.get("created_at", ""))[0].timestamp()
+                except ValueError:
+                    cre_ep = 0.0
+                merged.append((item, cre_ep, upd_ep))
+
+        if sort == "created":
+            merged.sort(key=lambda t: (-t[1], -t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["path"]))
+        elif sort == "layer":
+            merged.sort(key=lambda t: (t[0]["layer"], -t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["path"]))
+        else:
+            merged.sort(key=lambda t: (-t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["layer"], t[0]["path"]))
+        return [t[0] for t in merged]
+
+    def read_entry(self, rel_path, library=""):
+        self._load_stores()
+        target_lib = (library or "").strip()
+        effective_path = rel_path
+        if not target_lib and ":" in rel_path:
+            prefix, rest = rel_path.split(":", 1)
+            if prefix in self._stores and rest:
+                target_lib = prefix
+                effective_path = rest
+        store = self._resolve_single_store(target_lib or "personal")
+        return store.read_entry(effective_path)
+
+    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal"):
+        store = self._resolve_single_store(library or "personal")
+        return store.upsert_entry(
+            layer=layer,
+            name=name,
+            title=title,
+            description=description,
+            body=body,
+            topic_type=topic_type,
+            user_managed=user_managed,
+        )
+
+    def archive_entry(self, name, user_managed=False, library="personal"):
+        store = self._resolve_single_store(library or "personal")
+        return store.archive_entry(name=name, user_managed=user_managed)
+
+
 TOOLS = [
     {
+        "name": "memory_libraries",
+        "description": "List the personal memory library and all mounted shared libraries with their read/write mode, allowed layers, and sync driver.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "memory_search",
-        "description": "Search unified L0-L4 Markdown memories by keywords, Chinese phrases, or temporal cues (e.g. '最近工作', '刚刚做了什么').",
+        "description": "Search unified L0-L4 Markdown memories across the personal library and mounted shared libraries by keywords, Chinese phrases, or temporal cues (e.g. '最近工作', '刚刚做了什么').",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -825,58 +1122,63 @@ TOOLS = [
                 "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "default": 10},
+                "library": {"type": "string", "default": "*", "description": "Target library id ('*' for all mounted libraries, or 'personal' / a shared mount id)."},
             },
             "required": ["query"],
         },
     },
     {
         "name": "memory_list",
-        "description": "List indexed L0-L4 and user-managed memory entries with created_at and updated_at timestamps.",
+        "description": "List indexed L0-L4 and user-managed memory entries with created_at and updated_at timestamps across personal and mounted shared libraries.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "sort": {"type": "string", "enum": ["updated", "created", "layer"], "default": "updated"},
+                "library": {"type": "string", "default": "*", "description": "Target library id ('*' for all, 'personal', or a shared mount id)."},
             },
         },
     },
     {
         "name": "memory_read",
-        "description": "Read a specific memory Markdown file by path relative to the memory root (e.g. 'MEMORY.md' or 'projects/example-project.md').",
+        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md').",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path inside the memory library."},
+                "path": {"type": "string", "description": "Relative path inside the memory library, optionally prefixed with '<library>:'."},
+                "library": {"type": "string", "default": "", "description": "Optional library id (defaults to 'personal' unless path has '<library>:' prefix)."},
             },
             "required": ["path"],
         },
     },
     {
         "name": "memory_upsert",
-        "description": "Apply the writing rules in MEMORY.md §0. Search for the topic first. Use its existing name and supply the complete revised body when updating. Synchronizes the L0-L4 index, or writes to user-managed/ when explicitly requested.",
+        "description": "Apply the writing rules in MEMORY.md §0. Search for the topic first. Use its existing name and supply the complete revised body when updating. Defaults to writing into the personal library; specify 'library' explicitly to write to a writable shared library.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"]},
-                "name": {"type": "string", "description": "Kebab-case slug matching ^[a-z0-9][a-z0-9_-]{0,79}$."},
+                "name": {"type": "string", "description": "Kebab-case slug matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$."},
                 "title": {"type": "string", "description": "Single-line human-readable title."},
                 "description": {"type": "string", "description": "Concise single-line retrieval cue."},
                 "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates."},
                 "topic_type": {"type": "string", "enum": ["", "user", "feedback", "project", "reference"], "default": ""},
-                "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/."},
+                "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
             },
             "required": ["layer", "name", "title", "description", "body"],
         },
     },
     {
         "name": "memory_archive",
-        "description": "Archive a user-managed entry or move an L0-L3 entry to archive/ (L4).",
+        "description": "Archive a user-managed entry or move an L0-L3 entry to archive/ (L4). Defaults to the personal library.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Entry slug name."},
                 "user_managed": {"type": "boolean", "default": False},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal')."},
             },
             "required": ["name"],
         },
@@ -886,23 +1188,34 @@ TOOLS = [
 
 def handle_tool_call(store, name, args):
     """Dispatch an MCP tools/call invocation."""
-    if name == "memory_search":
-        data = store.search(
+    if name == "memory_libraries":
+        data = store.list_libraries() if hasattr(store, "list_libraries") else []
+    elif name == "memory_search":
+        kwargs = dict(
             query=args.get("query", ""),
             layer=args.get("layer", ""),
             include_archived=bool(args.get("include_archived", False)),
             limit=args.get("limit", 10),
         )
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "*")
+        data = store.search(**kwargs)
     elif name == "memory_list":
-        data = store.list_entries(
+        kwargs = dict(
             layer=args.get("layer", ""),
             include_archived=bool(args.get("include_archived", False)),
             sort=args.get("sort", "updated"),
         )
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "*")
+        data = store.list_entries(**kwargs)
     elif name == "memory_read":
-        data = store.read_entry(args["path"])
+        if isinstance(store, WorkspaceStore):
+            data = store.read_entry(args["path"], library=args.get("library", ""))
+        else:
+            data = store.read_entry(args["path"])
     elif name == "memory_upsert":
-        data = store.upsert_entry(
+        kwargs = dict(
             layer=args["layer"],
             name=args["name"],
             title=args["title"],
@@ -911,11 +1224,17 @@ def handle_tool_call(store, name, args):
             topic_type=args.get("topic_type", ""),
             user_managed=bool(args.get("user_managed", False)),
         )
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "personal")
+        data = store.upsert_entry(**kwargs)
     elif name == "memory_archive":
-        data = store.archive_entry(
+        kwargs = dict(
             name=args["name"],
             user_managed=bool(args.get("user_managed", False)),
         )
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "personal")
+        data = store.archive_entry(**kwargs)
     else:
         raise ValueError(f"Unknown tool: {name}")
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
@@ -1000,7 +1319,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--memory-root", type=Path, default=DEFAULT_ROOT, help="Path to unified memory root.")
     args = parser.parse_args()
-    store = MemoryStore(args.memory_root)
+    store = WorkspaceStore(args.memory_root)
     serve_stdio(store)
 
 

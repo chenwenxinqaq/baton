@@ -31,8 +31,9 @@ if str(ROOT_DIR / "mcp") not in sys.path:
 if str(ROOT_DIR / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
-from library_paths import data_root
+from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
 import server as mcp_server  # noqa: E402
+import sync_git  # noqa: E402
 
 LAYERS = {
     "L0": ("操作约束", "feedback", "操作红线、只读范围与环境授权边界"),
@@ -244,19 +245,61 @@ def parse_index_markdown(markdown):
 
 
 class Library:
-    def __init__(self, root, label):
+    def __init__(
+        self,
+        root,
+        label,
+        *,
+        library_id="personal",
+        role="personal",
+        mode="rw",
+        allowed_layers=None,
+        allow_user_managed=True,
+        sync_config=None,
+    ):
         root = data_root(root).resolve(strict=True)
         self.root = root
+        self.library_id = library_id
+        self.role = role
+        self.mode = mode
+        self.allowed_layers = frozenset(allowed_layers if allowed_layers is not None else ALL_LAYERS)
+        self.allow_user_managed = bool(allow_user_managed)
+        self.sync_config = sync_config
         self.index = root / "MEMORY.md"
         if root.name.casefold() in {"memories", "memories_v2"} or not self.index.is_file():
             raise InvalidEntry("请选择包含 MEMORY.md 的手工记忆库目录。")
         self.folder = root / "user-managed"
-        self.folder.mkdir(mode=0o700, exist_ok=True)
-        if self.folder.is_symlink() or not self.folder.is_dir():
-            raise InvalidEntry("用户管理目录必须是普通目录。")
-        self.lock_path = root / ".state" / "library.lock"
-        self.trash_dir = root / ".state" / "trash"
+        if self.allow_user_managed:
+            self.folder.mkdir(mode=0o700, exist_ok=True)
+            if self.folder.is_symlink() or not self.folder.is_dir():
+                raise InvalidEntry("用户管理目录必须是普通目录。")
+        self.state_dir = library_state_dir(root)
+        self.lock_path = self.state_dir / "library.lock"
+        self.trash_dir = self.state_dir / "trash"
         self.label = label
+
+    @property
+    def is_readonly(self):
+        return self.mode == "ro"
+
+    def _ensure_writable(self, layer=None, user_managed=False):
+        if self.is_readonly:
+            raise InvalidEntry(f"记忆库「{self.label}」为只读挂载，不支持写入或删除。")
+        if user_managed and not self.allow_user_managed:
+            raise InvalidEntry(f"共享记忆库「{self.label}」不支持保存个人手记。")
+        if layer is not None and layer not in self.allowed_layers:
+            allowed_str = " / ".join(sorted(self.allowed_layers))
+            raise InvalidEntry(f"记忆库「{self.label}」未启用层级 {layer}（允许：{allowed_str}）。")
+
+    def _maybe_auto_commit(self, message):
+        if not self.sync_config or self.sync_config.get("driver") != "git":
+            return
+        if not self.sync_config.get("auto_commit", True):
+            return
+        try:
+            sync_git.auto_commit(self.root, message)
+        except Exception:
+            pass
 
     @contextmanager
     def write_lock(self):
@@ -320,6 +363,7 @@ class Library:
         return text, sha256(raw).hexdigest()
 
     def save_index_markdown(self, new_markdown, expected_revision):
+        self._ensure_writable()
         normalized = new_markdown.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not normalized or len(normalized) > MAX_BODY_CHARS:
             raise InvalidEntry("MEMORY.md 内容不能为空且须在长度上限内。")
@@ -342,6 +386,7 @@ class Library:
             if cur_rev != expected_revision:
                 raise StaleEntry
             mcp_server.atomic_write(self.index, normalized + "\n")
+        self._maybe_auto_commit(f"memory({self.library_id}): update MEMORY.md")
 
     @staticmethod
     def _topic_revision(raw_bytes, topic):
@@ -400,6 +445,7 @@ class Library:
         return candidate
 
     def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type=""):
+        self._ensure_writable(layer=layer)
         validate_common_fields(layer, title, description, body)
         ts_now = mcp_server.now_iso()
         with self.write_lock():
@@ -469,6 +515,7 @@ class Library:
                     raise
                 if new_rel != orig_path:
                     (self.root / orig_path).unlink(missing_ok=True)
+                self._maybe_auto_commit(f"memory({self.library_id}): update {new_rel}")
                 return new_rel
 
             final_slug = self._generate_unique_slug(title, slug)
@@ -494,9 +541,11 @@ class Library:
             except Exception:
                 new_file.unlink(missing_ok=True)
                 raise
+            self._maybe_auto_commit(f"memory({self.library_id}): create {new_rel}")
             return new_rel
 
     def archive_topic(self, topic_path, expected_revision):
+        self._ensure_writable(layer="L4")
         ts_now = mcp_server.now_iso()
         with self.write_lock():
             store = mcp_server.MemoryStore(self.root)
@@ -541,9 +590,11 @@ class Library:
                 dest.unlink(missing_ok=True)
                 raise
             (self.root / topic_path).unlink(missing_ok=True)
+            self._maybe_auto_commit(f"memory({self.library_id}): archive {topic_path} -> {new_rel}")
             return new_rel
 
     def delete_topic(self, topic_path, expected_revision):
+        self._ensure_writable()
         with self.write_lock():
             store = mcp_server.MemoryStore(self.root)
             _, current_topics = self.read_index()
@@ -557,8 +608,11 @@ class Library:
             self._backup_to_trash(target, cur.slug)
             target.unlink()
             store._remove_index_line(topic_path)
+        self._maybe_auto_commit(f"memory({self.library_id}): delete {topic_path}")
 
     def path(self, name):
+        if not self.allow_user_managed:
+            raise InvalidEntry("共享记忆库不支持个人手记。")
         if not ENTRY_NAME.fullmatch(name) or name == "readme":
             raise InvalidEntry("条目名称无效。")
         return self.folder / f"{name}.md"
@@ -575,9 +629,11 @@ class Library:
         return Entry.from_file(name, raw)
 
     def list(self):
+        if not self.allow_user_managed or not self.folder.is_dir():
+            return [], []
         entries, unreadable = [], []
         for path in sorted(self.folder.glob("*.md")):
-            if path.name == "README.md":
+            if path.name == "README.md" or sync_git.is_conflict_filename(path.name):
                 continue
             try:
                 entries.append(self.read(path.stem))
@@ -587,6 +643,7 @@ class Library:
         return entries, unreadable
 
     def save(self, entry):
+        self._ensure_writable(layer=entry.layer, user_managed=True)
         path = self.path(entry.name)
         with self.write_lock():
             if entry.revision:
@@ -612,8 +669,10 @@ class Library:
             finally:
                 if staged is not None:
                     staged.unlink(missing_ok=True)
+        self._maybe_auto_commit(f"memory({self.library_id}): save user-managed/{entry.name}.md")
 
     def delete_user_entry(self, name, expected_revision):
+        self._ensure_writable(user_managed=True)
         path = self.path(name)
         with self.write_lock():
             try:
@@ -624,6 +683,7 @@ class Library:
                 raise StaleEntry
             self._backup_to_trash(path, name)
             path.unlink()
+        self._maybe_auto_commit(f"memory({self.library_id}): delete user-managed/{name}.md")
 
 
 def validate_common_fields(layer, title, description, body):
@@ -1131,10 +1191,73 @@ def library_nav_html(libraries, current_key):
     links = []
     for key, library in libraries.items():
         current = CUR_ATTR if key == current_key else ""
+        suffix = ""
+        if library.role == "shared":
+            suffix = " · 只读" if library.is_readonly else " · 共写"
         links.append(
-            f'<li><a href="{escape(query(library=key))}"{current}>{escape(library.label)}</a></li>'
+            f'<li><a href="{escape(query(library=key))}"{current}>{escape(library.label)}{suffix}</a></li>'
         )
     return f'<nav aria-label="切换记忆库"><ul class="lib-pills">{"".join(links)}</ul></nav>'
+
+
+def render_library_sync_bar(library, key, token, tab=""):
+    """Render Git sync status and one-click sync/rebuild controls for the active library."""
+    sync_cfg = library.sync_config or {}
+    remote = sync_cfg.get("remote") or "origin"
+    branch = sync_cfg.get("branch") or ""
+    st = sync_git.git_status(library.root, remote=remote, branch=branch)
+    role_badge = "个人主库" if library.role == "personal" else ("共享只读" if library.is_readonly else "团队共写")
+
+    parts = [f'<span class="meta-chip">{role_badge}</span>']
+    if st.get("is_repo"):
+        br_txt = st.get("branch") or "main"
+        parts.append(f'<span class="meta-chip">Git: {escape(br_txt)}</span>')
+        if st.get("remote_url"):
+            parts.append(f'<span class="chip-ok">✓ 远端已配</span>')
+            if st.get("behind"):
+                parts.append(f'<span class="chip-warn">↓ 落后 {st["behind"]}</span>')
+            if st.get("ahead"):
+                parts.append(f'<span class="chip-warn">↑ 待推送 {st["ahead"]}</span>')
+        else:
+            parts.append('<span class="chip-off">○ 未绑远端</span>')
+        if st.get("dirty_count"):
+            parts.append(f'<span class="chip-warn">● {st["dirty_count"]} 项未提交</span>')
+    else:
+        parts.append('<span class="chip-off">○ 未启用 Git</span>')
+
+    actions = []
+    if st.get("is_repo") and st.get("remote_url"):
+        sync_label = "拉取更新" if library.is_readonly else "Git 同步"
+        actions.append(
+            f'<form method="post" action="/sync#feedback">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}'
+            f'<button class="btn btn-secondary btn-compact" type="submit">{sync_label}</button>'
+            f"</form>"
+        )
+    if not library.is_readonly:
+        actions.append(
+            f'<form method="post" action="/rebuild_index#feedback">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}'
+            f'<button class="btn btn-ghost btn-compact" type="submit">重建索引</button>'
+            f"</form>"
+        )
+
+    conflict_html = ""
+    if st.get("conflicts"):
+        c_names = "、".join(escape(c) for c in st["conflicts"])
+        conflict_html = (
+            f'<p class="agent-issue">发现待人工合并的同步冲突副本（合并并删除后方可推送）：{c_names}</p>'
+        )
+
+    return f"""
+      <div class="sync-bar">
+        <div class="sync-bar-meta">
+          <strong>当前库：{escape(library.label)}</strong>
+          <div class="check-chips">{"".join(parts)}</div>
+        </div>
+        <div class="agents-global-actions">{"".join(actions)}</div>
+      </div>
+      {conflict_html}"""
 
 
 def format_comp_chip(label, state, suffix=""):
@@ -1890,7 +2013,12 @@ def render(
     editor_html = ""
     confirm_dialog_html = ""
 
-    if view == "new":
+    if view in {"new", "edit", "edit_topic", "edit_index"} and library.is_readonly:
+        heading = f"{library.label}（只读共享库）"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">只读共享库</span></div>'
+        error = error or f"当前库「{library.label}」为只读挂载，不支持在页面中新建或编辑。"
+        reader = render_overview(topics, entries, key)
+    elif view == "new":
         heading = "新建记忆"
         default_scope = draft_scope or ("user" if source == "user" else "index")
         default_layer = (
@@ -2047,8 +2175,13 @@ def render(
         detail_submeta = f'<p class="detail-path"><code>{escape(str(library.index))}</code></p>'
         edit_idx_href = query(**link_params, view="edit_index") + "#detail-title"
         toggle_href = query(**link_params, view="index", raw="" if raw_mode else "1") + "#detail-title"
+        edit_idx_btn = (
+            ""
+            if library.is_readonly
+            else f'<a class="btn btn-primary btn-compact" href="{escape(edit_idx_href)}">编辑 MEMORY.md</a>'
+        )
         detail_toolbar = (
-            f'<a class="btn btn-primary btn-compact" href="{escape(edit_idx_href)}">编辑 MEMORY.md</a>'
+            f'{edit_idx_btn}'
             f'<a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">'
             f'{"阅读视图" if raw_mode else "查看源码"}</a>'
         )
@@ -2078,27 +2211,33 @@ def render(
             )
             edit_topic_href = query(**link_params, topic=t_entry.path, view="edit_topic") + "#detail-title"
             toggle_href = query(**link_params, topic=t_entry.path, raw="" if raw_mode else "1") + "#detail-title"
-            archive_btn = ""
-            if t_entry.layer != "L4":
-                archive_btn = f"""
-                  <form action="/archive_topic#feedback" method="post" aria-label="归档当前记忆到 L4">
-                    {hidden("csrf", token)}{hidden("library", key)}
-                    {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
-                    <button class="btn btn-ghost btn-compact" type="submit">归档至 L4</button>
-                  </form>"""
-            detail_toolbar = f"""
-              <a class="btn btn-primary btn-compact" href="{escape(edit_topic_href)}">编辑记忆</a>
-              <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
-              {archive_btn}
-              <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
-            confirm_dialog_html = render_delete_dialog_html(
-                token=token,
-                library_key=key,
-                scope="index",
-                target_id=t_entry.path,
-                display_path=t_entry.path,
-                revision=t_entry.revision,
-            )
+            if library.is_readonly:
+                detail_toolbar = (
+                    f'<a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">'
+                    f'{"阅读视图" if raw_mode else "查看源码"}</a>'
+                )
+            else:
+                archive_btn = ""
+                if t_entry.layer != "L4" and "L4" in library.allowed_layers:
+                    archive_btn = f"""
+                      <form action="/archive_topic#feedback" method="post" aria-label="归档当前记忆到 L4">
+                        {hidden("csrf", token)}{hidden("library", key)}
+                        {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
+                        <button class="btn btn-ghost btn-compact" type="submit">归档至 L4</button>
+                      </form>"""
+                detail_toolbar = f"""
+                  <a class="btn btn-primary btn-compact" href="{escape(edit_topic_href)}">编辑记忆</a>
+                  <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
+                  {archive_btn}
+                  <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
+                confirm_dialog_html = render_delete_dialog_html(
+                    token=token,
+                    library_key=key,
+                    scope="index",
+                    target_id=t_entry.path,
+                    display_path=t_entry.path,
+                    revision=t_entry.revision,
+                )
             summary_html = (
                 f'<div class="doc-summary-banner">{escape(t_entry.description)}</div>'
                 if t_entry.description
@@ -2152,9 +2291,16 @@ def render(
         f'<a class="mode-tab" href="{escape(query(library=key))}"{CUR_ATTR}>记忆知识库 ({len(topics)})</a>'
         f'<a class="mode-tab" href="{escape(query(library=key, tab="skills"))}">Skills 技能中心 ({en_sk_cnt}/{len(hub_skills)})</a>'
     )
-    topbar_cta = (
-        f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>'
-        f'<a class="btn btn-primary" href="{escape(new_link)}"><span aria-hidden="true">＋</span> 新建记忆</a>'
+    new_btn_html = (
+        ""
+        if library.is_readonly
+        else f'<a class="btn btn-primary" href="{escape(new_link)}"><span aria-hidden="true">＋</span> 新建记忆</a>'
+    )
+    topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
+
+    agent_and_sync_html = (
+        render_agent_panel(token, key, tab="", agent_home=agent_home)
+        + render_library_sync_bar(library, key, token, tab="")
     )
 
     return load_template().substitute(
@@ -2175,7 +2321,7 @@ def render(
         index_path=escape(str(library.index)),
         skills_path=escape(str(library.root / "skills")),
         folder=escape(str(library.folder)),
-        agent_panel=render_agent_panel(token, key, tab="", agent_home=agent_home),
+        agent_panel=agent_and_sync_html,
         detail_badges=detail_badges,
         detail_submeta=detail_submeta,
         detail_toolbar=detail_toolbar,
@@ -2235,10 +2381,16 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
+    def _refresh_mounts(self):
+        loader = getattr(self.server, "reload_mounts", None)
+        if loader is not None:
+            loader()
+
     def do_GET(self):
         if not self.known_host():
             self.respond(HTTPStatus.FORBIDDEN, "地址无效。", "text/plain; charset=utf-8")
             return
+        self._refresh_mounts()
         url = urlsplit(self.path)
         if url.path == "/style.css":
             self.respond(HTTPStatus.OK, load_style(), "text/css; charset=utf-8")
@@ -2292,7 +2444,7 @@ class Handler(BaseHTTPRequestHandler):
             "topic_saved": "记忆已保存并同步更新 MEMORY.md 索引。",
             "topic_archived": "记忆已移入 L4 事故归档并同步更新索引。",
             "index_saved": "MEMORY.md 规范与索引已保存。",
-            "deleted": "记忆条目已移除（已在 .state/trash/ 保留安全备份）。",
+            "deleted": "记忆条目已移除（已在本机回收站保留安全备份）。",
             "archived": "手记已归档。",
             "restored": "手记已恢复生效。",
             "connected": "客户端记忆与 Skills 已统一同步生效。",
@@ -2300,6 +2452,9 @@ class Handler(BaseHTTPRequestHandler):
             "doctored": "自检完成，所有可自动修复项已同步对齐。",
             "skill_enabled": "技能已启用并同步到已连通客户端。",
             "skill_disabled": "技能已停用并从已连通客户端卸载。",
+            "synced": "Git 同步完成。",
+            "synced_conflicts": "已合并远端更新，发现正文冲突副本，请人工合并并删除冲突文件后再推送。",
+            "index_rebuilt": "MEMORY.md 索引已按磁盘条目重新生成。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -2338,10 +2493,13 @@ class Handler(BaseHTTPRequestHandler):
             "/agent",
             "/doctor",
             "/skill",
+            "/sync",
+            "/rebuild_index",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
             return
+        self._refresh_mounts()
         if self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.page(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, error="请使用页面上的表单。")
             return
@@ -2367,7 +2525,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.FORBIDDEN, "请刷新页面后重试。", "text/plain; charset=utf-8")
             return
 
-        if self.path in {"/agent", "/doctor", "/skill"}:
+        if self.path in {"/agent", "/doctor", "/skill", "/sync", "/rebuild_index"}:
             self.handle_control_action(fields)
             return
         if self.path == "/save_index":
@@ -2403,6 +2561,27 @@ class Handler(BaseHTTPRequestHandler):
                     skill="" if folder == "all" else folder,
                     notice=notice,
                 )
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/rebuild_index":
+                lib_obj = self.server.libraries[key]
+                lib_obj._ensure_writable()
+                sync_git.rebuild_index(lib_obj.root)
+                notice = "index_rebuilt"
+                loc = query(library=key, tab=return_tab, notice=notice)
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/sync":
+                lib_obj = self.server.libraries[key]
+                sync_cfg = lib_obj.sync_config or {}
+                res = sync_git.sync(
+                    lib_obj.root,
+                    remote=sync_cfg.get("remote") or "origin",
+                    branch=sync_cfg.get("branch") or "",
+                    mode=lib_obj.mode,
+                )
+                notice = "synced_conflicts" if res.get("status") == "needs_manual_merge" else "synced"
+                loc = query(library=key, tab=return_tab, notice=notice)
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/doctor":
@@ -2696,6 +2875,34 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
 
 
+def build_libraries_map(primary_root, also_root=None, home=None):
+    """Build ordered mapping of key -> Library from primary root, mounts.json, and optional --also-root."""
+    descriptors = resolve_libraries(primary_root=primary_root, home=home)
+    libraries = {}
+    for desc in descriptors:
+        key = "primary" if desc["id"] == "personal" else desc["id"]
+        try:
+            libraries[key] = Library(
+                desc["path"],
+                desc["label"],
+                library_id=desc["id"],
+                role=desc["role"],
+                mode=desc["mode"],
+                allowed_layers=desc["layers"],
+                allow_user_managed=desc["allow_user_managed"],
+                sync_config=desc.get("sync"),
+            )
+        except (InvalidEntry, ValueError, OSError):
+            if key == "primary":
+                raise
+            continue
+    if also_root:
+        alternate = Library(also_root, "对照记忆库", library_id="local")
+        if all(lib.root != alternate.root for lib in libraries.values()):
+            libraries["local"] = alternate
+    return libraries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--memory-root", type=Path, default=data_root())
@@ -2705,12 +2912,7 @@ def main():
     try:
         primary = data_root(args.memory_root).resolve(strict=True)
         os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
-        primary_label = "统一本地记忆"
-        libraries = {"primary": Library(primary, primary_label)}
-        if args.also_root:
-            alternate = Library(args.also_root, "对照记忆库")
-            if alternate.root != primary:
-                libraries["local"] = alternate
+        libraries = build_libraries_map(primary, also_root=args.also_root)
         server = HTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
@@ -2726,6 +2928,19 @@ def main():
         server.libraries = libraries
         server.token = secrets.token_urlsafe(32)
         server.agent_home = None
+        cfg_file = mounts_config_path()
+        state_holder = {"mtime": cfg_file.stat().st_mtime if cfg_file.is_file() else None}
+
+        def reload_mounts():
+            try:
+                cur_mtime = cfg_file.stat().st_mtime if cfg_file.is_file() else None
+            except OSError:
+                cur_mtime = None
+            if cur_mtime != state_holder["mtime"]:
+                server.libraries = build_libraries_map(primary, also_root=args.also_root)
+                state_holder["mtime"] = cur_mtime
+
+        server.reload_mounts = reload_mounts
         print(f"http://127.0.0.1:{server.server_port}/", flush=True)
         for library in libraries.values():
             print(f"{library.label}: {library.index}", flush=True)

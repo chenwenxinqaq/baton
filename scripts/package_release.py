@@ -18,6 +18,7 @@ PUBLIC_FILES = (
     "scripts/library_paths.py",
     "scripts/memoryctl.py",
     "scripts/package_release.py",
+    "scripts/sync_git.py",
     "skills/unified-memory/SKILL.md",
     "templates/entry.md",
     "templates/incident.md",
