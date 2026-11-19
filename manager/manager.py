@@ -669,7 +669,7 @@ def render_layer_radios(selected_layer):
 
 def render_scope_radios(selected_scope):
     opts = [
-        ("index", "主知识库（写入对应分层目录并自动同步 MEMORY.md，三端 Agent 默认检索）"),
+        ("index", "主知识库（写入对应分层目录并自动同步 MEMORY.md，已接入的 Agent 默认检索）"),
         ("user", "个人手记区（仅存入 user-managed/，由你手动管理）"),
     ]
     pills = []
@@ -1147,7 +1147,7 @@ def format_comp_chip(label, state, suffix=""):
 
 
 def render_agent_panel(token, key, tab="", agent_home=None):
-    """Render clean, intuitive 3-agent integration status ribbon."""
+    """Render integration status and controls for each supported client."""
     try:
         import memoryctl
 
@@ -1199,7 +1199,7 @@ def render_agent_panel(token, key, tab="", agent_home=None):
             sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
             chips = "".join(
                 [
-                    format_comp_chip("指令规则", comp["instructions"]["state"]),
+                    format_comp_chip("指令规则", comp["instructions"]["state"]) if "instructions" in comp else "",
                     format_comp_chip("MCP 服务", comp["mcp"]["state"]),
                     format_comp_chip("Skills", sk_comp["state"], sk_suffix),
                 ]
@@ -1234,7 +1234,7 @@ def render_agent_panel(token, key, tab="", agent_home=None):
               </form>"""
 
         summary_note = (
-            f"三端已全部连通（{managed_count}/{len(specs)}）"
+            f"客户端已全部连通（{managed_count}/{len(specs)}）"
             if managed_count == len(specs)
             else f"已完整同步 {managed_count}/{len(specs)} 个客户端"
         )
@@ -1265,7 +1265,7 @@ def render_agent_panel(token, key, tab="", agent_home=None):
     except OSError:
         return (
             '<div class="agents-ribbon">'
-            '<p class="agents-subtitle">当前进程受沙盒限制无法直接检测三端目录；在本地终端运行 python3 manager/manager.py 即可启用三端可视化控制。</p>'
+            '<p class="agents-subtitle">当前进程受沙盒限制无法直接检测客户端目录；在本地终端运行 python3 manager/manager.py 即可启用客户端接入管理。</p>'
             "</div>"
         )
 
@@ -1478,7 +1478,7 @@ def render_overview(topics, entries, key):
         <strong>如何高效使用这套统一中枢？</strong>
         <p>1. 左侧列表默认按 <strong>最近更新时间</strong> 倒序排列，顶部可切换「⚡ 最近工作」「最近写入」或「层级顺序」，每条卡片均标明多久前写入或更新。</p>
         <p>2. 当前共有 <strong>{len(topics)} 条</strong> 主知识库记忆和 <strong>{active_user_cnt} 条</strong> 个人手记。点击任意条目右上角「编辑记忆」即可在线修改并自动刷新 <code>updated_at</code> 与 <code>MEMORY.md</code>。</p>
-        <p>3. 在 Claude Code、Codex 或 Antigravity 中直接询问“最近做了什么”或“最近工作”，MCP 服务也会按最新更新时间优先返回近期活跃工作。</p>
+        <p>3. 在已接入的客户端中直接询问“最近做了什么”或“最近工作”，MCP 服务也会按最新更新时间优先返回近期活跃工作。</p>
       </div>"""
 
 
@@ -1510,7 +1510,7 @@ def render_skills_overview(skills_matrix, key):
         <strong>统一 Skills 管理机制</strong>
         <p>1. 所有跨端共享技能统一存放在 <code>{escape(str(data_root() / "skills"))}</code>（共 <strong>{len(skills_matrix)} 个</strong>，当前已启用 <strong>{enabled_cnt} 个</strong>）。</p>
         <p>2. 点击上方「一键同步全部」或「同步」后，系统会自动将原分散在各客户端的独立目录安全备份到 <code>.state/skill-backups/</code>，并统一替换为指向本仓库的软链接。</p>
-        <p>3. 在任意技能详情页右上角点击「停用此技能」或「启用此技能」，三端挂载状态会实时自动增删同步；客户端专有的内部技能（如 Codex <code>.system</code>）保持原位不受影响。</p>
+        <p>3. 在任意技能详情页右上角点击「停用此技能」或「启用此技能」，已接入客户端的挂载状态会实时自动增删同步；客户端专有的内部技能（如 Codex <code>.system</code>）保持原位不受影响。</p>
       </div>"""
 
 
@@ -1532,11 +1532,12 @@ def render_skills_tab(
     import memoryctl
 
     library = libraries[key]
+    specs = memoryctl.agent_specs(home=agent_home)
     try:
         skills_matrix = memoryctl.inspect_skills_matrix(home=agent_home)
     except OSError:
         skills_matrix = [
-            {**s, "agents": {"claude": "absent", "codex": "absent", "antigravity": "absent"}}
+            {**s, "agents": dict.fromkeys(specs, "absent")}
             for s in memoryctl.discover_hub_skills()
         ]
 
@@ -1602,7 +1603,8 @@ def render_skills_tab(
             md_content = library.read_markdown(target_file, [(hub / name).resolve() for name in resources])
             heading = sk["name"] if not sub_doc else f"{sk['name']} · {Path(sub_doc).name}"
             ag_chips = []
-            for aid, alabel in (("claude", "Claude"), ("codex", "Codex"), ("antigravity", "Antigravity")):
+            for aid, spec in specs.items():
+                alabel = escape(spec["name"])
                 ast = sk["agents"].get(aid, "absent")
                 if ast == "linked":
                     ag_chips.append(f'<span class="meta-chip">✓ {alabel} 已挂载</span>')
@@ -1660,7 +1662,7 @@ def render_skills_tab(
             error = "找不到请求的技能 Markdown 文件。"
     else:
         heading = "Skills 统一技能中心"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">跨 Claude Code / Codex / Antigravity 共享</span></div>'
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">已接入的客户端共享</span></div>'
         if dis_cnt > 0:
             detail_toolbar = f"""
               <form method="post" action="/skill#feedback">

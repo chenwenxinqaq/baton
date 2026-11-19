@@ -455,6 +455,15 @@ def agent_specs(home=None):
             "mcp_key": "unified_memory",
             "skills_dir": home / ".codex" / "skills",
         },
+        "cursor": {
+            "name": "Cursor",
+            "mode": "files",
+            "detect_paths": [home / ".cursor", home / ".local" / "bin" / "cursor-agent"],
+            "mcp_type": "json",
+            "mcp_path": home / ".cursor" / "mcp.json",
+            "mcp_key": "unified_memory",
+            "skills_dir": home / ".cursor" / "skills",
+        },
         "antigravity": {
             "name": "Antigravity",
             "mode": "agy_plugin",
@@ -748,10 +757,11 @@ def inspect_agent(agent_id, spec):
 
     detected = any(p.exists() for p in spec["detect_paths"])
     restore = load_restore(agent_id)
-    inst_path = spec["instructions"]
     issues = []
-
-    if inst_path.is_symlink():
+    inst_path = spec.get("instructions")
+    if inst_path is None:
+        inst_state = None
+    elif inst_path.is_symlink():
         inst_state = "symlink"
         issues.append(f"instructions is a symlink ({inst_path})")
     elif inst_path.is_file():
@@ -812,7 +822,9 @@ def inspect_agent(agent_id, spec):
     skill_state, linked_cnt, total_cnt, skill_issues = inspect_skills_dir(spec["skills_dir"])
     issues.extend(skill_issues)
 
-    states = {inst_state, mcp_state, skill_state}
+    states = {mcp_state, skill_state}
+    if inst_state is not None:
+        states.add(inst_state)
     if states == {"managed"}:
         overall = "managed"
     elif states & {"modified", "conflict", "drifted", "symlink"}:
@@ -828,7 +840,7 @@ def inspect_agent(agent_id, spec):
         "detected": detected,
         "state": overall,
         "components": {
-            "instructions": {"path": str(inst_path), "state": inst_state},
+            **({"instructions": {"path": str(inst_path), "state": inst_state}} if inst_path else {}),
             "mcp": {"path": str(mcp_path), "state": mcp_state},
             "skill": {
                 "path": str(spec["skills_dir"]),
@@ -899,33 +911,33 @@ def connect_agent(agent_id, spec, dry_run=False):
             save_restore(agent_id, restore)
             return {"id": agent_id, "state": "managed", "changes": changes or ["already up to date"]}
 
-        inst_path = spec["instructions"]
+        inst_path = spec.get("instructions")
         mcp_path = spec["mcp_path"]
 
-        # 1. Instructions marker block
-        if inst_path.is_symlink():
-            raise RuntimeError(f"{inst_path} is a symlink; remove or convert it to a regular file first.")
-        existed_before = inst_path.is_file()
-        orig_text = inst_path.read_text(encoding="utf-8") if existed_before else ""
-        if "instructions_existed" not in restore:
-            restore["instructions_existed"] = existed_before
-            if existed_before:
-                restore["instructions_backup"] = orig_text
+        if inst_path is not None:
+            if inst_path.is_symlink():
+                raise RuntimeError(f"{inst_path} is a symlink; remove or convert it to a regular file first.")
+            existed_before = inst_path.is_file()
+            orig_text = inst_path.read_text(encoding="utf-8") if existed_before else ""
+            if "instructions_existed" not in restore:
+                restore["instructions_existed"] = existed_before
+                if existed_before:
+                    restore["instructions_backup"] = orig_text
 
-        working_text = orig_text
-        parsed = extract_block(working_text, MD_START, MD_END)
-        if parsed is None:
-            prefix = working_text.rstrip("\n")
-            new_text = f"{prefix}\n\n{MANAGED_MD_BODY}\n" if prefix else f"{MANAGED_MD_BODY}\n"
-            if new_text != orig_text:
-                atomic_write(inst_path, new_text)
-                changes.append(f"injected managed block into {inst_path}")
-        else:
-            rebuilt = parsed[0] + MANAGED_MD_BODY + parsed[2]
-            if rebuilt != orig_text:
-                atomic_write(inst_path, rebuilt)
-                changes.append(f"updated managed block in {inst_path}")
-        restore["instructions_block_hash"] = sha256_text(MANAGED_MD_BODY)
+            working_text = orig_text
+            parsed = extract_block(working_text, MD_START, MD_END)
+            if parsed is None:
+                prefix = working_text.rstrip("\n")
+                new_text = f"{prefix}\n\n{MANAGED_MD_BODY}\n" if prefix else f"{MANAGED_MD_BODY}\n"
+                if new_text != orig_text:
+                    atomic_write(inst_path, new_text)
+                    changes.append(f"injected managed block into {inst_path}")
+            else:
+                rebuilt = parsed[0] + MANAGED_MD_BODY + parsed[2]
+                if rebuilt != orig_text:
+                    atomic_write(inst_path, rebuilt)
+                    changes.append(f"updated managed block in {inst_path}")
+            restore["instructions_block_hash"] = sha256_text(MANAGED_MD_BODY)
 
         # 2. MCP config
         if spec["mcp_type"] == "json":
@@ -933,7 +945,7 @@ def connect_agent(agent_id, spec, dry_run=False):
             servers = data.setdefault("mcpServers", {})
             desired = desired_json_mcp(mcp_path)
             if "mcp_had_previous" not in restore:
-                if spec["mcp_key"] in servers:
+                if spec["mcp_key"] in servers and not (agent_id == "cursor" and servers[spec["mcp_key"]] == desired):
                     restore["mcp_had_previous"] = True
                     restore["previous_mcp"] = servers[spec["mcp_key"]]
                 else:
@@ -1006,10 +1018,10 @@ def disconnect_agent(agent_id, spec, force=False):
                 restore_file.unlink()
             return {"id": agent_id, "state": "unmanaged", "changes": changes or ["nothing to remove"]}
 
-        inst_path = spec["instructions"]
+        inst_path = spec.get("instructions")
         mcp_path = spec["mcp_path"]
 
-        if inst_path.is_file() and not inst_path.is_symlink():
+        if inst_path is not None and inst_path.is_file() and not inst_path.is_symlink():
             text = inst_path.read_text(encoding="utf-8")
             parsed = extract_block(text, MD_START, MD_END)
             if parsed is not None:
@@ -1271,7 +1283,7 @@ def main():
     p_sdis = skill_sub.add_parser("disable", help="Disable a skill (folder name) and unlink from connected agents.")
     p_sdis.add_argument("folder")
 
-    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, antigravity, or all).")
+    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, cursor, antigravity, or all).")
     p_conn.add_argument("target", nargs="?", default="all")
     p_conn.add_argument("--dry-run", action="store_true")
 

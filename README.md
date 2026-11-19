@@ -1,6 +1,6 @@
 # Unified Memory
 
-用一套 Markdown 记忆库为 Claude Code、Codex 和 Antigravity 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
+用一套 Markdown 记忆库为 Claude Code、Codex、Cursor 和 Antigravity 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
 
 ## 框架与数据
 
@@ -27,13 +27,13 @@ python3 manager/manager.py
 
 ## Agent 如何决定写什么
 
-公开版的写入规约位于 [空库模板的 §0](templates/library.md)。它规定何时保存、何时跳过、如何选择 L0–L4、怎样合并已有主题，以及何时撤回或归档旧结论。`init` 把规约和三份条目模板放进新库。`connect` 将同一份公开规约写入 Claude Code、Codex 和 Antigravity 各自的接入指令。接入时只读取公开模板，个人索引和正文留在私有库。
+公开版的写入规约位于 [空库模板的 §0](templates/library.md)。它规定何时保存、何时跳过、如何选择 L0–L4、怎样合并已有主题，以及何时撤回或归档旧结论。`init` 把规约和三份条目模板放进新库。`connect` 将同一份公开规约写入 Claude Code、Codex 和 Antigravity 各自的接入指令。Cursor 通过全局 MCP 配置和本地技能目录接入。接入时只读取公开模板，个人索引和正文留在私有库。
 
 从早期公开版升级时，在原数据目录配置下重跑 `init` 补齐缺少的模板，再对已接入的客户端重跑 `connect` 并重开会话。新规约随客户端指令生效，已有私有索引和自定义模板会保留。
 
 ## 接入客户端
 
-以下以 Codex 为例，也可选择 claude 或 antigravity。接入会更新该客户端的指令与 MCP 配置，命令指向源码目录中的服务程序，参数指向当前选定的数据目录。客户端重新启动后能继续找到该库。
+以下以 Codex 为例，也可选择 claude、cursor 或 antigravity。接入会更新该客户端的指令与 MCP 配置，命令指向源码目录中的服务程序，参数指向当前选定的数据目录。客户端重新启动后能继续找到该库。
 
 ```sh
 python3 scripts/memoryctl.py connect codex --dry-run

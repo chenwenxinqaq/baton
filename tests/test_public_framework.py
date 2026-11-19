@@ -70,7 +70,7 @@ class PublicFrameworkTests(unittest.TestCase):
         config.write_text('[sample]\nkeep = true\n', encoding="utf-8")
         self.cli("connect", "all")
         report = self.cli("doctor")
-        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 3)
+        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 4)
         self.assertIn(str(CODE / "mcp/server.py"), config.read_text())
         self.assertIn(str(self.library), config.read_text())
         self.assertTrue((self.home / ".codex/skills/sample").samefile(skill))
