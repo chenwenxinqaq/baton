@@ -436,9 +436,128 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertEqual(refs(self.library), before)
         self.assertEqual(refs(remote), b"")
         denied = subprocess.CompletedProcess([], 128, "", "fatal: could not read Username: terminal prompts disabled")
-        with patch.object(sync_git.subprocess, "run", return_value=denied):
+        with patch.object(sync_git, "_git_process", return_value=denied):
             with self.assertRaisesRegex(sync_git.GitSyncError, "本机 Git 未能通过远端身份验证"):
                 sync_git.test_remote_access(self.library)
+
+    def test_browser_onboarding_cancel_retry_sync_and_join(self):
+        import shutil
+        import time
+        from urllib.error import HTTPError
+
+        # Exercise the normal HTTP forms and real Git commits, clone, and push. Only the
+        # identity provider and network destination are substituted; no real accounts are used.
+        bundle = self.home / "Portable Git"
+        bindir = bundle / "bin"
+        core = bundle / "libexec/git-core"
+        bindir.mkdir(parents=True)
+        core.mkdir(parents=True)
+        git = shutil.which("git")
+        system_core = subprocess.check_output([git, "--exec-path"], text=True).strip()
+        bare = self.home / "team.git"
+        subprocess.run([git, "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        url = "https://github.com/example/team.git"
+        helper = core / "git-credential-manager"
+        helper.write_text("#!" + sys.executable + "\n" + r"""
+import os, subprocess, sys, time
+from pathlib import Path
+home = Path(os.environ["HOME"])
+fields = dict(line.split("=", 1) for line in sys.stdin.read().splitlines() if "=" in line)
+if fields.get("host") != "github.com":
+    sys.exit(1)
+if sys.argv[1] == "store":
+    (home / "session").touch()
+elif sys.argv[1] == "get":
+    if not (home / "session").exists():
+        def setting(key):
+            return subprocess.check_output([os.environ["REAL_GIT"], "config", "--get-urlmatch",
+                                            "credential." + key, "https://github.com"], text=True).strip()
+        assert setting("interactive") == "true" and setting("gitHubAuthModes") == "browser"
+        (home / "opened").touch()
+        for _ in range(300):
+            if (home / "answer").exists(): break
+            time.sleep(.05)
+        if (home / "answer").read_text() != "allow":
+            sys.stderr.write("access_denied\n")
+            print("quit=true")
+            sys.exit(0)
+    print("username=fixture\npassword=test-only")
+""")
+        wrapper = bindir / "git"
+        wrapper.write_text("#!" + sys.executable + "\n" + r"""
+import os, subprocess, sys
+git = os.environ["REAL_GIT"]
+os.environ["GIT_EXEC_PATH"] = os.environ["REAL_GIT_CORE"]
+os.environ.pop("GIT_TEMPLATE_DIR", None)
+args = sys.argv[1:]
+network = next((i for i, arg in enumerate(args) if arg in ("ls-remote", "fetch", "push", "clone")), None)
+if network is not None:
+    settings = args[:network]
+    fill = subprocess.run([git, *settings, "credential", "fill"], input=b"protocol=https\nhost=github.com\n\n",
+                          stdout=subprocess.PIPE)
+    if fill.returncode: sys.exit(fill.returncode)
+    subprocess.run([git, *settings, "credential", "approve"], input=fill.stdout, check=True)
+    args = ["-c", "url." + os.environ["TEST_BARE"] + ".insteadOf=" + os.environ["TEST_URL"], *args]
+os.execv(git, [git, *args])
+""")
+        helper.chmod(0o755)
+        wrapper.chmod(0o755)
+        env = {**self.environment(), "REAL_GIT": git, "REAL_GIT_CORE": system_core,
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
+               "UNIFIED_MEMORY_GIT_HOME": str(bundle), "TEST_BARE": str(bare), "TEST_URL": url}
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, text=True) as process:
+            try:
+                address = process.stdout.readline().strip().rstrip("/")
+                with urlopen(address + "/?view=sync_hub", timeout=10) as response:
+                    csrf = re.search(r'name="csrf" value="([^"]+)"', response.read().decode())[1]
+
+                def post(path, **fields):
+                    req = Request(address + path, data=urlencode({"csrf": csrf, **fields}).encode())
+                    with urlopen(req, timeout=10) as resp:
+                        return resp.geturl(), resp.read().decode()
+
+                def finish(location):
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        try:
+                            with urlopen(location, timeout=10) as response:
+                                page = response.read().decode()
+                                if "/sync_progress?" not in response.geturl():
+                                    return page
+                        except HTTPError as error:
+                            return error.read().decode()
+                        time.sleep(.05)
+                    self.fail("sync job did not finish")
+
+                setup = dict(remote_url=url, target_library="personal", branch="main", after_save="sync")
+                location, page = post("/sync_setup", **setup)
+                self.assertIn("正在同步", page)
+                self.assertEqual(post("/sync", library="primary")[0], location)
+                with self.assertRaises(HTTPError) as guard:
+                    post("/sync_setup", **setup)
+                self.assertEqual(guard.exception.code, 409)
+                answer = self.home / "answer"
+                answer.write_text("deny")
+                self.assertIn("授权已取消", finish(location))
+                self.assertTrue((self.home / "opened").exists())
+
+                answer.write_text("allow")
+                location, _ = post("/sync_test", library="primary")
+                self.assertIn("读取连接成功", finish(location))
+                self.assertEqual(subprocess.check_output([git, "-C", str(bare), "for-each-ref"]), b"")
+                self.assertFalse((self.library / ".git/refs/heads/main").exists())
+                answer.unlink()
+                location, _ = post("/sync", library="primary", return_view="sync_hub")
+                self.assertIn("同步完成", finish(location))
+                subprocess.run([git, "-C", str(bare), "cat-file", "-e", "main:MEMORY.md"], check=True)
+
+                location, _ = post("/mount_add", git_url=url, mode="ro", layer_L1="1", layer_L3="1")
+                self.assertIn("共享记忆库已挂载", finish(location))
+                self.assertTrue((self.home / "UnifiedMemory-Shared/team-team/MEMORY.md").is_file())
+                self.assertFalse((self.home / ".gitconfig").exists())
+            finally:
+                process.terminate()
 
     def test_git_sync_two_devices_index_autoheal_and_entry_conflict_preservation(self):
         bare_remote = self.home / "remote.git"

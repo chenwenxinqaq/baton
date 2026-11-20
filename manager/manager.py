@@ -2,6 +2,7 @@
 """Unified Memory & Skills Web Console: browse, create, and edit memories, manage skills, and control agents."""
 
 import argparse
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -1633,10 +1634,11 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
                 f'<a class="btn btn-warn btn-compact" href="{escape(query(library=nav_key, view="conflicts"))}#detail-title">处理冲突</a>'
             )
         if git.get("is_repo") and git.get("remote_url") and nav_key in libraries:
+            test_label = "连接 GitHub（仅验证）" if sync_git.github_browser_login(git["remote_url"]) else "测试读取连接"
             act_btns.append(
                 f'<form method="post" action="/sync_test#feedback">'
                 f'{hidden("csrf", token)}{hidden("library", nav_key)}'
-                '<button class="btn btn-ghost btn-compact" type="submit">测试读取连接</button></form>'
+                f'<button class="btn btn-ghost btn-compact" type="submit">{test_label}</button></form>'
             )
             s_lbl = "拉取更新" if is_ro else "立即同步"
             act_btns.append(
@@ -1735,14 +1737,14 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
       <section class="hub-section">
         <h2 class="hub-section-title">个人主库跨设备同步（GitHub / Gitee / 自建 Git）</h2>
-        <p class="hub-section-desc">将个人库绑定到私有 Git 仓库；在另一台电脑克隆同一仓库并指向 <code>UNIFIED_MEMORY_ROOT</code> 即可多机共享。</p>
+        <p class="hub-section-desc">粘贴你有写入权限的仓库地址。桌面版首次连接私有 GitHub HTTPS 仓库时会打开浏览器授权，完成后自动继续同步。同步会上传本地记忆和提交历史。</p>
         <form method="post" action="/sync_setup#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}{hidden("target_library", "personal")}
           <div class="form-row-two">
             <div class="field-group">
               <label class="field-label" for="p-remote-url">Git 仓库地址</label>
               <input id="p-remote-url" type="text" name="remote_url" value="{escape(personal_remote)}" required
-                     placeholder="git@github.com:you/my-memory.git 或 https://gitee.com/...">
+                     placeholder="https://github.com/账号/个人记忆库">
             </div>
             <div class="field-group">
               <label class="field-label" for="p-branch">分支</label>
@@ -1754,50 +1756,49 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
             <span>Agent 或网页每次修改后自动在本地 Git 提交快照</span>
           </label>
           <div class="form-actions">
-            <button class="btn btn-primary" type="submit">保存个人库 Git 绑定</button>
+            <button class="btn btn-primary" type="submit" name="after_save" value="sync">连接并同步</button>
+            <button class="btn btn-ghost" type="submit">仅保存地址</button>
           </div>
         </form>
       </section>
 
       <section class="hub-section">
         <h2 class="hub-section-title">挂载新的共享记忆库</h2>
-        <p class="hub-section-desc">支持挂载本地目录或直接克隆远端 Git 仓库（GitHub / Gitee / 自建 Gitea），按库选择只读订阅或团队共写。</p>
+        <p class="hub-section-desc">粘贴团队仓库链接并选择权限即可加入。首次使用私有 GitHub 仓库时，请用已接受邀请的账号完成浏览器授权。共享库使用独立目录，个人库保存在原处。</p>
         <form method="post" action="/mount_add#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}
+          <div class="field-group">
+            <label class="field-label" for="m-git">团队仓库 HTTPS 地址</label>
+            <input id="m-git" type="text" name="git_url" placeholder="https://github.com/团队/记忆库">
+          </div>
+          <div class="field-group">
+            <label class="field-label" for="m-mode">权限模式</label>
+            <select id="m-mode" name="mode">
+              <option value="ro">只读订阅</option><option value="rw">团队共写</option>
+            </select>
+          </div>
+          <details><summary>库名称、目录与分支</summary>
           <div class="form-row-two">
             <div class="field-group">
               <label class="field-label" for="m-id">库标识 ID（英文短名）</label>
-              <input id="m-id" type="text" name="mount_id" required pattern="[a-z0-9][a-z0-9_-]{{0,39}}"
-                     placeholder="例如 team-kb">
+              <input id="m-id" type="text" name="mount_id" pattern="[a-z0-9][a-z0-9_-]{{0,39}}" placeholder="默认从仓库地址生成">
             </div>
             <div class="field-group">
               <label class="field-label" for="m-label">显示名称</label>
-              <input id="m-label" type="text" name="label" required maxlength="60" placeholder="例如 研发共享库">
+              <input id="m-label" type="text" name="label" maxlength="60" placeholder="默认使用仓库名称">
             </div>
           </div>
           <div class="form-row-two">
             <div class="field-group">
-              <label class="field-label" for="m-path">本地保存目录</label>
-              <input id="m-path" type="text" name="path" required placeholder="~/UnifiedMemory-Team">
-            </div>
-            <div class="field-group">
-              <label class="field-label" for="m-mode">权限模式</label>
-              <select id="m-mode" name="mode">
-                <option value="ro">只读订阅（ro · 仅拉取检索，禁止修改）</option>
-                <option value="rw">团队共写（rw · 允许更新与推送）</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-row-two">
-            <div class="field-group">
-              <label class="field-label" for="m-git">Git 仓库地址（可选，填写则自动克隆）</label>
-              <input id="m-git" type="text" name="git_url" placeholder="git@gitee.com:team/memory-kb.git">
+              <label class="field-label" for="m-path">本地保存目录（挂载本地库时必填）</label>
+              <input id="m-path" type="text" name="path" placeholder="默认保存在 ~/UnifiedMemory-Shared 下">
             </div>
             <div class="field-group">
               <label class="field-label" for="m-branch">分支</label>
-              <input id="m-branch" type="text" name="branch" value="main" placeholder="main">
+              <input id="m-branch" type="text" name="branch" placeholder="使用远端默认分支">
             </div>
           </div>
+          </details>
           <div class="field-group">
             <label class="field-label">允许生效的记忆层级（推荐保持默认以保护个人红线与偏好）</label>
             {render_layer_checkboxes(["L1", "L3", "L4"])}
@@ -3073,6 +3074,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._refresh_mounts()
         url = urlsplit(self.path)
+        if url.path == "/sync_progress":
+            self.show_sync_progress(parse_qs(url.query).get("job", [""])[0])
+            return
         if url.path == "/style.css":
             self.respond(HTTPStatus.OK, load_style(), "text/css; charset=utf-8")
             return
@@ -3248,6 +3252,70 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.update_entry(fields)
 
+    def start_sync_action(self, key, read_only, tab, return_view):
+        library = self.server.libraries[key]
+        cfg = library.sync_config or {}
+        remote = cfg.get("remote") or "origin"
+        remote_url = sync_git.git_status(library.root, remote=remote).get("remote_url") or ""
+        interactive = sync_git.github_browser_login(remote_url)
+
+        def perform():
+            if read_only:
+                sync_git.test_remote_access(library.root, remote, browser_login=interactive)
+                return query(library=key, view="sync_hub", notice="remote_readable")
+            result = sync_git.sync(library.root, remote=remote, branch=cfg.get("branch") or "", mode=library.mode)
+            if result.get("status") == "needs_manual_merge":
+                return query(library=key, view="conflicts", notice="synced_conflicts")
+            return query(library=key, tab=tab, view=return_view, notice="synced")
+
+        self.run_sync_job(key, "验证连接" if read_only else "同步", interactive, perform)
+
+    def run_sync_job(self, key, action, interactive, perform):
+        if not interactive:
+            self.respond(HTTPStatus.SEE_OTHER, "", location=perform() + "#feedback")
+            return
+        jobs = self.server.sync_jobs
+        previous = jobs.get(key)
+        if previous and not previous[1].done():
+            if previous[2] != action:
+                raise InvalidEntry("这个库正在验证连接或同步，请待当前操作完成后重试。")
+            job_id = previous[0]
+        else:
+            job_id = secrets.token_hex(16)
+            outcome = Future()
+            jobs[key] = (job_id, outcome, action)
+
+            def run():
+                try:
+                    outcome.set_result(perform())
+                except Exception as exc:
+                    outcome.set_exception(exc)
+
+            threading.Thread(target=run, daemon=True, name="github-sync").start()
+        self.respond(HTTPStatus.SEE_OTHER, "", location="/sync_progress?job=" + job_id)
+
+    def show_sync_progress(self, job_id):
+        for key, (identifier, outcome, action) in self.server.sync_jobs.items():
+            if identifier != job_id:
+                continue
+            if not outcome.done():
+                content = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+                    <meta http-equiv="refresh" content="2"><link rel="stylesheet" href="/style.css">
+                    <title>正在{action} · Unified Memory</title><main class="sync-progress hub-section">
+                    <h1>正在{action}</h1><p>如果浏览器打开 GitHub，请登录有权访问此仓库的账号并确认授权。
+                    完成后会自动继续，此页会显示结果。</p><a href="/?view=sync_hub">返回共享与同步</a></main></html>"""
+                self.respond(HTTPStatus.OK, content)
+            else:
+                try:
+                    location = outcome.result()
+                except Exception as exc:
+                    self.page(HTTPStatus.CONFLICT, key=key if key in self.server.libraries else "primary",
+                              view="sync_hub", error=f"操作未完成：{exc}")
+                else:
+                    self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
+            return
+        self.respond(HTTPStatus.SEE_OTHER, "", location=query(view="sync_hub"))
+
     def handle_control_action(self, fields):
         import memoryctl
 
@@ -3257,6 +3325,12 @@ class Handler(BaseHTTPRequestHandler):
         return_tab = "skills" if fields.get("tab") == "skills" or self.path == "/skill" else ""
         agent_home = getattr(self.server, "agent_home", None)
         try:
+            if self.path in {"/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
+                target = fields.get("target_library") or fields.get("mount_id")
+                target = "primary" if target == "personal" else target
+                for job_key, (_, outcome, action) in self.server.sync_jobs.items():
+                    if not outcome.done() and (action == "挂载共享库" or job_key == target):
+                        raise InvalidEntry("正在连接或同步，请完成后再修改仓库配置。")
             if self.path == "/skill":
                 folder = fields.get("folder", "")
                 op = fields.get("op", "")
@@ -3280,27 +3354,8 @@ class Handler(BaseHTTPRequestHandler):
                 loc = query(library=key, tab=return_tab, view=return_view, notice="index_rebuilt")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
-            if self.path == "/sync_test":
-                lib_obj = self.server.libraries[key]
-                sync_git.test_remote_access(lib_obj.root, (lib_obj.sync_config or {}).get("remote") or "origin")
-                loc = query(library=key, view="sync_hub", notice="remote_readable")
-                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
-                return
-            if self.path == "/sync":
-                lib_obj = self.server.libraries[key]
-                sync_cfg = lib_obj.sync_config or {}
-                res = sync_git.sync(
-                    lib_obj.root,
-                    remote=sync_cfg.get("remote") or "origin",
-                    branch=sync_cfg.get("branch") or "",
-                    mode=lib_obj.mode,
-                )
-                return_view = fields.get("return_view", "")
-                if res.get("status") == "needs_manual_merge":
-                    loc = query(library=key, view="conflicts", notice="synced_conflicts")
-                else:
-                    loc = query(library=key, tab=return_tab, view=return_view, notice="synced")
-                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+            if self.path in {"/sync", "/sync_test"}:
+                self.start_sync_action(key, self.path == "/sync_test", return_tab, fields.get("return_view", ""))
                 return
             if self.path == "/sync_setup":
                 target_lib = fields.get("target_library", "personal").strip() or "personal"
@@ -3317,6 +3372,10 @@ class Handler(BaseHTTPRequestHandler):
                     home=agent_home,
                 )
                 self._refresh_mounts(force=True)
+                if fields.get("after_save") == "sync":
+                    sync_key = "primary" if target_lib == "personal" else target_lib
+                    self.start_sync_action(sync_key, False, return_tab, "sync_hub")
+                    return
                 loc = query(library=key, view="sync_hub", notice="sync_setup_saved")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
@@ -3326,25 +3385,29 @@ class Handler(BaseHTTPRequestHandler):
                 path_val = fields.get("path", "").strip()
                 mode_val = fields.get("mode", "ro").strip()
                 git_url = fields.get("git_url", "").strip()
-                branch = fields.get("branch", "main").strip()
+                branch = fields.get("branch", "").strip()
+                repo_name = git_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+                if not git_url and not (path_val and mount_id):
+                    raise InvalidEntry("请填写团队仓库地址。挂载本地库时，请在目录设置中填写库标识和路径。")
+                if not mount_id:
+                    slug = re.sub(r"[^a-z0-9_-]+", "-", repo_name.lower()).strip("-_")
+                    mount_id = "team-" + (slug or "repo")[:35]
+                if not path_val:
+                    default_dir = Path.home() / "UnifiedMemory-Shared" / memoryctl.validate_mount_id(mount_id)
+                    if default_dir.exists() and (not default_dir.is_dir() or any(default_dir.iterdir())):
+                        raise InvalidEntry("默认保存目录已被使用。请在目录设置中选择一个空目录。")
+                    path_val = str(default_dir)
                 auto_commit = fields.get("auto_commit") == "1"
                 selected_layers = [lyr for lyr in ALL_LAYERS if fields.get(f"layer_{lyr}") == "1"]
                 if not selected_layers:
                     raise InvalidEntry("请至少勾选一个允许生效的记忆层级。")
-                memoryctl.mount_add(
-                    mount_id,
-                    path_val,
-                    label=label or mount_id,
-                    mode=mode_val,
-                    layers=selected_layers,
-                    git_url=git_url,
-                    branch=branch,
-                    auto_commit=auto_commit,
-                    home=agent_home,
-                )
-                self._refresh_mounts(force=True)
-                loc = query(library=key, view="sync_hub", notice="mount_added")
-                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                def mount():
+                    memoryctl.mount_add(mount_id, path_val, label=label or repo_name or mount_id,
+                                        mode=mode_val, layers=selected_layers, git_url=git_url, branch=branch,
+                                        auto_commit=auto_commit, home=agent_home)
+                    return query(library=key, view="sync_hub", notice="mount_added")
+
+                self.run_sync_job(mount_id, "挂载共享库", sync_git.github_browser_login(git_url), mount)
                 return
             if self.path == "/mount_update":
                 mount_id = fields.get("mount_id", "").strip()
@@ -3800,6 +3863,7 @@ def main():
         parser.exit(2, f"{exc}\n")
     with server:
         server.libraries = libraries
+        server.sync_jobs = {}
         server.token = secrets.token_urlsafe(32)
         server.agent_home = None
         cfg_file = mounts_config_path()

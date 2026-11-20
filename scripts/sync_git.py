@@ -8,6 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
+import signal
+import sys
 import subprocess
 from tempfile import NamedTemporaryFile
 
@@ -260,26 +264,83 @@ class GitSyncError(RuntimeError):
     """Raised when a Git synchronization operation fails."""
 
 
+def _git_bundle():
+    """Find the desktop Git distribution, including when a source-backed manager is in use."""
+    explicit = os.environ.get("UNIFIED_MEMORY_GIT_HOME")
+    candidates = [Path(explicit)] if explicit else []
+    if (FRAMEWORK_ROOT.name == "framework" and FRAMEWORK_ROOT.parent.name == "Resources"
+            and FRAMEWORK_ROOT.parent.parent.parent.suffix == ".app"):
+        candidates.append(FRAMEWORK_ROOT.parent / "git")
+    if sys.platform == "darwin":
+        for apps in (Path.home() / "Applications", Path("/Applications")):
+            candidates.append(apps / "Unified Memory.app/Contents/Resources/git")
+    return next((p for p in candidates if os.access(p / "bin/git", os.X_OK)), None)
+
+
+def github_helper():
+    bundle = _git_bundle()
+    if bundle:
+        helper = bundle / "libexec/git-core/git-credential-manager"
+        if os.access(helper, os.X_OK):
+            return str(helper)
+    return shutil.which("git-credential-manager")
+
+
+def github_browser_login(remote_url):
+    return bool(re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?",
+                             remote_url, re.IGNORECASE) and github_helper())
+
+
+def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=None):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    bundle = _git_bundle()
+    if bundle:
+        env.update(PATH=str(bundle / "bin") + os.pathsep + env.get("PATH", os.defpath),
+                   GIT_EXEC_PATH=str(bundle / "libexec/git-core"),
+                   GIT_TEMPLATE_DIR=str(bundle / "share/git-core/templates"))
+    cmd = ["git", "-c", "core.quotepath=false"]
+    if args[0] in {"ls-remote", "fetch", "push", "clone"}:
+        helper = github_helper()
+        if helper:
+            cmd += ["-c", "credential.https://github.com.helper=!" + shlex.quote(helper),
+                    "-c", "credential.https://github.com.gitHubAuthModes=browser",
+                    "-c", "credential.https://github.com.interactive=" + ("true" if browser_login else "false")]
+    if env_extra:
+        env.update(env_extra)
+    # A timed-out Git can leave its credential helper listening for an OAuth callback.
+    with subprocess.Popen(cmd + list(args), cwd=str(root), env=env, text=True, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise GitSyncError("等待 GitHub 授权或网络连接超时，请返回同步页重试。") from exc
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
 def _git_failure(action, detail):
     lowered = detail.lower()
+    if "repository not found" in lowered or re.search(r"(?:http |error: )403\b", lowered) or "write access to repository not granted" in lowered:
+        return GitSyncError("仓库地址有误或当前账号权限不足。请在 GitHub 确认仓库归属、接受协作邀请，并核对读写权限。")
+    if any(word in lowered for word in ("user_cancel", "access_denied", "authentication was canceled", "user canceled", "user cancelled")):
+        return GitSyncError("GitHub 授权已取消，可以重新点击连接。")
     if ("terminal prompts disabled" in lowered or "authentication failed" in lowered
             or "permission denied (publickey" in lowered):
         return GitSyncError(
-            "本机 Git 未能通过远端身份验证。浏览器登录只适用于网页。"
-            "请为这个仓库配置 Git 凭据或 SSH 密钥，再到「共享与同步」点击「测试读取连接」。"
+            "本机 Git 未能通过远端身份验证。"
+            "使用 GitHub HTTPS 地址时，可在桌面版「共享与同步」点击「连接 GitHub」重新授权。其他地址请检查 Git 凭据。"
         )
+    if "refusing to merge unrelated histories" in lowered:
+        return GitSyncError("本地库与远端已有独立的提交历史。要加入已有团队仓库，请在「共享与同步」挂载共享库，个人记忆会保留在原目录。")
     return GitSyncError(f"{action} failed: {detail}")
 
 
-def _run_git(root, *args, check=True, env_extra=None, timeout=None):
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if env_extra:
-        env.update(env_extra)
-    cmd = ["git", "-c", "core.quotepath=false", *args]
-    try:
-        proc = subprocess.run(cmd, cwd=str(root), text=True, capture_output=True, env=env, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise GitSyncError("连接远端超时，请检查网络后重试。") from exc
+def _run_git(root, *args, check=True, env_extra=None, timeout=None, browser_login=False):
+    proc = _git_process(root, args, env_extra=env_extra, timeout=timeout, browser_login=browser_login)
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         raise _git_failure(f"git {args[0]}", detail)
@@ -368,16 +429,12 @@ def clone_repo(remote_url, dest_path, branch=""):
     if dest.exists() and any(dest.iterdir()):
         raise GitSyncError(f"Target directory already exists and is not empty: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    args = ["git", "-c", "core.quotepath=false", "clone"]
+    args = ["clone"]
     if branch:
         args.extend(["--branch", branch])
-    args.extend([remote_url, str(dest)])
-    proc = subprocess.run(
-        args,
-        text=True,
-        capture_output=True,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
+    args.extend(["--", remote_url, str(dest)])
+    interactive = github_browser_login(remote_url)
+    proc = _git_process(dest.parent, args, browser_login=interactive, timeout=300 if interactive else None)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         raise _git_failure("git clone", detail)
@@ -389,9 +446,9 @@ def clone_repo(remote_url, dest_path, branch=""):
     }
 
 
-def test_remote_access(root, remote="origin"):
+def test_remote_access(root, remote="origin", *, browser_login=False):
     """Read advertised refs without fetching, committing, or pushing, including for empty remotes."""
-    _run_git(root, "ls-remote", "--", remote, timeout=15)
+    _run_git(root, "ls-remote", "--", remote, browser_login=browser_login, timeout=180 if browser_login else 15)
 
 
 def _has_commits(root):
@@ -578,7 +635,7 @@ def pull(root, remote="origin", branch="", mode="rw"):
         ]
         if not unmerged:
             detail = (merge.stderr or merge.stdout or "merge failed").strip()
-            raise GitSyncError(f"git merge {remote_ref} failed: {detail}")
+            raise _git_failure(f"git merge {remote_ref}", detail)
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         saved_conflicts = []
@@ -632,7 +689,7 @@ def pull(root, remote="origin", branch="", mode="rw"):
         }
 
 
-def push(root, remote="origin", branch="", mode="rw"):
+def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
     """Commit pending changes and push to the configured remote branch."""
     if mode == "ro":
         raise GitSyncError("Cannot push a read-only mounted library.")
@@ -656,7 +713,9 @@ def push(root, remote="origin", branch="", mode="rw"):
         if not _has_commits(root):
             return {"pushed": False, "status": "no_commits", "branch": br, "remote": remote}
 
-        _run_git(root, "push", "-u", remote, f"HEAD:{br}")
+        interactive = browser_login and github_browser_login(remote_url)
+        _run_git(root, "push", "-u", remote, f"HEAD:{br}", browser_login=interactive,
+                 timeout=300 if interactive else None)
         return {
             "pushed": True,
             "status": "pushed",
@@ -666,9 +725,16 @@ def push(root, remote="origin", branch="", mode="rw"):
         }
 
 
-def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only=False):
+def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only=False, browser_login=True):
     """Run bidirectional (or one-way) Git synchronization for a library."""
     result = {"path": str(Path(root).expanduser().resolve()), "mode": mode, "pull": None, "push": None}
+    if browser_login:
+        remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
+        if github_browser_login(remote_url):
+            # Finish the interactive step before taking the library write lock or making a snapshot.
+            test_remote_access(root, remote, browser_login=True)
+            if _run_git(root, "remote", "get-url", remote).stdout.strip() != remote_url:
+                raise GitSyncError("授权期间仓库绑定已变更，请对新的仓库重新同步。")
     if not push_only:
         pull_res = pull(root, remote=remote, branch=branch, mode=mode)
         result["pull"] = pull_res
@@ -676,7 +742,7 @@ def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only
             result["status"] = "needs_manual_merge"
             return result
     if mode == "rw" and not pull_only:
-        push_res = push(root, remote=remote, branch=branch, mode=mode)
+        push_res = push(root, remote=remote, branch=branch, mode=mode, browser_login=browser_login)
         result["push"] = push_res
     result["status"] = "ok"
     return result

@@ -4,7 +4,7 @@
 
 ## 桌面版和命令行版
 
-macOS 桌面版使用 Electron。Apple 芯片发行包为 `Unified-Memory-macOS-arm64.zip`。先将解压出的 **Unified Memory.app** 移到用户的 Applications 目录，再打开。应用包含 Python，首次打开会初始化个人库。侧栏提供记忆检索、技能、读写动态、客户端接入和共享同步。在「客户端接入」里可以选择要配置的客户端。关闭窗口会结束该窗口启动的本地服务。
+macOS 桌面版使用 Electron。Apple 芯片发行包为 `Unified-Memory-macOS-arm64.zip`。先将解压出的 **Unified Memory.app** 移到用户的 Applications 目录，再打开。应用内置 Python、Git 和 Git Credential Manager，首次打开会初始化个人库。侧栏提供记忆检索、技能、读写动态、客户端接入和共享同步。在「客户端接入」里可以选择要配置的客户端。
 
 独立命令行包为 `unified-memory-cli.tar.gz`，适用于有 Python 3.9+ 和 Git 的 macOS / Linux。解压到固定目录后运行：
 
@@ -16,7 +16,7 @@ cd unified-memory-cli
 ./bin/umem doctor
 ```
 
-`umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body-file -` 从标准输入读取 Markdown。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。同步 Git 仓库需要本机 Git 以及相应仓库权限。
+`umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body-file -` 从标准输入读取 Markdown。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。独立使用 CLI 时，GitHub HTTPS 浏览器登录需要可在 PATH 中找到的 Git Credential Manager，或已安装到 Applications 的桌面版。已有 Git 凭据也可继续使用。
 
 桌面版会常驻 macOS 菜单栏：关闭窗口不会退出，菜单栏图标可打开读写动态、共享与同步，并提供「开机自动启动」开关（首次打开会询问一次）。
 
@@ -28,7 +28,7 @@ cd unified-memory-cli
 
 ### 本地构建
 
-在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本验证内置 Python 发行包的 SHA-256，首次构建需要联网。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。
+在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本校验 Python 和 [Dugite Native v2.56.1](https://github.com/desktop/dugite-native/tree/v2.56.1) 发行包的 SHA-256，首次构建需要联网。Dugite 提供 Git 和 [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager/tree/v2.9.1)，许可证位于应用的 `Contents/Resources/licenses`。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。
 
 在仓库根目录运行 `python3 scripts/package_release.py --cli` 单独生成 CLI 包。两个发行包都位于 `dist/`。分发内容来自公开文件清单。
 
@@ -78,9 +78,15 @@ python3 scripts/memoryctl.py connect codex
 
 支持将个人库绑定到私有 Git 仓库（GitHub / Gitee / 自建 Gitea 等）实现多设备同步，同时按库挂载只读（`ro`）或共写（`rw`）的团队共享库。共享库默认仅开放 `L1 / L3 / L4`，不会改写本机 `L0` 红线与 `L2` 个人偏好。
 
+**第一次用桌面版同步 GitHub**
+
+- 备份自己的记忆时，在「共享与同步 → 个人主库跨设备同步」粘贴自己有写权限的空仓库 HTTPS 地址，点「连接并同步」。已绑定的库点「立即同步」。首次需要凭据时，按系统浏览器的 GitHub 授权提示操作，回到应用看结果。后续同步可复用 macOS 钥匙串中的凭据。
+- 加入已有团队库时，先用自己的 GitHub 账号接受仓库邀请，再到「挂载新的共享记忆库」粘贴团队仓库 HTTPS 地址，选择只读或共写。应用将它克隆到独立目录，个人记忆仍在个人库中。向团队仓库推送需要 GitHub 写权限。
+- 想先确认能否访问，可以先「仅保存地址」，再点库卡片上的「连接 GitHub（仅验证）」。这一步只读取远端引用。
+
 ```sh
 # 1. 为个人主库绑定私有 Git 远端并同步
-python3 scripts/memoryctl.py sync setup personal --remote-url git@github.com:you/my-memory.git
+python3 scripts/memoryctl.py sync setup personal --remote-url https://github.com/you/my-memory.git
 python3 scripts/memoryctl.py sync run personal
 
 # 2. 挂载团队共享库（支持自动克隆，按需选 ro 或 rw）

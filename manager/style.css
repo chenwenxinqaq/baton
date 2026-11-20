@@ -1254,6 +1254,11 @@
     padding: 1rem 1.15rem;
   }
 
+  .sync-progress {
+    max-width: 36rem;
+    margin: 12vh auto;
+  }
+
   .hub-section-title {
     margin: 0 0 0.25rem;
     font-size: 1rem;
