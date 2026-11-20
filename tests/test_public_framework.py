@@ -73,7 +73,11 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("connect", "all")
         report = self.cli("doctor")
         self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 4)
-        self.assertIn(str(CODE / "mcp/server.py"), config.read_text())
+        launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
+        self.assertIn(str(launcher), config.read_text())  # clients never point at the source tree / app bundle
+        self.assertNotIn(str(CODE / "mcp/server.py"), config.read_text())
+        self.assertIn(f"FW={CODE}", launcher.read_text())
+        self.assertTrue(report["ok"], report["findings"])  # doctor probes MCP through the launcher
         self.assertIn(str(self.library), config.read_text())
         self.assertTrue((self.home / ".codex/skills/sample").samefile(skill))
         self.assertTrue((self.home / ".codex/skills/shared-guides").samefile(resource))
@@ -160,7 +164,7 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertEqual(data["hooks"]["stop"][0], mine)
         stop_ours = data["hooks"]["stop"][1]
         self.assertEqual(stop_ours["loop_limit"], 1)
-        self.assertIn("cursor_hook.py", stop_ours["command"])
+        self.assertIn("umem-hook", stop_ours["command"])
         cursor = next(a for a in self.cli("doctor")["agents"] if a["id"] == "cursor")
         self.assertEqual(cursor["components"]["hooks"]["state"], "managed")
         self.cli("connect", "cursor")  # idempotent
@@ -233,6 +237,69 @@ class PublicFrameworkTests(unittest.TestCase):
                     self.assertIn(expected, page)
             finally:
                 process.terminate()
+
+    def test_stable_launchers_survive_runtime_moves_and_migrate_legacy_configs(self):
+        (self.home / ".cursor").mkdir()
+        legacy_mcp = {"command": "/old/python3", "args": [str(CODE / "mcp/server.py"), "--memory-root", str(self.library)]}
+        (self.home / ".cursor/mcp.json").write_text(json.dumps({"mcpServers": {"unified_memory": legacy_mcp}}))
+        legacy_hook = {"command": f"/old/python3 {CODE}/scripts/cursor_hook.py stop --memory-root {self.library}"}
+        (self.home / ".cursor/hooks.json").write_text(json.dumps({"version": 1, "hooks": {"stop": [legacy_hook]}}))
+        cursor = lambda: next(a for a in self.cli("doctor")["agents"] if a["id"] == "cursor")
+        self.assertEqual(cursor()["state"], "drifted")  # legacy direct paths are flagged, not accepted
+        self.cli("connect", "cursor")
+        self.assertEqual(cursor()["state"], "managed")
+        launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
+        entry = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"]["unified_memory"]
+        self.assertEqual(entry["command"], str(launcher))
+        stop_hooks = json.loads((self.home / ".cursor/hooks.json").read_text())["hooks"]["stop"]
+        self.assertEqual(len(stop_hooks), 1)  # legacy entry replaced, not duplicated
+
+        def initialize(command):
+            result = subprocess.run([command, "--memory-root", str(self.library)], env=self.environment(), cwd=self.home,
+                                    input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+                                    capture_output=True, text=True)
+            return result
+
+        self.assertIn("unified-memory", initialize(str(launcher)).stdout)
+        # Simulate the app being moved/replaced: the recorded runtime path disappears.
+        broken = launcher.read_text().replace(str(CODE), str(self.home / "gone"))
+        launcher.write_text(broken)
+        result = initialize(str(launcher))
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("runtime not found", result.stderr)
+        # Any app/CLI run regenerates the launcher; configs never needed to change.
+        changed = self.cli("install-shims")["changed"]
+        self.assertIn(str(launcher), changed)
+        self.assertIn("unified-memory", initialize(str(launcher)).stdout)
+        self.assertEqual(self.cli("install-shims")["changed"], [])  # idempotent
+
+    def test_desktop_mode_pages_lifecycle_and_launchers(self):
+        self.tool("memory_upsert", dict(layer="L3", name="desk", title="桌面样本", description="桌面描述", body="正文"))
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--desktop", "--port", "0",
+                   "--memory-root", str(self.library)]
+        process = subprocess.Popen(command, env=self.environment(), cwd=self.home, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            address = process.stdout.readline().strip()
+            self.assertRegex(address, r"^http://127\.0\.0\.1:\d+/$")
+            for query, expected in (("", "桌面样本"), ("?view=activity", "AI 读写动态"), ("?view=clients", "跨 Agent 统一接入控制"),
+                                    ("?tab=skills", "技能"), ("?view=sync_hub", "同步")):
+                with self.subTest(query=query):
+                    with urlopen(address + query, timeout=5) as response:
+                        page = response.read().decode()
+                    self.assertIn('class="desk"', page)
+                    self.assertIn("读写动态", page)  # desktop navigation present on every page
+                    self.assertIn(expected, page)
+            self.assertTrue((self.home / "Library/Application Support/Unified Memory/bin/umem-mcp").is_file())
+            with urlopen(address + "style.css", timeout=5) as response:
+                self.assertIn(".rail", response.read().decode())  # desktop stylesheet appended
+            process.stdin.close()  # the window owns stdin: EOF must stop the backend
+            self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.stdout.close()
+            process.stderr.close()
 
     def test_multi_library_mounts_permissions_and_web_ro_guard(self):
         team_rw = self.home / "team-rw"

@@ -42,6 +42,72 @@ def resolve_python_cmd():
     return sys.executable
 
 
+SHIM_TARGETS = {
+    "umem-mcp": "mcp/server.py",
+    "umem-hook": "scripts/cursor_hook.py",
+    "umem": "scripts/memoryctl.py",
+}
+
+
+def stable_bin_dir(home=None):
+    """Stable launcher directory that client configs point at (survives app moves/updates)."""
+    home = Path(home) if home else Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Unified Memory" / "bin"
+    return home / ".local" / "share" / "unified-memory" / "bin"
+
+
+def shim_path(name, home=None):
+    return stable_bin_dir(home) / name
+
+
+def render_shim(rel_script):
+    """Return a POSIX launcher that runs `rel_script` with the current runtime.
+
+    If the recorded runtime vanished (app moved or replaced), fall back to the app bundles in the
+    usual install locations so configured clients keep working until the app regenerates the shim.
+    """
+    py, framework = shlex.quote(resolve_python_cmd()), shlex.quote(str(FRAMEWORK_ROOT))
+    return f"""#!/bin/sh
+# Managed by Unified Memory; regenerated whenever the app or memoryctl runs. Do not edit.
+PY={py}
+FW={framework}
+if [ ! -x "$PY" ] || [ ! -f "$FW/{rel_script}" ]; then
+  for APP in "$HOME/Applications/Unified Memory.app" "/Applications/Unified Memory.app"; do
+    R="$APP/Contents/Resources"
+    if [ -x "$R/umem-python" ] && [ -f "$R/framework/{rel_script}" ]; then
+      PY="$R/umem-python"; FW="$R/framework"; break
+    fi
+  done
+fi
+if [ ! -x "$PY" ] || [ ! -f "$FW/{rel_script}" ]; then
+  echo "Unified Memory runtime not found. Open the Unified Memory app once, or run: memoryctl connect all" >&2
+  exit 127
+fi
+exec "$PY" -B "$FW/{rel_script}" "$@"
+"""
+
+
+def ensure_stable_shims(home=None):
+    """Create or refresh the stable launchers. Returns the list of paths that changed."""
+    directory = stable_bin_dir(home)
+    directory.mkdir(parents=True, exist_ok=True)
+    changed = []
+    for name, rel in SHIM_TARGETS.items():
+        target = directory / name
+        content = render_shim(rel)
+        if target.is_file() and not target.is_symlink() and target.read_text(encoding="utf-8") == content \
+                and os.access(target, os.X_OK):
+            continue
+        with NamedTemporaryFile("w", dir=directory, delete=False, encoding="utf-8") as tmp:
+            tmp.write(content)
+            staged = Path(tmp.name)
+        staged.chmod(0o755)
+        os.replace(staged, target)
+        changed.append(str(target))
+    return changed
+
+
 MEMORY_ROOT = data_root()
 STATE_DIR = global_state_dir()
 LEGACY_STATE_DIR = MEMORY_ROOT / ".state"
@@ -50,7 +116,7 @@ SKILL_BACKUP_DIR = STATE_DIR / "skill-backups"
 LOCK_FILE = STATE_DIR / "integration.lock"
 MCP_SERVER = FRAMEWORK_ROOT / "mcp" / "server.py"
 CURSOR_HOOK_SCRIPT = FRAMEWORK_ROOT / "scripts" / "cursor_hook.py"
-CURSOR_HOOK_MARKER = "cursor_hook.py"
+CURSOR_HOOK_MARKERS = ("umem-hook", "cursor_hook.py")  # second marker migrates legacy entries
 CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "stop")
 SKILLS_DIR = MEMORY_ROOT / "skills"
 
@@ -72,7 +138,7 @@ if not index_start:
 MANAGED_MD_BODY = f"""{MD_START}
 ## 统一本地记忆
 
-当前用户的权威记忆库位于 `{MEMORY_ROOT}`。所有记忆读写都使用这个目录。客户端默认记忆目录不用于本库。MCP 不可用时，可运行 `UNIFIED_MEMORY_ROOT={shlex.quote(str(MEMORY_ROOT))} {shlex.quote(resolve_python_cmd())} {shlex.quote(str(FRAMEWORK_ROOT / "scripts" / "memoryctl.py"))} doctor` 检查接入状态，并按 `{MEMORY_ROOT}/MEMORY.md` 的 §0 手工维护正文与索引。
+当前用户的权威记忆库位于 `{MEMORY_ROOT}`。所有记忆读写都使用这个目录。客户端默认记忆目录不用于本库。MCP 不可用时，可运行 `UNIFIED_MEMORY_ROOT={shlex.quote(str(MEMORY_ROOT))} {shlex.quote(str(shim_path("umem")))} doctor` 检查接入状态，并按 `{MEMORY_ROOT}/MEMORY.md` 的 §0 手工维护正文与索引。
 
 {WRITING_POLICY.rstrip()}
 {MD_END}"""
@@ -521,8 +587,13 @@ def save_restore(agent_id, payload):
 
 
 def desired_mcp_args():
-    """Return (command, args) tuple for the MCP server."""
-    return resolve_python_cmd(), [str(MCP_SERVER), "--memory-root", str(MEMORY_ROOT)]
+    """Return (command, args) for the MCP server: always the stable launcher, never a bundle path."""
+    return str(shim_path("umem-mcp")), ["--memory-root", str(MEMORY_ROOT)]
+
+
+def is_our_mcp_entry(command, args):
+    """True for current launcher entries and legacy direct python+server.py entries."""
+    return command == str(shim_path("umem-mcp")) or str(MCP_SERVER) in " ".join(args or [])
 
 
 def desired_json_mcp(mcp_path):
@@ -785,7 +856,7 @@ def desired_cursor_hooks():
     for event in CURSOR_HOOK_EVENTS:
         command = " ".join(
             shlex.quote(part)
-            for part in [resolve_python_cmd(), str(CURSOR_HOOK_SCRIPT), event, "--memory-root", str(MEMORY_ROOT)]
+            for part in [str(shim_path("umem-hook")), event, "--memory-root", str(MEMORY_ROOT)]
         )
         entry = {"command": command, "timeout": 10}
         if event == "stop":
@@ -795,7 +866,8 @@ def desired_cursor_hooks():
 
 
 def _is_our_hook(entry):
-    return isinstance(entry, dict) and CURSOR_HOOK_MARKER in str(entry.get("command", ""))
+    command = str(entry.get("command", "")) if isinstance(entry, dict) else ""
+    return any(marker in command for marker in CURSOR_HOOK_MARKERS)
 
 
 def inspect_cursor_hooks(hooks_path):
@@ -1020,6 +1092,8 @@ def connect_agent(agent_id, spec, dry_run=False):
     changes = []
 
     with integration_lock():
+        for changed in ensure_stable_shims():
+            changes.append(f"wrote launcher {changed}")
         if spec.get("mode") == "agy_plugin":
             pdir = spec["plugin_dir"]
             expected = desired_agy_plugin_files()
@@ -1100,7 +1174,7 @@ def connect_agent(agent_id, spec, dry_run=False):
                 changes.append(f"added {TOML_SECTION_HEADER} to {mcp_path}")
             else:
                 cur_cmd, cur_args = parse_toml_mcp_section(sec[1])
-                if "toml_had_previous" not in restore and cur_cmd and str(MCP_SERVER) not in " ".join(cur_args or []):
+                if "toml_had_previous" not in restore and cur_cmd and not is_our_mcp_entry(cur_cmd, cur_args):
                     restore["toml_had_previous"] = True
                     restore["previous_toml_section"] = sec[1]
                 if cur_cmd != exp_cmd or cur_args != exp_args:
@@ -1678,8 +1752,14 @@ def run_doctor(fix=False, home=None):
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     ]
+    if fix:
+        ensure_stable_shims()
+    launcher = shim_path("umem-mcp")
+    if not launcher.is_file():
+        findings.append({"area": "launcher", "severity": "warn",
+                         "detail": f"stable launcher missing: {launcher} (run `memoryctl connect all` or `doctor --fix`)"})
     probe = subprocess.run(
-        [resolve_python_cmd(), str(MCP_SERVER), "--memory-root", str(MEMORY_ROOT)],
+        ([str(launcher)] if launcher.is_file() else [resolve_python_cmd(), str(MCP_SERVER)]) + ["--memory-root", str(MEMORY_ROOT)],
         input="\n".join(json.dumps(r) for r in probe_reqs) + "\n",
         text=True,
         capture_output=True,
@@ -1783,6 +1863,7 @@ def main():
     p_init.add_argument("--path", help="Optional target library path (defaults to UNIFIED_MEMORY_ROOT).")
     p_init.add_argument("--shared", action="store_true", help="Initialize as a shared library (no personal skills/user-managed).")
 
+    sub.add_parser("install-shims", help="Create or refresh the stable launchers client configs point at.")
     sub.add_parser("interface", help="Emit machine-readable paths and capabilities.")
 
     p_rb = sub.add_parser("rebuild-index", help="Deterministically rebuild MEMORY.md index from disk entries.")
@@ -1933,6 +2014,8 @@ def main():
                 auto_push=args.auto_push,
             )
             print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.command == "install-shims":
+        print(json.dumps({"directory": str(stable_bin_dir()), "changed": ensure_stable_shims()}, ensure_ascii=False, indent=2))
     elif args.command == "interface":
         hub = discover_hub_skills()
         print(
@@ -1957,6 +2040,7 @@ def main():
                         "memory_root": str(MEMORY_ROOT),
                         "index": str(MEMORY_ROOT / "MEMORY.md"),
                         "mcp_server": str(MCP_SERVER),
+                        "launcher": str(shim_path("umem-mcp")),
                         "skills_dir": str(SKILLS_DIR),
                         "state": str(STATE_DIR),
                     },

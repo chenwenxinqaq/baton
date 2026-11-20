@@ -3715,6 +3715,7 @@ def main():
         os.environ["UNIFIED_MEMORY_ROOT"] = str(data_root(args.memory_root))
         import memoryctl
         memoryctl.initialize_library()
+        memoryctl.ensure_stable_shims()  # keep client launchers pointing at this app's runtime
     try:
         primary = data_root(args.memory_root).resolve(strict=True)
         os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
