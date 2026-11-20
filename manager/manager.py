@@ -22,6 +22,7 @@ import stat
 from string import Template
 import sys
 import time
+import threading
 from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
@@ -87,7 +88,36 @@ MAX_BODY_CHARS = 120_000
 CUR_ATTR = ' aria-current="page"'
 
 
+DESKTOP = False
 PAGE_TEMPLATE = Template((APP / "page.html").read_text(encoding="utf-8"))
+
+
+def desktop_navigation(key, selected):
+    routes = [
+        ("工作区", "library", "▤", "记忆库", {}),
+        ("", "activity", "◷", "读写动态", {"view": "activity"}),
+        ("", "skills", "▦", "技能", {"tab": "skills"}),
+        ("管理", "clients", "⊞", "客户端接入", {"view": "clients"}),
+        ("", "sync", "⇄", "共享与同步", {"view": "sync_hub"}),
+    ]
+    links = []
+    section = "记忆库"
+    for group, slug, icon, label, params in routes:
+        if group:
+            links.append(f'<span class="nav-group">{group}</span>')
+        if slug == selected:
+            section = label
+        href = escape(query(library=key, **params))
+        links.append(f'<a href="{href}"{CUR_ATTR if slug == selected else ""}>'
+                     f'<span class="nav-icon" aria-hidden="true">{icon}</span>{label}</a>')
+    return dict(desktop_nav="".join(links), section_name=section,
+                library_key=escape(key), list_title_short="技能" if selected == "skills" else "记忆")
+
+
+def desktop_results(listing, layers, sources, sort_controls="", label="条目", count=0):
+    return f'''<section class="desk-results"><div class="desk-tools"><h2>{label} · {count}</h2>
+      {sort_controls}</div><details class="desk-filter"><summary>筛选条件</summary>
+      <nav>{"".join(layers)}</nav><nav>{sources}</nav></details>{listing}</section>'''
 
 
 def load_template():
@@ -95,7 +125,8 @@ def load_template():
 
 
 def load_style():
-    return (APP / "style.css").read_bytes()
+    base = (APP / "style.css").read_bytes()
+    return base + (APP / "desktop.css").read_bytes() if DESKTOP else base
 
 
 def load_script():
@@ -2338,7 +2369,7 @@ def render_skills_tab(
                 {hidden("folder", "all")}{hidden("op", "enable")}
                 <button class="btn btn-secondary btn-compact" type="submit">全部启用</button>
               </form>"""
-        reader = render_skills_overview(skills_matrix, key)
+        reader = "" if DESKTOP else render_skills_overview(skills_matrix, key)
 
     feedback = ""
     if error:
@@ -2363,7 +2394,13 @@ def render_skills_tab(
         else ""
     )
 
+    if DESKTOP and not skill_slug:
+        heading = "技能"
+        detail_badges = ""
+        reader = desktop_results(listing, cat_tabs, source_tabs, label="技能", count=len(rows))
+
     return load_template().substitute(
+        **(desktop_navigation(key, "skills") if DESKTOP else {}),
         library=escape(library.label),
         home_link=escape(query(library=key, tab="skills")),
         mode_tabs=mode_tabs,
@@ -2562,7 +2599,7 @@ def render(
         heading = f"{library.label}（只读共享库）"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">只读共享库</span></div>'
         error = error or f"当前库「{library.label}」为只读挂载，不支持在页面中新建或编辑。"
-        reader = render_overview(topics, entries, key)
+        reader = "" if DESKTOP else render_overview(topics, entries, key)
     elif view == "new":
         heading = "新建记忆"
         default_scope = draft_scope or ("user" if source == "user" else "index")
@@ -2831,7 +2868,7 @@ def render(
     else:
         heading = "记忆库概览"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'
-        reader = render_overview(topics, entries, key)
+        reader = "" if DESKTOP else render_overview(topics, entries, key)
 
     feedback = ""
     if error:
@@ -2869,7 +2906,27 @@ def render(
 
     agent_and_sync_html = render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
 
+    selected = "library"
+    if DESKTOP:
+        if view in {"sync_hub", "conflicts"}:
+            selected = "sync"
+        elif view in {"clients", "activity"}:
+            selected = view
+            heading = "客户端接入" if view == "clients" else "读写动态"
+            detail_badges = detail_submeta = detail_toolbar = ""
+            reader = (agent_and_sync_html.replace('<details class="ops-drawer">', '<details class="ops-drawer" open>')
+                      if view == "clients" else render_activity_panel(key))
+        elif not view and not topic_path and not entry.name:
+            heading = "搜索结果" if q else "记忆库"
+            detail_badges = detail_submeta = detail_toolbar = ""
+            stats = (("知识库条目", len(topics)), ("近七天活跃", len(recent_7d_rows)), ("个人手记", active_user_cnt))
+            metrics = "".join(f'<div class="desk-stat"><span>{label}</span><strong>{value}</strong></div>'
+                              for label, value in stats)
+            reader = ("" if q else f'<div class="desk-stats">{metrics}</div>') + desktop_results(
+                listing, layer_tabs, source_tabs, sort_controls_html, "记忆条目", len(rows))
+
     return load_template().substitute(
+        **(desktop_navigation(key, selected) if DESKTOP else {}),
         library=escape(library.label),
         home_link=escape(home_link),
         mode_tabs=mode_tabs,
@@ -2996,7 +3053,8 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in {"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts"}
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts"}
+                                | ({"clients", "activity"} if DESKTOP else set()))
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -3644,11 +3702,19 @@ def build_libraries_map(primary_root, also_root=None, home=None):
 
 
 def main():
+    global DESKTOP, PAGE_TEMPLATE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--memory-root", type=Path, default=data_root())
     parser.add_argument("--also-root", type=Path, help="同一页面可切换到的本机记忆库")
     parser.add_argument("--port", type=int, default=8765, help="端口，0 表示自动选择")
+    parser.add_argument("--desktop", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.desktop:
+        DESKTOP = True
+        PAGE_TEMPLATE = Template((APP / "desktop.html").read_text(encoding="utf-8"))
+        os.environ["UNIFIED_MEMORY_ROOT"] = str(data_root(args.memory_root))
+        import memoryctl
+        memoryctl.initialize_library()
     try:
         primary = data_root(args.memory_root).resolve(strict=True)
         os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
@@ -3680,6 +3746,12 @@ def main():
                 server.libraries = build_libraries_map(primary, also_root=args.also_root)
                 state_holder["mtime"] = cur_mtime
 
+        if DESKTOP:
+            # The native window owns the write end. EOF also covers a parent crash.
+            def watch_parent():
+                sys.stdin.buffer.read()
+                server.shutdown()
+            threading.Thread(target=watch_parent, daemon=True).start()
         server.reload_mounts = reload_mounts
         print(f"http://127.0.0.1:{server.server_port}/", flush=True)
         for library in libraries.values():

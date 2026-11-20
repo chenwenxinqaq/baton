@@ -33,6 +33,15 @@ from library_paths import (
 import sync_git
 
 
+def resolve_python_cmd():
+    executable = Path(sys.executable)
+    resources = executable.parent.parent.parent
+    wrapper = resources / "umem-python"
+    if resources.name == "Resources" and wrapper.is_file() and executable.parent.parent.name == "python":
+        return str(wrapper)
+    return sys.executable
+
+
 MEMORY_ROOT = data_root()
 STATE_DIR = global_state_dir()
 LEGACY_STATE_DIR = MEMORY_ROOT / ".state"
@@ -63,7 +72,7 @@ if not index_start:
 MANAGED_MD_BODY = f"""{MD_START}
 ## 统一本地记忆
 
-当前用户的权威记忆库位于 `{MEMORY_ROOT}`。所有记忆读写都使用这个目录。客户端默认记忆目录不用于本库。MCP 不可用时，可运行 `UNIFIED_MEMORY_ROOT={shlex.quote(str(MEMORY_ROOT))} {shlex.quote(sys.executable)} {shlex.quote(str(FRAMEWORK_ROOT / "scripts" / "memoryctl.py"))} doctor` 检查接入状态，并按 `{MEMORY_ROOT}/MEMORY.md` 的 §0 手工维护正文与索引。
+当前用户的权威记忆库位于 `{MEMORY_ROOT}`。所有记忆读写都使用这个目录。客户端默认记忆目录不用于本库。MCP 不可用时，可运行 `UNIFIED_MEMORY_ROOT={shlex.quote(str(MEMORY_ROOT))} {shlex.quote(resolve_python_cmd())} {shlex.quote(str(FRAMEWORK_ROOT / "scripts" / "memoryctl.py"))} doctor` 检查接入状态，并按 `{MEMORY_ROOT}/MEMORY.md` 的 §0 手工维护正文与索引。
 
 {WRITING_POLICY.rstrip()}
 {MD_END}"""
@@ -102,10 +111,6 @@ def initialize_library(target_root=None, shared=False):
             except FileExistsError:
                 pass
     return {"memory_root": str(root), "shared": shared}
-
-
-def resolve_python_cmd():
-    return sys.executable
 
 
 def sha256_text(text):
@@ -1754,6 +1759,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    for command, help_text in (("list", "List memory entries."), ("search", "Search memory entries."),
+                               ("read", "Read one memory by path or library:path."),
+                               ("write", "Create or update a Markdown memory entry.")):
+        item = sub.add_parser(command, help=help_text)
+        item.add_argument("--library", default=None, help="Library ID (defaults to personal for writes).")
+        if command in {"list", "search"}:
+            item.add_argument("--layer", choices=ALL_LAYERS, default="")
+            item.add_argument("--archived", action="store_true", help="Include archived entries.")
+        if command == "search":
+            item.add_argument("query")
+            item.add_argument("--limit", type=int, default=10)
+        if command == "read":
+            item.add_argument("path")
+        if command == "write":
+            item.add_argument("--layer", choices=ALL_LAYERS, required=True)
+            item.add_argument("--name", required=True)
+            item.add_argument("--title", required=True)
+            item.add_argument("--description", required=True)
+            item.add_argument("--body-file", required=True, help="UTF-8 Markdown file, or - for standard input.")
+
     p_init = sub.add_parser("init", help="Initialize an empty private or shared library.")
     p_init.add_argument("--path", help="Optional target library path (defaults to UNIFIED_MEMORY_ROOT).")
     p_init.add_argument("--shared", action="store_true", help="Initialize as a shared library (no personal skills/user-managed).")
@@ -1836,7 +1861,26 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "init":
+    if args.command in {"list", "search", "read", "write"}:
+        sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
+        from server import WorkspaceStore
+        try:
+            store = WorkspaceStore(MEMORY_ROOT)
+            if args.command == "list":
+                result = store.list_entries(library=args.library or "*", layer=args.layer, include_archived=args.archived)
+            elif args.command == "search":
+                result = store.search(args.query, library=args.library or "*", layer=args.layer,
+                                      include_archived=args.archived, limit=args.limit)
+            elif args.command == "read":
+                result = store.read_entry(args.path, library=args.library or "")
+            else:
+                body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
+                result = store.upsert_entry(args.layer, args.name, args.title, args.description, body,
+                                            library=args.library or "personal")
+        except (ValueError, OSError) as exc:
+            parser.exit(1, f"{exc}\n")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "init":
         print(json.dumps(initialize_library(target_root=args.path, shared=args.shared), ensure_ascii=False, indent=2))
     elif args.command == "rebuild-index":
         print(json.dumps(rebuild_library_index(args.target), ensure_ascii=False, indent=2))

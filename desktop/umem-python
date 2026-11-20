@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keep bytecode caches out of the signed application bundle.
+exec "$(dirname "$0")/python/bin/python3" -B "$@"

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>$heading · Unified Memory</title>
+  <link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script>
+</head>
+<body class="desk">
+  <aside class="rail">
+    <a href="/?library=$library_key" class="identity"><i aria-hidden="true">▤</i><b>Unified Memory</b></a>
+    <form role="search" class="rail-search" action="/" method="get">$search_hidden_fields
+      <input id="filter-q" name="q" type="search" value="$q" placeholder="搜索$list_title_short" aria-label="搜索$list_title_short">
+    </form>
+    <nav class="routes" aria-label="工作区">$desktop_nav</nav>
+    <div class="rail-bottom"><span class="online-dot"></span>$library $library_nav</div>
+  </aside>
+  <main class="paper">
+    <header class="desk-top"><span>工作空间 <b>/</b> $section_name</span><div>$topbar_cta</div></header>
+    <article class="sheet">$feedback $unreadable
+      <div class="sheet-head">$detail_badges<h1 id="detail-title" tabindex="-1">$heading</h1>$detail_submeta
+      <div class="sheet-actions">$detail_toolbar</div></div>
+      $reader $editor $confirm_dialog
+    </article>
+  </main>
+</body></html>

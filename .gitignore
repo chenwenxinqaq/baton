@@ -12,3 +12,6 @@ __pycache__/
 /user-managed/
 /skills/*
 !/skills/unified-memory/
+
+/desktop/node_modules/
+/dist/

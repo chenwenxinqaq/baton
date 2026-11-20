@@ -2,6 +2,30 @@
 
 用一套 Markdown 记忆库为 Claude Code、Codex、Cursor 和 Antigravity 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
 
+## 桌面版和命令行版
+
+macOS 桌面版使用 Electron。Apple 芯片发行包为 `Unified-Memory-macOS-arm64.zip`。先将解压出的 **Unified Memory.app** 移到用户的 Applications 目录，再打开。应用包含 Python，首次打开会初始化个人库。侧栏提供记忆检索、技能、读写动态、客户端接入和共享同步。在「客户端接入」里可以选择要配置的客户端。关闭窗口会结束该窗口启动的本地服务。
+
+独立命令行包为 `unified-memory-cli.tar.gz`，适用于有 Python 3.9+ 和 Git 的 macOS / Linux。解压到固定目录后运行：
+
+```sh
+cd unified-memory-cli
+./bin/umem init
+./bin/umem list
+./bin/umem search "部署"
+./bin/umem doctor
+```
+
+`umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body-file -` 从标准输入读取 Markdown。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。同步 Git 仓库需要本机 Git 以及相应仓库权限。
+
+两个入口默认读取 `~/UnifiedMemory`。桌面窗口单独分配回环端口，原有的 8765 网页可以继续使用。已有 CLI 源码安装的用户，可在 macOS 的 `~/Library/Application Support/Unified Memory/backend.json` 配置 `framework` 和 `python` 两个绝对路径，让应用沿用同一份已升级的源码和解释器；新安装默认使用包内运行时。
+
+### 本地构建
+
+在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本验证内置 Python 发行包的 SHA-256，首次构建需要联网。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。
+
+在仓库根目录运行 `python3 scripts/package_release.py --cli` 单独生成 CLI 包。两个发行包都位于 `dist/`。分发内容来自公开文件清单。
+
 ## 框架与数据
 
 本仓库保存程序、空模板、通用记忆技能和合成数据测试。使用者的索引、条目和运行状态保存在单独的数据目录。可将同一份代码与不同的数据目录配合使用。
