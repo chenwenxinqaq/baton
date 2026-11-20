@@ -72,7 +72,7 @@ class PublicFrameworkTests(unittest.TestCase):
         config.write_text('[sample]\nkeep = true\n', encoding="utf-8")
         self.cli("connect", "all")
         report = self.cli("doctor")
-        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 4)
+        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 5)
         launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
         self.assertIn(str(launcher), config.read_text())  # clients never point at the source tree / app bundle
         self.assertNotIn(str(CODE / "mcp/server.py"), config.read_text())
@@ -89,6 +89,75 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("disconnect", "all")
         self.assertEqual(config.read_text().strip(), '[sample]\nkeep = true')
         self.assertTrue((skill / "SKILL.md").is_file())
+
+    def test_workbuddy_one_click_connect_and_disconnect(self):
+        from urllib.error import HTTPError
+
+        config = self.home / ".workbuddy/mcp.json"
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=self.environment()) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+                with urlopen(base + "/?view=clients", timeout=5) as response:
+                    page = response.read().decode()
+                self.assertIn("<strong>WorkBuddy</strong>", page)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+
+                def click(op):
+                    data = urlencode(dict(csrf=csrf, target="workbuddy", op=op)).encode()
+                    with urlopen(Request(base + "/agent", data=data, headers={"Origin": base}), timeout=8) as response:
+                        self.assertIn("view=clients", response.geturl())
+                        return response.read().decode()
+
+                self.assertIn("WorkBuddy 配置已保存", click("connect"))
+                config_data = json.loads(config.read_text())
+                entry = config_data["mcpServers"]["unified_memory"]
+                self.assertEqual(entry["args"], ["--memory-root", str(self.library.resolve())])
+                requests = [
+                    {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "generic-mcp-client"},
+                                                                 "protocolVersion": "2025-06-18", "capabilities": {}}},
+                    {"method": "notifications/initialized"},
+                    {"id": 2, "method": "tools/list"},
+                    {"id": 3, "method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": "测试"}}},
+                ]
+                env = {**self.environment(), **entry["env"]}
+                result = subprocess.check_output([entry["command"], *entry["args"]], env=env, text=True,
+                    input="".join(json.dumps({"jsonrpc": "2.0", **req}) + "\n" for req in requests))
+                results = {r["id"]: r["result"] for r in map(json.loads, result.splitlines())}
+                self.assertIn("memory_search", {t["name"] for t in results[2]["tools"]})
+                self.assertFalse(results[3].get("isError", False))
+                events = next(self.home.rglob("audit.jsonl")).read_text().splitlines()
+                self.assertEqual(json.loads(events[-1])["client"], "WorkBuddy")
+                workbuddy = next(a for a in self.cli("agent", "list")["agents"] if a["id"] == "workbuddy")
+                self.assertEqual((workbuddy["state"], set(workbuddy["components"])), ("managed", {"mcp"}))
+                click("disconnect")
+                self.assertFalse(config.exists())
+
+                original = {"settings": {"keep": True}, "mcpServers": {
+                    "other": {"command": "other"}, "unified_memory": {"command": "previous"}}}
+                shared_config = self.home / "shared-config.json"
+                shared_config.write_text(json.dumps(original))
+                config.symlink_to(shared_config)
+                click("connect")
+                click("connect")
+                updated = json.loads(config.read_text())
+                self.assertEqual(updated["mcpServers"]["other"], original["mcpServers"]["other"])
+                self.assertEqual(updated["mcpServers"]["unified_memory"], entry)
+                updated["mcpServers"]["added_later"] = {"command": "third"}
+                config.write_text(json.dumps(updated))
+                click("disconnect")
+                original["mcpServers"]["added_later"] = {"command": "third"}
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(json.loads(shared_config.read_text()), original)
+
+                config.write_text("{invalid")
+                with self.assertRaises(HTTPError) as error:
+                    click("connect")
+                self.assertEqual(error.exception.code, 409)
+                self.assertEqual(config.read_text(), "{invalid")
+                self.assertIn("MCP 配置格式无效", error.exception.read().decode())
+            finally:
+                manager.terminate()
 
     def test_writing_policy_reaches_clients_without_private_index(self):
         index = self.library / "MEMORY.md"

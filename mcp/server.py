@@ -1188,7 +1188,8 @@ TOOLS = [
 ]
 
 
-CLIENT_NAME = "unknown"
+CONFIGURED_CLIENT = os.environ.get("UNIFIED_MEMORY_CLIENT")
+CLIENT_NAME = audit_log.normalize_client(CONFIGURED_CLIENT)
 AUDIT_HOME = None
 
 
@@ -1304,7 +1305,7 @@ def process_one_message(store, msg):
     try:
         if method == "initialize":
             global CLIENT_NAME
-            CLIENT_NAME = audit_log.normalize_client((params.get("clientInfo") or {}).get("name", ""))
+            CLIENT_NAME = audit_log.normalize_client(CONFIGURED_CLIENT or (params.get("clientInfo") or {}).get("name", ""))
             requested = params.get("protocolVersion", "")
             negotiated = requested if requested in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL
             result = {

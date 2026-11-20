@@ -1389,14 +1389,14 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                   </form>"""
 
             comp = info["components"]
-            sk_comp = comp["skill"]
+            sk_comp = comp.get("skill", {})
             sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
             chips = "".join(
                 [
                     format_comp_chip("指令规则", comp["instructions"]["state"]) if "instructions" in comp else "",
                     format_comp_chip("自动读写 Hooks", comp["hooks"]["state"]) if "hooks" in comp else "",
                     format_comp_chip("MCP 服务", comp["mcp"]["state"]),
-                    format_comp_chip("Skills", sk_comp["state"], sk_suffix),
+                    format_comp_chip("Skills", sk_comp["state"], sk_suffix) if sk_comp else "",
                 ]
             )
             issue_html = (
@@ -2290,7 +2290,7 @@ def render_skills_tab(
     import memoryctl
 
     library = libraries[key]
-    specs = memoryctl.agent_specs(home=agent_home)
+    specs = {aid: spec for aid, spec in memoryctl.agent_specs(home=agent_home).items() if "skills_dir" in spec}
     try:
         skills_matrix = memoryctl.inspect_skills_matrix(home=agent_home)
     except OSError:
@@ -2810,6 +2810,9 @@ def render(
             )
         )
         reader = summary_html + body_html
+    elif view == "clients":
+        heading = "客户端接入"
+        reader = render_agent_panel(token, key, agent_home=agent_home, library=library, flat=True)
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'
@@ -2963,7 +2966,7 @@ def render(
     )
     topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
 
-    agent_and_sync_html = "" if DESKTOP else render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
+    agent_and_sync_html = "" if DESKTOP or view == "clients" else render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
 
     selected = "library"
     if DESKTOP:
@@ -2971,10 +2974,10 @@ def render(
             selected = "sync"
         elif view in {"clients", "activity"}:
             selected = view
-            heading = "客户端接入" if view == "clients" else "读写动态"
             detail_badges = detail_submeta = detail_toolbar = ""
-            reader = (render_agent_panel(token, key, tab="", agent_home=agent_home, library=library, flat=True)
-                      if view == "clients" else render_activity_panel(key))
+            if view == "activity":
+                heading = "读写动态"
+                reader = render_activity_panel(key)
         elif not view and not topic_path and not entry.name:
             heading = "搜索结果" if q else "记忆库"
             detail_badges = detail_submeta = detail_toolbar = ""
@@ -3115,8 +3118,8 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts"}
-                                | ({"clients", "activity"} if DESKTOP else set()))
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients"}
+                                | ({"activity"} if DESKTOP else set()))
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -3133,7 +3136,8 @@ class Handler(BaseHTTPRequestHandler):
             "deleted": "记忆条目已移除（已在本机回收站保留安全备份）。",
             "archived": "手记已归档。",
             "restored": "手记已恢复生效。",
-            "connected": "客户端记忆与 Skills 已统一同步生效。",
+            "connected": "客户端配置已保存，可在读写动态查看实际调用。",
+            "workbuddy_connected": "WorkBuddy 配置已保存。如果当前会话还看不到记忆工具，请重新打开 WorkBuddy 会话。",
             "disconnected": "客户端接入已干净移除，原备份已还原。",
             "doctored": "自检完成，所有可自动修复项已同步对齐。",
             "skill_enabled": "技能已启用并同步到已连通客户端。",
@@ -3526,7 +3530,7 @@ class Handler(BaseHTTPRequestHandler):
                 if op == "connect":
                     for aid, spec in targets:
                         memoryctl.connect_agent(aid, spec)
-                    notice = "connected"
+                    notice = "workbuddy_connected" if target == "workbuddy" else "connected"
                 elif op == "disconnect":
                     for aid, spec in targets:
                         memoryctl.disconnect_agent(aid, spec)
@@ -3534,7 +3538,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise InvalidEntry("不支持的控制操作。")
         except (RuntimeError, ValueError, OSError, SystemExit) as exc:
-            err_view = ""
+            err_view = "clients" if self.path == "/agent" and not return_tab else ""
             err_topic = ""
             if self.path in {"/sync", "/sync_test", "/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
                 err_view = "sync_hub"
@@ -3551,7 +3555,8 @@ class Handler(BaseHTTPRequestHandler):
                 error=f"操作未完成：{exc}",
             )
             return
-        location = query(library=key, tab=return_tab, notice=notice)
+        view = "clients" if self.path == "/agent" and not return_tab else ""
+        location = query(library=key, tab=return_tab, view=view, notice=notice)
         self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
 
     def handle_save_index(self, fields):

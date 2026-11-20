@@ -551,6 +551,15 @@ def agent_specs(home=None):
             "skills_dir": home / ".cursor" / "skills",
             "hooks_path": home / ".cursor" / "hooks.json",
         },
+        "workbuddy": {
+            "name": "WorkBuddy",
+            "mode": "files",
+            "detect_paths": [home / ".workbuddy", home / "Applications/WorkBuddy.app", Path("/Applications/WorkBuddy.app")],
+            "mcp_type": "json",
+            "mcp_path": home / ".workbuddy" / "mcp.json",
+            "mcp_env": {"UNIFIED_MEMORY_CLIENT": "WorkBuddy"},
+            "mcp_key": "unified_memory",
+        },
         "antigravity": {
             "name": "Antigravity",
             "mode": "agy_plugin",
@@ -591,12 +600,26 @@ def is_our_mcp_entry(command, args):
     return command == str(shim_path("umem-mcp")) or str(MCP_SERVER) in " ".join(args or [])
 
 
-def desired_json_mcp(mcp_path):
+def read_json_mcp(path):
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"MCP 配置格式无效，请检查 {path}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise ValueError(f"MCP 配置及 mcpServers 必须是 JSON 对象，请检查 {path}")
+    return data
+
+
+def desired_json_mcp(spec):
     """Build expected mcpServers entry for JSON-configured agents."""
     py_cmd, args = desired_mcp_args()
     entry = {"command": py_cmd, "args": args}
-    if mcp_path.name == ".claude.json":
+    if spec["mcp_path"].name == ".claude.json":
         entry = {"type": "stdio", **entry, "env": {}}
+    elif "mcp_env" in spec:
+        entry["env"] = spec["mcp_env"]
     return entry
 
 
@@ -974,15 +997,19 @@ def inspect_agent(agent_id, spec):
     exp_cmd, exp_args = desired_mcp_args()
     if spec["mcp_type"] == "json":
         if mcp_path.is_file():
-            data = json.loads(mcp_path.read_text(encoding="utf-8"))
-            current = (data.get("mcpServers") or {}).get(spec["mcp_key"])
-            if current is None:
-                mcp_state = "unmanaged"
-            elif current == desired_json_mcp(mcp_path):
-                mcp_state = "managed"
+            try:
+                current = read_json_mcp(mcp_path).get("mcpServers", {}).get(spec["mcp_key"])
+            except (ValueError, OSError) as exc:
+                issues.append(str(exc))
+                mcp_state = "modified"
             else:
-                mcp_state = "drifted"
-                issues.append("MCP entry differs from current server path/args")
+                if current is None:
+                    mcp_state = "unmanaged"
+                elif current == desired_json_mcp(spec):
+                    mcp_state = "managed"
+                else:
+                    mcp_state = "drifted"
+                    issues.append("MCP entry differs from current server path/args")
         else:
             mcp_state = "missing"
     else:
@@ -1005,20 +1032,19 @@ def inspect_agent(agent_id, spec):
         else:
             mcp_state = "missing"
 
-    skill_state, linked_cnt, total_cnt, skill_issues = inspect_skills_dir(spec["skills_dir"])
-    issues.extend(skill_issues)
-
-    hooks_path = spec.get("hooks_path")
-    hooks_state = None
-    if hooks_path is not None:
-        hooks_state, hook_issues = inspect_cursor_hooks(hooks_path)
+    components = {"mcp": {"path": str(mcp_path), "state": mcp_state}}
+    if inst_path is not None:
+        components["instructions"] = {"path": str(inst_path), "state": inst_state}
+    if "skills_dir" in spec:
+        skill_state, linked, total, skill_issues = inspect_skills_dir(spec["skills_dir"])
+        issues.extend(skill_issues)
+        components["skill"] = {"path": str(spec["skills_dir"]), "state": skill_state, "linked": linked, "total": total}
+    if "hooks_path" in spec:
+        hooks_state, hook_issues = inspect_cursor_hooks(spec["hooks_path"])
         issues.extend(hook_issues)
+        components["hooks"] = {"path": str(spec["hooks_path"]), "state": hooks_state}
 
-    states = {mcp_state, skill_state}
-    if inst_state is not None:
-        states.add(inst_state)
-    if hooks_state is not None:
-        states.add(hooks_state)
+    states = {component["state"] for component in components.values()}
     if states == {"managed"}:
         overall = "managed"
     elif states & {"modified", "conflict", "drifted", "symlink"}:
@@ -1033,17 +1059,7 @@ def inspect_agent(agent_id, spec):
         "name": spec["name"],
         "detected": detected,
         "state": overall,
-        "components": {
-            **({"instructions": {"path": str(inst_path), "state": inst_state}} if inst_path else {}),
-            **({"hooks": {"path": str(hooks_path), "state": hooks_state}} if hooks_path else {}),
-            "mcp": {"path": str(mcp_path), "state": mcp_state},
-            "skill": {
-                "path": str(spec["skills_dir"]),
-                "state": skill_state,
-                "linked": linked_cnt,
-                "total": total_cnt,
-            },
-        },
+        "components": components,
         "issues": issues,
     }
 
@@ -1083,10 +1099,10 @@ def connect_agent(agent_id, spec, dry_run=False):
         info = inspect_agent(agent_id, spec)
         return {"id": agent_id, "dry_run": True, "current_state": info["state"], "issues": info["issues"]}
 
-    restore = load_restore(agent_id)
     changes = []
 
     with integration_lock():
+        restore = load_restore(agent_id)
         for changed in ensure_stable_shims():
             changes.append(f"wrote launcher {changed}")
         if spec.get("mode") == "agy_plugin":
@@ -1138,18 +1154,22 @@ def connect_agent(agent_id, spec, dry_run=False):
 
         # 2. MCP config
         if spec["mcp_type"] == "json":
-            data = json.loads(mcp_path.read_text(encoding="utf-8")) if mcp_path.is_file() else {}
+            data = read_json_mcp(mcp_path)
+            if agent_id == "workbuddy" and "mcp_had_previous" not in restore:
+                restore["mcp_file_existed"] = mcp_path.exists()
+                restore["mcp_servers_existed"] = "mcpServers" in data
             servers = data.setdefault("mcpServers", {})
-            desired = desired_json_mcp(mcp_path)
+            desired = desired_json_mcp(spec)
             if "mcp_had_previous" not in restore:
                 if spec["mcp_key"] in servers and not (agent_id == "cursor" and servers[spec["mcp_key"]] == desired):
                     restore["mcp_had_previous"] = True
                     restore["previous_mcp"] = servers[spec["mcp_key"]]
                 else:
                     restore["mcp_had_previous"] = False
+                save_restore(agent_id, restore)  # Preserve the pre-connect entry before replacing it.
             if servers.get(spec["mcp_key"]) != desired:
                 servers[spec["mcp_key"]] = desired
-                atomic_write(mcp_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                atomic_write(mcp_path.resolve(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
                 changes.append(f"updated mcpServers.{spec['mcp_key']} in {mcp_path}")
         else:
             toml_text = mcp_path.read_text(encoding="utf-8") if mcp_path.is_file() else ""
@@ -1185,8 +1205,8 @@ def connect_agent(agent_id, spec, dry_run=False):
         if spec.get("hooks_path") is not None:
             apply_cursor_hooks(spec["hooks_path"], restore, changes)
 
-        # 3. Sync all enabled hub skills
-        sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
+        if "skills_dir" in spec:
+            sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
 
         restore["connected_at"] = datetime.now().isoformat(timespec="seconds")
         save_restore(agent_id, restore)
@@ -1196,10 +1216,10 @@ def connect_agent(agent_id, spec, dry_run=False):
 
 def disconnect_agent(agent_id, spec, force=False):
     """Revert unified-memory managed blocks/keys/plugins and restore backed-up skills."""
-    restore = load_restore(agent_id)
     changes = []
 
     with integration_lock():
+        restore = load_restore(agent_id)
         if spec.get("mode") == "agy_plugin":
             pdir = spec["plugin_dir"]
             rule_path = pdir / "rules" / "unified-memory.md"
@@ -1240,16 +1260,25 @@ def disconnect_agent(agent_id, spec, force=False):
                     changes.append(f"removed managed block from {inst_path}")
 
         if spec["mcp_type"] == "json" and mcp_path.is_file():
-            data = json.loads(mcp_path.read_text(encoding="utf-8"))
+            data = read_json_mcp(mcp_path)
             servers = data.get("mcpServers") or {}
             if spec["mcp_key"] in servers:
+                if agent_id == "workbuddy" and servers[spec["mcp_key"]] != desired_json_mcp(spec) and not force:
+                    if not restore:
+                        return {"id": agent_id, "state": "unmanaged", "changes": ["nothing to remove"]}
+                    raise RuntimeError(f"WorkBuddy 的同名服务配置已更改，请先核对 {mcp_path}")
                 if restore.get("mcp_had_previous"):
                     servers[spec["mcp_key"]] = restore["previous_mcp"]
                     changes.append(f"restored previous mcpServers.{spec['mcp_key']} in {mcp_path}")
                 else:
                     del servers[spec["mcp_key"]]
                     changes.append(f"removed mcpServers.{spec['mcp_key']} from {mcp_path}")
-                atomic_write(mcp_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                if not servers and restore.get("mcp_servers_existed") is False:
+                    data.pop("mcpServers")
+                if not data and restore.get("mcp_file_existed") is False:
+                    mcp_path.resolve().unlink()
+                else:
+                    atomic_write(mcp_path.resolve(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         elif spec["mcp_type"] == "toml" and mcp_path.is_file():
             text = mcp_path.read_text(encoding="utf-8")
             orig_toml = text
@@ -1280,7 +1309,8 @@ def disconnect_agent(agent_id, spec, force=False):
         if spec.get("hooks_path") is not None:
             remove_cursor_hooks(spec["hooks_path"], restore, changes)
 
-        restore_skills_dir(agent_id, spec["skills_dir"], restore, changes)
+        if "skills_dir" in spec:
+            restore_skills_dir(agent_id, spec["skills_dir"], restore, changes)
 
         restore_file = RESTORE_DIR / f"{agent_id}.json"
         if restore_file.exists():
@@ -1313,6 +1343,8 @@ def set_skill_enabled(target_folder, enabled, home=None):
     synced_agents = []
     specs = agent_specs(home=home)
     for aid, spec in specs.items():
+        if "skills_dir" not in spec:
+            continue
         st = inspect_agent(aid, spec)["state"]
         if st != "unmanaged":
             connect_agent(aid, spec)
@@ -1330,6 +1362,8 @@ def inspect_skills_matrix(home=None):
         src = SKILLS_DIR / slug
         per_agent = {}
         for aid, spec in specs.items():
+            if "skills_dir" not in spec:
+                continue
             dest = spec["skills_dir"] / slug
             if is_linked_to_hub(dest, src):
                 per_agent[aid] = "linked"
@@ -1926,7 +1960,7 @@ def main():
     p_sdis = skill_sub.add_parser("disable", help="Disable a skill (folder name) and unlink from connected agents.")
     p_sdis.add_argument("folder")
 
-    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, cursor, antigravity, or all).")
+    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, cursor, workbuddy, antigravity, or all).")
     p_conn.add_argument("target", nargs="?", default="all")
     p_conn.add_argument("--dry-run", action="store_true")
 

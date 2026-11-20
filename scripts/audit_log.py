@@ -32,6 +32,8 @@ def normalize_client(name):
     low = raw.lower()
     if not low:
         return "unknown"
+    if "workbuddy" in low:
+        return "WorkBuddy"
     if "cursor" in low:
         return "Cursor"
     if "codex" in low:

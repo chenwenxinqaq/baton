@@ -1,6 +1,6 @@
 # Unified Memory
 
-用一套 Markdown 记忆库为 Claude Code、Codex、Cursor 和 Antigravity 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
+用一套 Markdown 记忆库为 Claude Code、Codex、Cursor、WorkBuddy 和 Antigravity 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
 
 ## 桌面版和命令行版
 
@@ -22,7 +22,7 @@ cd unified-memory-cli
 
 ### 稳定入口
 
-客户端（Cursor、Codex、Claude Code、Antigravity）的 MCP 与 Hook 配置不会直接指向源码目录或 `.app` 包内部，而是指向固定启动器 `~/Library/Application Support/Unified Memory/bin/`（Linux 为 `~/.local/share/unified-memory/bin/`）下的 `umem-mcp`、`umem-hook`、`umem`。启动器由 `memoryctl connect`、桌面版每次启动或 `memoryctl install-shims` 自动刷新；应用被移动或升级后，若记录的运行时已消失，启动器会回退到 `~/Applications`、`/Applications` 里的应用包，仍找不到则明确报错而不是静默失效。旧版直接写入 python 与 `server.py` 路径的配置会被识别为「待同步」，点「同步」即可迁移。
+客户端（Cursor、Codex、Claude Code、WorkBuddy、Antigravity）的 MCP 与 Hook 配置不会直接指向源码目录或 `.app` 包内部，而是指向固定启动器 `~/Library/Application Support/Unified Memory/bin/`（Linux 为 `~/.local/share/unified-memory/bin/`）下的 `umem-mcp`、`umem-hook`、`umem`。启动器由 `memoryctl connect`、桌面版每次启动或 `memoryctl install-shims` 自动刷新；应用被移动或升级后，若记录的运行时已消失，启动器会回退到 `~/Applications`、`/Applications` 里的应用包，仍找不到则明确报错而不是静默失效。旧版直接写入 python 与 `server.py` 路径的配置会被识别为「待同步」，点「同步」即可迁移。
 
 两个入口默认读取 `~/UnifiedMemory`。桌面窗口单独分配回环端口，原有的 8765 网页可以继续使用。已有 CLI 源码安装的用户，可在 macOS 的 `~/Library/Application Support/Unified Memory/backend.json` 配置 `framework` 和 `python` 两个绝对路径，让应用沿用同一份已升级的源码和解释器；新安装默认使用包内运行时。
 
@@ -63,7 +63,9 @@ python3 manager/manager.py
 
 ## 接入客户端
 
-以下以 Codex 为例，也可选择 claude、cursor 或 antigravity。接入会更新该客户端的指令与 MCP 配置，命令指向源码目录中的服务程序，参数指向当前选定的数据目录。客户端重新启动后能继续找到该库。
+使用腾讯 WorkBuddy 桌面版时，打开 Unified Memory 的「客户端接入」，在 WorkBuddy 一行点「接入」。应用将 `unified_memory` 合并到用户级 `~/.workbuddy/mcp.json`，其他项目也能使用。命令行等价操作为 `umem connect workbuddy`。在 WorkBuddy 会话中输入「用 unified_memory 搜索我的记忆」，即可在「读写动态」核对实际调用。可从同一行断开。[WorkBuddy 官方 MCP 配置说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)
+
+以下以 Codex 为例，也可选择 claude、cursor、workbuddy 或 antigravity。接入会更新该客户端的指令与 MCP 配置，命令指向本机的稳定启动器，参数指向当前选定的数据目录。客户端重新启动后能继续找到该库。
 
 ```sh
 python3 scripts/memoryctl.py connect codex --dry-run
