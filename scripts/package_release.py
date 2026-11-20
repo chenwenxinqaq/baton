@@ -12,6 +12,9 @@ from library_paths import FRAMEWORK_ROOT
 PUBLIC_FILES = (
     ".gitignore",
     "bin/umem",
+    "desktop/licenses/dugite-LICENSE.md",
+    "desktop/licenses/git-COPYING",
+    "desktop/licenses/gcm-LICENSE",
     "desktop/icon.svg",
     "desktop/tray.svg",
     "desktop/main.cjs",

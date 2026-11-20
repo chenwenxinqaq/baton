@@ -42,7 +42,9 @@ function backendSettings() {
 function startBackend() {
   const { framework, python } = backendSettings();
   const child = spawn(python, [path.join(framework, 'manager', 'manager.py'), '--desktop', '--port', '0'], {
-    cwd: framework, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONUNBUFFERED: '1' },
+    cwd: framework, env: { ...process.env,
+      ...(app.isPackaged ? { UNIFIED_MEMORY_GIT_HOME: path.join(process.resourcesPath, 'git') } : {}),
+      PYTHONDONTWRITEBYTECODE: '1', PYTHONUNBUFFERED: '1' },
     stdio: ['pipe', 'pipe', 'pipe']
   });
   backend = child;

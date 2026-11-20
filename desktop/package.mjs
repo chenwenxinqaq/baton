@@ -1,5 +1,5 @@
 import { packager } from '@electron/packager';
-import { unpackPython } from './runtime.mjs';
+import { unpackPython, unpackGitTools } from './runtime.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -54,8 +54,9 @@ try {
   // Packager resolves extraResource symlinks into build-time absolute paths.
   // Preserve the runtime's relative links so Python still starts after moving the app.
   await fs.cp(runtime,path.join(appPath,'Contents','Resources','python'),{recursive:true,verbatimSymlinks:true});
+  unpackGitTools(path.join(appPath, 'Contents', 'Resources'));
   const notices = path.join(appPath,'Contents','Resources','licenses');
-  await fs.mkdir(notices,{recursive:true});
+  await fs.cp(path.join(here, 'licenses'), notices, {recursive:true});
   for (const name of ['LICENSE','LICENSES.chromium.html']) await fs.copyFile(path.join(build,name),path.join(notices,name));
   execFileSync('codesign',['--force','--deep','--sign','-',appPath]);
   execFileSync('codesign',['--verify','--deep','--strict',appPath]);
