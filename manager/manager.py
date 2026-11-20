@@ -3299,11 +3299,16 @@ class Handler(BaseHTTPRequestHandler):
             if identifier != job_id:
                 continue
             if not outcome.done():
+                # A POST redirect inherits the form's #feedback. Poll a fragment-free URL
+                # so Chromium requests the job result instead of scrolling the same page.
+                progress_url = "/sync_progress?" + urlencode({"job": identifier})
                 content = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-                    <meta http-equiv="refresh" content="2"><link rel="stylesheet" href="/style.css">
+                    <meta http-equiv="refresh" content="2;url={progress_url}"><link rel="stylesheet" href="/style.css">
                     <title>正在{action} · Unified Memory</title><main class="sync-progress hub-section">
-                    <h1>正在{action}</h1><p>如果浏览器打开 GitHub，请登录有权访问此仓库的账号并确认授权。
-                    完成后会自动继续，此页会显示结果。</p><a href="/?view=sync_hub">返回共享与同步</a></main></html>"""
+                    <h1>正在{action}</h1><p>如果 GitHub 提示授权，请在浏览器中完成。看到授权成功后即可关闭该标签页，
+                    应用会继续检查仓库并自动显示结果。</p><div class="form-actions">
+                    <a class="btn btn-secondary" href="{progress_url}">查看最新状态</a>
+                    <a class="btn btn-ghost" href="/?view=sync_hub">返回共享与同步</a></div></main></html>"""
                 self.respond(HTTPStatus.OK, content)
             else:
                 try:

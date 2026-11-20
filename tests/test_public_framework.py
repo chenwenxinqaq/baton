@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from urllib.parse import urlencode
+from urllib.parse import urldefrag, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -517,6 +517,13 @@ os.execv(git, [git, *args])
                     with urlopen(req, timeout=10) as resp:
                         return resp.geturl(), resp.read().decode()
 
+                def refresh_target(page, current_url):
+                    target = re.search(r'<meta http-equiv="refresh" content="\d+;url=([^"]+)">', page)
+                    self.assertIsNotNone(target, "progress must request its job URL even after a #feedback redirect")
+                    next_url = urljoin(current_url, target[1])
+                    self.assertEqual(next_url, urldefrag(current_url).url)
+                    return next_url
+
                 def finish(location):
                     deadline = time.monotonic() + 15
                     while time.monotonic() < deadline:
@@ -525,6 +532,7 @@ os.execv(git, [git, *args])
                                 page = response.read().decode()
                                 if "/sync_progress?" not in response.geturl():
                                     return page
+                                location = refresh_target(page, response.geturl())
                         except HTTPError as error:
                             return error.read().decode()
                         time.sleep(.05)
@@ -533,6 +541,7 @@ os.execv(git, [git, *args])
                 setup = dict(remote_url=url, target_library="personal", branch="main", after_save="sync")
                 location, page = post("/sync_setup", **setup)
                 self.assertIn("正在同步", page)
+                self.assertEqual(refresh_target(page, location + "#feedback"), location)
                 self.assertEqual(post("/sync", library="primary")[0], location)
                 with self.assertRaises(HTTPError) as guard:
                     post("/sync_setup", **setup)
