@@ -120,6 +120,39 @@ def desktop_results(listing, layers, sources, sort_controls="", label="条目", 
       <nav>{"".join(layers)}</nav><nav>{sources}</nav></details>{listing}</section>'''
 
 
+def desktop_status_strip(key, library):
+    """One-line health summary for the desktop home: AI activity, clients without calls, sync state."""
+    try:
+        summary = audit_log.summarize()
+    except Exception:
+        return ""
+    chips = [
+        f'<span class="meta-chip">今日 AI 查询 {summary["reads_today"]} · 写入 {summary["writes_today"]}</span>',
+    ]
+    try:
+        import memoryctl
+
+        seen = {c["client"] for c in summary["clients"]}
+        silent = []
+        for aid, spec in memoryctl.agent_specs().items():
+            info = memoryctl.inspect_agent(aid, spec)
+            if info["state"] in {"managed", "partial", "drifted"} and info["name"] not in seen:
+                silent.append(info["name"])
+        if silent:
+            chips.append(f'<span class="chip-warn">! {escape("、".join(silent))} 已配置但近 7 天无调用</span>')
+    except Exception:
+        pass
+    try:
+        sync_meta = render_library_sync_bar(library, key, "", tab="")
+        chips.append(sync_meta["chips"])
+        if sync_meta["conflicts"]:
+            chips.append(f'<span class="chip-warn">! {len(sync_meta["conflicts"])} 个同步冲突待处理</span>')
+    except Exception:
+        pass
+    href = escape(query(library=key, view="activity"))
+    return f'<div class="desk-status check-chips">{"".join(chips)}<a href="{href}">查看读写动态 →</a></div>'
+
+
 def load_template():
     return PAGE_TEMPLATE
 
@@ -1293,7 +1326,7 @@ def format_comp_chip(label, state, suffix=""):
     return f'<span class="chip-off">○ {escape(label)}未配</span>'
 
 
-def render_agent_panel(token, key, tab="", agent_home=None, library=None):
+def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=False):
     """Render compact collapsible ops bar (sync + agent summary) with expandable client cards."""
     sync_meta = render_library_sync_bar(library, key, token, tab=tab) if library is not None else None
     try:
@@ -1414,6 +1447,31 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None):
                 f'<a href="{escape(c_href)}">进入可视化对比合并 →</a></p>'
             )
 
+        body_html = f"""
+              <div class="agents-ribbon-top">
+                <div class="agents-title-row">
+                  <h2>跨 Agent 统一接入控制</h2>
+                  <span class="agents-subtitle">· 状态反映本机配置与技能软链接；是否真在调用，看「读写动态」</span>
+                </div>
+                <div class="agents-global-actions">
+                  {connect_all_btn}
+                  {rebuild_btn}
+                  <form method="post" action="/doctor#feedback">
+                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                    <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
+                  </form>
+                </div>
+              </div>
+              <div class="agents-cards">{"".join(cards)}</div>"""
+        if flat:
+            # Desktop "client access" page: the page itself is the panel, so no collapsible wrapper.
+            return f"""
+        <div class="ops-flat">
+          <div class="check-chips">{sync_chips}{agent_chip}</div>
+          {conflict_banner}
+          {stray_alert}
+          {body_html}
+        </div>"""
         return f"""
         <div class="ops-strip">
           <div class="ops-strip-top">
@@ -1431,22 +1489,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None):
               <span>客户端接入与运维面板（{managed_count}/{len(specs)} 客户端已配置）</span>
               <span class="ops-drawer-hint">展开管理 ▾</span>
             </summary>
-            <div class="ops-drawer-body">
-              <div class="agents-ribbon-top">
-                <div class="agents-title-row">
-                  <h2>跨 Agent 统一接入控制</h2>
-                  <span class="agents-subtitle">· 状态反映本机配置与技能软链接，实际连接以各客户端进程为准</span>
-                </div>
-                <div class="agents-global-actions">
-                  {connect_all_btn}
-                  {rebuild_btn}
-                  <form method="post" action="/doctor#feedback">
-                    {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
-                    <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
-                  </form>
-                </div>
-              </div>
-              <div class="agents-cards">{"".join(cards)}</div>
+            <div class="ops-drawer-body">{body_html}
             </div>
           </details>
         </div>"""
@@ -2904,7 +2947,7 @@ def render(
     )
     topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
 
-    agent_and_sync_html = render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
+    agent_and_sync_html = "" if DESKTOP else render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
 
     selected = "library"
     if DESKTOP:
@@ -2914,7 +2957,7 @@ def render(
             selected = view
             heading = "客户端接入" if view == "clients" else "读写动态"
             detail_badges = detail_submeta = detail_toolbar = ""
-            reader = (agent_and_sync_html.replace('<details class="ops-drawer">', '<details class="ops-drawer" open>')
+            reader = (render_agent_panel(token, key, tab="", agent_home=agent_home, library=library, flat=True)
                       if view == "clients" else render_activity_panel(key))
         elif not view and not topic_path and not entry.name:
             heading = "搜索结果" if q else "记忆库"
@@ -2922,7 +2965,7 @@ def render(
             stats = (("知识库条目", len(topics)), ("近七天活跃", len(recent_7d_rows)), ("个人手记", active_user_cnt))
             metrics = "".join(f'<div class="desk-stat"><span>{label}</span><strong>{value}</strong></div>'
                               for label, value in stats)
-            reader = ("" if q else f'<div class="desk-stats">{metrics}</div>') + desktop_results(
+            reader = ("" if q else desktop_status_strip(key, library) + f'<div class="desk-stats">{metrics}</div>') + desktop_results(
                 listing, layer_tabs, source_tabs, sort_controls_html, "记忆条目", len(rows))
 
     return load_template().substitute(

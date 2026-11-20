@@ -96,3 +96,15 @@ dialog::backdrop { background: rgb(0 0 0 / 45%); }
 :where(input, textarea)::placeholder { color: var(--muted); opacity: 1; }
 :where(input, select, textarea):user-invalid { border-color: var(--danger-fg); }
 ::selection { background: color-mix(in srgb, var(--focus) 30%, var(--bg)); color: var(--text); }
+
+/* Desktop polish: readable activity page, flat client page, home status line. */
+.desk-status{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 18px;font-size:13px}
+.desk-status a{margin-left:auto;color:var(--link)}
+.desk .activity-panel{border:0;padding:0;background:none}
+.desk .activity-panel .recent-panel-head{display:none}
+.desk .activity-clients{gap:10px}.desk .activity-clients li{font-size:15px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+.desk .activity-cols{gap:22px;margin-top:22px}.desk .activity-cols h3{font-size:14px;opacity:1;color:var(--text);margin-bottom:10px}
+.desk .activity-cols ul{font-size:14px;gap:9px}.desk .act-meta{font-size:12.5px}
+.desk .ops-flat{display:grid;gap:14px}.desk .ops-flat .agents-title-row{display:none}
+.desk .ops-flat .agents-ribbon-top{justify-content:flex-end}
+.desk .ops-flat .agent-item{padding:16px}.desk .ops-flat .check-chips span{font-size:12.5px}
