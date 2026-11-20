@@ -559,6 +559,44 @@ os.execv(git, [git, *args])
             finally:
                 process.terminate()
 
+    def test_first_sync_adopts_remote_history_and_preserves_local_edits(self):
+        def git(*args):
+            return subprocess.check_output(["git", *map(str, args)], text=True, env=self.environment())
+
+        bare = self.home / "first.git"
+        git("init", "-q", "--bare", "-b", "main", bare)
+        team = self.home / "shared"
+        self.cli("mount", "add", "empty", "--path", str(team), "--mode", "ro", "--git", str(bare))
+        self.cli("sync", "run", "empty")
+        self.assertEqual(git("-C", bare, "for-each-ref"), "")
+
+        self.cli("init", root=self.other)
+        self.cli("sync", "setup", "personal", "--remote-url", str(bare), root=self.other)
+        self.tool("memory_upsert", dict(layer="L1", name="welcome", title="入门", description="欢迎", body="团队记忆"),
+                  root=self.other)
+        self.cli("sync", "run", "personal", root=self.other)
+        revision = git("-C", bare, "rev-parse", "main")
+        self.cli("sync", "run", "empty")
+        self.assertEqual(git("-C", team, "rev-parse", "HEAD"), revision)
+        self.assertEqual(git("-C", team, "status", "--porcelain"), "")
+        self.assertIn("团队记忆", (team / "methods/welcome.md").read_text())
+
+        self.cli("sync", "setup", "personal", "--remote-url", str(bare))
+        self.cli("sync", "run", "personal")
+        self.assertEqual(git("-C", self.library, "rev-parse", "HEAD"), revision)
+        self.assertEqual(git("-C", bare, "rev-parse", "main"), revision)
+
+        edited = self.home / "existing"
+        self.cli("init", root=edited)
+        (edited / "MEMORY.md").write_text("我的已有记录")
+        self.cli("sync", "setup", "personal", "--remote-url", str(bare), root=edited)
+        result = subprocess.run([sys.executable, str(CODE / "scripts/memoryctl.py"), "sync", "run", "personal"],
+                                cwd=self.home, env=self.environment(edited), capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("独立的提交历史", result.stderr + result.stdout)
+        self.assertEqual((edited / "MEMORY.md").read_text(), "我的已有记录")
+        self.assertEqual(git("-C", bare, "rev-parse", "main"), revision)
+
     def test_git_sync_two_devices_index_autoheal_and_entry_conflict_preservation(self):
         bare_remote = self.home / "remote.git"
         subprocess.check_call(["git", "init", "--bare", "-b", "main", str(bare_remote)],

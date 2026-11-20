@@ -15,7 +15,7 @@ import sys
 import subprocess
 from tempfile import NamedTemporaryFile
 
-from library_paths import FRAMEWORK_ROOT, library_state_dir
+from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
 
 
 LAYER_HEADINGS = (
@@ -395,7 +395,7 @@ def current_branch(root, fallback="main"):
     return fallback
 
 
-def ensure_repo(root, remote_url="", remote="origin", branch="main"):
+def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable=True):
     """Ensure root is a Git repo with sane .gitignore, local identity, and optional remote."""
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -404,7 +404,8 @@ def ensure_repo(root, remote_url="", remote="origin", branch="main"):
         _run_git(root, "init", "-b", branch or "main")
         initialized = True
     _ensure_git_identity(root)
-    _ensure_gitignore(root)
+    if writable:
+        _ensure_gitignore(root)
 
     if remote_url:
         existing = _run_git(root, "remote", "get-url", remote, check=False)
@@ -559,6 +560,40 @@ def _extract_theirs_conflict_copy(root, rel_path, stamp, text=None):
     return conflict_path.relative_to(root).as_posix()
 
 
+def _unmodified_seeds(root):
+    """Identify a new working tree made entirely of the files shipped by init."""
+    if _has_commits(root) or _run_git(root, "ls-files", "--cached", "-z").stdout:
+        return None
+    names = _run_git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout.split("\0")
+    sources = library_seed_files()
+    for name in filter(None, names):
+        path = root / name
+        if name != ".gitignore" and name not in sources:
+            return None
+        expected = DEFAULT_GITIGNORE.encode() if name == ".gitignore" else sources[name].read_bytes()
+        if (path.is_symlink() or not path.is_file() or path.stat().st_size != len(expected)
+                or path.read_bytes() != expected):
+            return None
+    return [name for name in names if name]
+
+
+def _checkout_initial_branch(root, branch, remote_ref, seeds, mode):
+    # Let Git check for local modifications and collisions while advancing the seed files
+    # to the remote tree. In a personal library, preserve templates absent from the remote.
+    remote_files = _run_git(root, "ls-tree", "-r", "--name-only", "-z", remote_ref).stdout.split("\0")
+    covered = [name for name in seeds if mode == "ro" or name in remote_files]
+    if covered:
+        _run_git(root, "add", "--", *covered)
+        base = _run_git(root, "write-tree").stdout.strip()
+        try:
+            _run_git(root, "read-tree", "-m", "-u", base, remote_ref)
+        except GitSyncError:
+            # Only originally untracked bootstrap files were staged above.
+            _run_git(root, "rm", "--cached", "--quiet", "--", *covered, check=False)
+            raise
+    _run_git(root, "checkout", "--no-overwrite-ignore", "-B", branch, remote_ref)
+
+
 def pull(root, remote="origin", branch="", mode="rw"):
     """Fetch and merge remote updates, auto-healing MEMORY.md conflicts and preserving entry conflicts."""
     root = Path(root).expanduser().resolve()
@@ -572,7 +607,8 @@ def pull(root, remote="origin", branch="", mode="rw"):
             raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
 
         changes = _porcelain_changes(root)
-        if changes:
+        seeds = _unmodified_seeds(root) if changes else []
+        if changes and seeds is None:
             if mode == "ro":
                 raise GitSyncError(
                     f"Read-only library '{root}' has local uncommitted changes; revert them before pulling."
@@ -591,7 +627,7 @@ def pull(root, remote="origin", branch="", mode="rw"):
             }
 
         if not _has_commits(root):
-            _run_git(root, "checkout", "-B", br, remote_ref)
+            _checkout_initial_branch(root, br, remote_ref, seeds or [], mode)
             return {
                 "pulled": True,
                 "status": "checked_out_remote",

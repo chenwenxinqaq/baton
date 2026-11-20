@@ -15,6 +15,17 @@ MOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 RESERVED_MOUNT_IDS = frozenset({"personal", "primary", "all", "local"})
 
 
+def library_seed_files(shared=False):
+    files = {"MEMORY.md": FRAMEWORK_ROOT / "templates/library.md"}
+    for name in ("entry", "project", "incident"):
+        relative = f"templates/{name}.md"
+        files[relative] = FRAMEWORK_ROOT / relative
+    if not shared:
+        skill = "skills/unified-memory/SKILL.md"
+        files[skill] = FRAMEWORK_ROOT / skill
+    return files
+
+
 def _resolved_home(home=None):
     return Path(home).expanduser().resolve() if home else Path.home().resolve()
 

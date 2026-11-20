@@ -24,6 +24,7 @@ from library_paths import (
     data_root,
     global_state_dir,
     load_mounts_config,
+    library_seed_files,
     normalize_layers,
     resolve_libraries,
     save_mounts_config,
@@ -160,13 +161,7 @@ def initialize_library(target_root=None, shared=False):
         folders = folders + ("user-managed",)
     for folder in folders:
         (root / folder).mkdir(exist_ok=True, mode=0o700)
-    seeds = {"MEMORY.md": LIBRARY_TEMPLATE}
-    if not shared:
-        seeds["skills/unified-memory/SKILL.md"] = FRAMEWORK_ROOT / "skills" / "unified-memory" / "SKILL.md"
-    for name in ("entry", "project", "incident"):
-        relative = f"templates/{name}.md"
-        seeds[relative] = FRAMEWORK_ROOT / relative
-    for relative, source in seeds.items():
+    for relative, source in library_seed_files(shared=shared).items():
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(dir=destination.parent) as staged:
@@ -1495,6 +1490,7 @@ def mount_add(
             remote_url=git_url,
             remote=remote or "origin",
             branch=branch or "main",
+            writable=mode == "rw",
         )
         sync_cfg = {
             "driver": "git",
@@ -1571,6 +1567,7 @@ def mount_update(
             remote_url=cur_sync.get("remote_url") or "",
             remote=cur_sync.get("remote") or "origin",
             branch=cur_sync.get("branch") or "main",
+            writable=target["mode"] == "rw",
         )
         cur_sync["branch"] = cur_sync.get("branch") or info["branch"]
         cur_sync["remote_url"] = info["remote_url"]
@@ -1612,6 +1609,7 @@ def setup_library_sync(
         remote_url=remote_url,
         remote=remote or "origin",
         branch=branch or "main",
+        writable=lib["mode"] == "rw",
     )
     sync_cfg = {
         "driver": "git",
