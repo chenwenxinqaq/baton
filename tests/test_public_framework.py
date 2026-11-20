@@ -440,6 +440,42 @@ class PublicFrameworkTests(unittest.TestCase):
             with self.assertRaisesRegex(sync_git.GitSyncError, "本机 Git 未能通过远端身份验证"):
                 sync_git.test_remote_access(self.library)
 
+    def test_github_network_route_and_transient_handshake(self):
+        from unittest.mock import patch
+        sys.path.insert(0, str(CODE / "scripts"))
+        import sync_git
+
+        env = {"HOME": str(self.home), "PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1"}
+        url = "https://github.com/"
+        proxy = "http://127.0.0.1:34567"
+        with patch.object(sync_git.sys, "platform", "darwin"), patch.object(sync_git, "getproxies", return_value={"https": proxy}), \
+                patch.object(sync_git, "proxy_bypass", return_value=False) as bypass:
+            options = sync_git._github_proxy_options(self.home, env)
+            self.assertEqual(options, ["-c", f"http.{url}.proxy={proxy}"])
+            for variable in ("https_proxy", "HTTPS_PROXY", "ALL_PROXY"):
+                self.assertEqual(sync_git._github_proxy_options(self.home, {**env, variable: ""}), [])
+            bypass.return_value = True
+            self.assertEqual(sync_git._github_proxy_options(self.home, env), [])
+            bypass.return_value = False
+            subprocess.run(["git", "config", "--global", "http.proxy", ""], env=env, check=True)
+            self.assertEqual(sync_git._github_proxy_options(self.home, env), [])
+
+        failure = subprocess.CompletedProcess([], 128, "", "LibreSSL SSL_connect: SSL_ERROR_SYSCALL")
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(sync_git.time, "sleep"), patch.object(sync_git, "_git_process", side_effect=[failure, ok]) as run:
+            sync_git.test_remote_access(self.library)
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(c.args[1] == ("ls-remote", "--", "origin") for c in run.call_args_list))
+        with patch.object(sync_git.time, "sleep"), patch.object(sync_git, "_git_process", return_value=failure) as run:
+            with self.assertRaisesRegex(sync_git.GitSyncError, "HTTPS 安全连接时中断"):
+                sync_git.test_remote_access(self.library)
+            self.assertEqual(run.call_count, 2)
+        for msg in ("SSL certificate problem: certificate has expired", "authentication failed"):
+            with patch.object(sync_git, "_git_process", return_value=subprocess.CompletedProcess([], 128, "", msg)) as run:
+                with self.assertRaises(sync_git.GitSyncError):
+                    sync_git.test_remote_access(self.library)
+                self.assertEqual(run.call_count, 1)
+
     def test_browser_onboarding_cancel_retry_sync_and_join(self):
         import shutil
         import time

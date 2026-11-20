@@ -13,7 +13,9 @@ import shutil
 import signal
 import sys
 import subprocess
+import time
 from tempfile import NamedTemporaryFile
+from urllib.request import getproxies, proxy_bypass
 
 from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
 
@@ -291,6 +293,23 @@ def github_browser_login(remote_url):
                              remote_url, re.IGNORECASE) and github_helper())
 
 
+def _github_proxy_options(root, env):
+    """Supply macOS's static HTTPS proxy as a host-scoped Git default."""
+    if sys.platform != "darwin" or any(key.lower() in {"http_proxy", "https_proxy", "all_proxy"}
+                                       for key in env):
+        return []
+    proxy = getproxies().get("https")
+    if not proxy or proxy_bypass("github.com"):
+        return []
+    # Even an explicitly empty http.proxy means the user chose their own route.
+    url = "https://github.com/"
+    configured = subprocess.run(["git", "config", "--get-urlmatch", "http.proxy", url],
+                                cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if configured.returncode != 1:
+        return []
+    return ["-c", f"http.{url}.proxy={proxy}"]
+
+
 def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=None):
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     bundle = _git_bundle()
@@ -298,15 +317,16 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
         env.update(PATH=str(bundle / "bin") + os.pathsep + env.get("PATH", os.defpath),
                    GIT_EXEC_PATH=str(bundle / "libexec/git-core"),
                    GIT_TEMPLATE_DIR=str(bundle / "share/git-core/templates"))
+    if env_extra:
+        env.update(env_extra)
     cmd = ["git", "-c", "core.quotepath=false"]
     if args[0] in {"ls-remote", "fetch", "push", "clone"}:
+        cmd += _github_proxy_options(root, env)
         helper = github_helper()
         if helper:
             cmd += ["-c", "credential.https://github.com.helper=!" + shlex.quote(helper),
                     "-c", "credential.https://github.com.gitHubAuthModes=browser",
                     "-c", "credential.https://github.com.interactive=" + ("true" if browser_login else "false")]
-    if env_extra:
-        env.update(env_extra)
     # A timed-out Git can leave its credential helper listening for an OAuth callback.
     with subprocess.Popen(cmd + list(args), cwd=str(root), env=env, text=True, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
@@ -322,8 +342,14 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
     return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
+class _InterruptedTlsHandshake(GitSyncError):
+    """Git lost the transport while establishing TLS with the remote."""
+
+
 def _git_failure(action, detail):
     lowered = detail.lower()
+    if "ssl_connect" in lowered and "ssl_error_syscall" in lowered:
+        return _InterruptedTlsHandshake("与远端仓库建立 HTTPS 安全连接时中断。请检查网络或代理后重试。")
     if "repository not found" in lowered or re.search(r"(?:http |error: )403\b", lowered) or "write access to repository not granted" in lowered:
         return GitSyncError("仓库地址有误或当前账号权限不足。请在 GitHub 确认仓库归属、接受协作邀请，并核对读写权限。")
     if any(word in lowered for word in ("user_cancel", "access_denied", "authentication was canceled", "user canceled", "user cancelled")):
@@ -449,7 +475,17 @@ def clone_repo(remote_url, dest_path, branch=""):
 
 def test_remote_access(root, remote="origin", *, browser_login=False):
     """Read advertised refs without fetching, committing, or pushing, including for empty remotes."""
-    _run_git(root, "ls-remote", "--", remote, browser_login=browser_login, timeout=180 if browser_login else 15)
+    timeout = 180 if browser_login else 15
+    deadline = time.monotonic() + timeout
+    try:
+        _run_git(root, "ls-remote", "--", remote, browser_login=browser_login, timeout=timeout)
+    except _InterruptedTlsHandshake:
+        # Only replay this read-only probe. Keep both attempts within the original time budget.
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise
+        time.sleep(0.5)
+        _run_git(root, "ls-remote", "--", remote, browser_login=browser_login, timeout=remaining - 0.5)
 
 
 def _has_commits(root):
