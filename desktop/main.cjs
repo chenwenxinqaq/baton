@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, nativeTheme, session } = require('electron');
+const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, session } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -11,6 +11,17 @@ let win;
 let backend;
 let origin;
 let quitting = false;
+let tray;
+let openedAtLogin = false;
+
+function prefsFile() { return path.join(app.getPath('userData'), 'prefs.json'); }
+function readPrefs() {
+  try { return JSON.parse(fs.readFileSync(prefsFile(), 'utf8')); } catch { return {}; }
+}
+function writePrefs(patch) {
+  fs.mkdirSync(app.getPath('userData'), { recursive: true });
+  fs.writeFileSync(prefsFile(), JSON.stringify({ ...readPrefs(), ...patch }, null, 2));
+}
 
 function backendSettings() {
   // Developers and existing CLI installs can point both entry points at the same checkout.
@@ -71,9 +82,13 @@ function createWindow() {
   wc.on('will-navigate', (event, address) => { if (!allowed(address)) event.preventDefault(); });
   wc.on('will-redirect', (event, address) => { if (!allowed(address)) event.preventDefault(); });
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
-  win.once('ready-to-show', () => win?.show());
+  win.once('ready-to-show', () => { if (!openedAtLogin) win?.show(); });
   const updateBackground = () => win.setBackgroundColor(background());
   nativeTheme.on('updated', updateBackground);
+  win.on('close', event => {
+    // Closing the window keeps the app in the menu bar; use the tray menu or Cmd+Q to quit.
+    if (!quitting && process.platform === 'darwin') { event.preventDefault(); win.hide(); }
+  });
   win.on('closed', () => {
     nativeTheme.off('updated', updateBackground);
     win = null;
@@ -101,7 +116,52 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(menu));
 }
 
+function showWindow(route) {
+  if (!win) return createWindow().then(() => win?.show());
+  if (win.isMinimized()) win.restore();
+  if (route) win.loadURL(origin + route);
+  win.show();
+  win.focus();
+}
+
+function setLoginItem(enabled) {
+  app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true });
+  writePrefs({ loginItemAsked: true });
+}
+
+function installTray() {
+  const base = path.join(__dirname, 'trayTemplate.png');
+  const image = nativeImage.createFromPath(base);
+  if (image.isEmpty()) return;
+  image.setTemplateImage(true);
+  tray = new Tray(image);
+  tray.setToolTip('Unified Memory');
+  const rebuild = () => tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '打开 Unified Memory', click: () => showWindow('/') },
+    { label: '读写动态', click: () => showWindow('/?view=activity') },
+    { label: '共享与同步', click: () => showWindow('/?view=sync_hub') },
+    { type: 'separator' },
+    { label: '开机自动启动', type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin,
+      click: item => { setLoginItem(item.checked); rebuild(); } },
+    { type: 'separator' },
+    { label: '退出 Unified Memory', click: () => app.quit() }
+  ]));
+  rebuild();
+  tray.on('click', () => showWindow('/'));
+}
+
+async function askLoginItemOnce() {
+  if (readPrefs().loginItemAsked || !app.isPackaged) return;
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question', buttons: ['开机自动启动', '暂不'], defaultId: 0, cancelId: 1,
+    message: '让 Unified Memory 常驻菜单栏？',
+    detail: '常驻后可随时查看 AI 读写动态与同步状态，关闭窗口不会退出。之后可在菜单栏图标里修改。'
+  });
+  setLoginItem(response === 0);
+}
+
 async function launch() {
+  openedAtLogin = app.getLoginItemSettings().wasOpenedAtLogin;
   const isolated = session.fromPartition('memory-workspace');
   isolated.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
   isolated.setPermissionCheckHandler(() => false);
@@ -111,18 +171,21 @@ async function launch() {
     callback({ cancel: new URL(details.url).origin !== origin });
   });
   installMenu();
+  installTray();
   await createWindow();
+  askLoginItemOnce().catch(() => {});
 }
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => { if (win?.isMinimized()) win.restore(); win?.focus(); });
+  app.on('second-instance', () => showWindow());
+  app.on('activate', () => { if (origin) showWindow(); });
   app.whenReady().then(launch).catch(error => {
     dialog.showErrorBox('无法打开 Unified Memory', String(error.message));
     app.quit();
   });
   app.on('before-quit', () => { quitting = true; backend?.stdin.end(); });
   app.on('will-quit', () => { if (backend && backend.exitCode === null) backend.kill(); });
-  app.on('window-all-closed', () => app.quit());
+  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 }

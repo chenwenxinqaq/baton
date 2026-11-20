@@ -13,6 +13,7 @@ PUBLIC_FILES = (
     ".gitignore",
     "bin/umem",
     "desktop/icon.svg",
+    "desktop/tray.svg",
     "desktop/main.cjs",
     "desktop/package.json",
     "desktop/package-lock.json",

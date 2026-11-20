@@ -17,6 +17,10 @@ try {
   const framework = path.join(temp, 'framework');
   await fs.mkdir(appDir);
   await fs.copyFile(path.join(here,'main.cjs'), path.join(appDir,'main.cjs'));
+  // Menu-bar glyph: black-on-transparent template images (macOS tints them for light/dark).
+  for (const [file, pixels] of [['trayTemplate.png', '18'], ['trayTemplate@2x.png', '36']]) {
+    execFileSync('sips', ['-s','format','png','-z',pixels,pixels,path.join(here,'tray.svg'),'--out',path.join(appDir,file)]);
+  }
   const { name, productName, version, description, main } = manifest;
   await fs.writeFile(path.join(appDir, 'package.json'), JSON.stringify({ name, productName, version, description, main }));
   const python = process.env.PYTHON || 'python3';

@@ -18,6 +18,12 @@ cd unified-memory-cli
 
 `umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body-file -` 从标准输入读取 Markdown。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。同步 Git 仓库需要本机 Git 以及相应仓库权限。
 
+桌面版会常驻 macOS 菜单栏：关闭窗口不会退出，菜单栏图标可打开读写动态、共享与同步，并提供「开机自动启动」开关（首次打开会询问一次）。
+
+### 稳定入口
+
+客户端（Cursor、Codex、Claude Code、Antigravity）的 MCP 与 Hook 配置不会直接指向源码目录或 `.app` 包内部，而是指向固定启动器 `~/Library/Application Support/Unified Memory/bin/`（Linux 为 `~/.local/share/unified-memory/bin/`）下的 `umem-mcp`、`umem-hook`、`umem`。启动器由 `memoryctl connect`、桌面版每次启动或 `memoryctl install-shims` 自动刷新；应用被移动或升级后，若记录的运行时已消失，启动器会回退到 `~/Applications`、`/Applications` 里的应用包，仍找不到则明确报错而不是静默失效。旧版直接写入 python 与 `server.py` 路径的配置会被识别为「待同步」，点「同步」即可迁移。
+
 两个入口默认读取 `~/UnifiedMemory`。桌面窗口单独分配回环端口，原有的 8765 网页可以继续使用。已有 CLI 源码安装的用户，可在 macOS 的 `~/Library/Application Support/Unified Memory/backend.json` 配置 `framework` 和 `python` 两个绝对路径，让应用沿用同一份已升级的源码和解释器；新安装默认使用包内运行时。
 
 ### 本地构建
