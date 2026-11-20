@@ -1633,6 +1633,11 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
                 f'<a class="btn btn-warn btn-compact" href="{escape(query(library=nav_key, view="conflicts"))}#detail-title">处理冲突</a>'
             )
         if git.get("is_repo") and git.get("remote_url") and nav_key in libraries:
+            act_btns.append(
+                f'<form method="post" action="/sync_test#feedback">'
+                f'{hidden("csrf", token)}{hidden("library", nav_key)}'
+                '<button class="btn btn-ghost btn-compact" type="submit">测试读取连接</button></form>'
+            )
             s_lbl = "拉取更新" if is_ro else "立即同步"
             act_btns.append(
                 f'<form method="post" action="/sync#feedback">'
@@ -3132,6 +3137,7 @@ class Handler(BaseHTTPRequestHandler):
             "synced": "Git 同步完成。",
             "synced_conflicts": "已合并远端更新，发现正文冲突副本，请前往冲突对比页合并后再推送。",
             "index_rebuilt": "MEMORY.md 索引已按磁盘条目重新生成。",
+            "remote_readable": "读取连接成功。远端仓库可访问，本次测试未上传记忆。",
             "sync_setup_saved": "Git 远端同步配置已保存。",
             "mount_added": "共享记忆库已挂载生效，顶栏可直接切换。",
             "mount_updated": "共享库挂载设置已更新。",
@@ -3177,6 +3183,7 @@ class Handler(BaseHTTPRequestHandler):
             "/doctor",
             "/skill",
             "/sync",
+            "/sync_test",
             "/rebuild_index",
             "/sync_setup",
             "/mount_add",
@@ -3219,6 +3226,7 @@ class Handler(BaseHTTPRequestHandler):
             "/doctor",
             "/skill",
             "/sync",
+            "/sync_test",
             "/rebuild_index",
             "/sync_setup",
             "/mount_add",
@@ -3270,6 +3278,12 @@ class Handler(BaseHTTPRequestHandler):
                 sync_git.rebuild_index(lib_obj.root)
                 return_view = fields.get("return_view", "")
                 loc = query(library=key, tab=return_tab, view=return_view, notice="index_rebuilt")
+                self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+                return
+            if self.path == "/sync_test":
+                lib_obj = self.server.libraries[key]
+                sync_git.test_remote_access(lib_obj.root, (lib_obj.sync_config or {}).get("remote") or "origin")
+                loc = query(library=key, view="sync_hub", notice="remote_readable")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/sync":
@@ -3454,7 +3468,7 @@ class Handler(BaseHTTPRequestHandler):
         except (RuntimeError, ValueError, OSError, SystemExit) as exc:
             err_view = ""
             err_topic = ""
-            if self.path in {"/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
+            if self.path in {"/sync", "/sync_test", "/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
                 err_view = "sync_hub"
             elif self.path == "/resolve_conflict":
                 err_view = "conflicts"

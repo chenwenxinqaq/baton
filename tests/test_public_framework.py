@@ -420,6 +420,26 @@ class PublicFrameworkTests(unittest.TestCase):
             finally:
                 process.terminate()
 
+    def test_remote_read_probe_and_auth_failure(self):
+        from unittest.mock import patch
+        sys.path.insert(0, str(CODE / "scripts"))
+        import sync_git
+
+        remote = self.home / "empty.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.cli("sync", "setup", "personal", "--remote-url", str(remote))
+        def refs(directory):
+            return subprocess.run(["git", "-C", str(directory), "for-each-ref"],
+                                  check=True, capture_output=True).stdout
+        before = refs(self.library)
+        sync_git.test_remote_access(self.library)
+        self.assertEqual(refs(self.library), before)
+        self.assertEqual(refs(remote), b"")
+        denied = subprocess.CompletedProcess([], 128, "", "fatal: could not read Username: terminal prompts disabled")
+        with patch.object(sync_git.subprocess, "run", return_value=denied):
+            with self.assertRaisesRegex(sync_git.GitSyncError, "本机 Git 未能通过远端身份验证"):
+                sync_git.test_remote_access(self.library)
+
     def test_git_sync_two_devices_index_autoheal_and_entry_conflict_preservation(self):
         bare_remote = self.home / "remote.git"
         subprocess.check_call(["git", "init", "--bare", "-b", "main", str(bare_remote)],

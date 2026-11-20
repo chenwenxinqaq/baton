@@ -260,21 +260,29 @@ class GitSyncError(RuntimeError):
     """Raised when a Git synchronization operation fails."""
 
 
-def _run_git(root, *args, check=True, env_extra=None):
+def _git_failure(action, detail):
+    lowered = detail.lower()
+    if ("terminal prompts disabled" in lowered or "authentication failed" in lowered
+            or "permission denied (publickey" in lowered):
+        return GitSyncError(
+            "本机 Git 未能通过远端身份验证。浏览器登录只适用于网页。"
+            "请为这个仓库配置 Git 凭据或 SSH 密钥，再到「共享与同步」点击「测试读取连接」。"
+        )
+    return GitSyncError(f"{action} failed: {detail}")
+
+
+def _run_git(root, *args, check=True, env_extra=None, timeout=None):
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if env_extra:
         env.update(env_extra)
     cmd = ["git", "-c", "core.quotepath=false", *args]
-    proc = subprocess.run(
-        cmd,
-        cwd=str(root),
-        text=True,
-        capture_output=True,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(cmd, cwd=str(root), text=True, capture_output=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise GitSyncError("连接远端超时，请检查网络后重试。") from exc
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-        raise GitSyncError(f"git {' '.join(args)} failed: {detail}")
+        raise _git_failure(f"git {args[0]}", detail)
     return proc
 
 
@@ -372,13 +380,18 @@ def clone_repo(remote_url, dest_path, branch=""):
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-        raise GitSyncError(f"git clone failed: {detail}")
+        raise _git_failure("git clone", detail)
     _ensure_git_identity(dest)
     return {
         "path": str(dest),
         "branch": current_branch(dest, fallback=branch or "main"),
         "remote_url": remote_url,
     }
+
+
+def test_remote_access(root, remote="origin"):
+    """Read advertised refs without fetching, committing, or pushing, including for empty remotes."""
+    _run_git(root, "ls-remote", "--", remote, timeout=15)
 
 
 def _has_commits(root):
