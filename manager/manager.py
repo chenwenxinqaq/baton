@@ -92,22 +92,32 @@ DESKTOP = False
 PAGE_TEMPLATE = Template((APP / "page.html").read_text(encoding="utf-8"))
 
 
+NAV_ICONS = {
+    "library": '<path d="M5 4h11a3 3 0 013 3v13H8a3 3 0 01-3-3z"/><path d="M5 17a3 3 0 013-3h11"/>',
+    "activity": '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+    "skills": '<path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"/>',
+    "clients": '<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 01-12 0zM12 17v5"/>',
+    "sync": '<path d="M4 8h13l-3-3M20 16H7l3 3"/>',
+}
+
+
 def desktop_navigation(key, selected):
     routes = [
-        ("工作区", "library", "▤", "记忆库", {}),
-        ("", "activity", "◷", "读写动态", {"view": "activity"}),
-        ("", "skills", "▦", "技能", {"tab": "skills"}),
-        ("管理", "clients", "⊞", "客户端接入", {"view": "clients"}),
-        ("", "sync", "⇄", "共享与同步", {"view": "sync_hub"}),
+        ("工作区", "library", "记忆库", {}),
+        ("", "activity", "读写动态", {"view": "activity"}),
+        ("", "skills", "技能", {"tab": "skills"}),
+        ("管理", "clients", "客户端接入", {"view": "clients"}),
+        ("", "sync", "共享与同步", {"view": "sync_hub"}),
     ]
     links = []
     section = "记忆库"
-    for group, slug, icon, label, params in routes:
+    for group, slug, label, params in routes:
         if group:
             links.append(f'<span class="nav-group">{group}</span>')
         if slug == selected:
             section = label
         href = escape(query(library=key, **params))
+        icon = f'<svg viewBox="0 0 24 24" aria-hidden="true">{NAV_ICONS[slug]}</svg>'
         links.append(f'<a href="{href}"{CUR_ATTR if slug == selected else ""}>'
                      f'<span class="nav-icon" aria-hidden="true">{icon}</span>{label}</a>')
     return dict(desktop_nav="".join(links), section_name=section,
