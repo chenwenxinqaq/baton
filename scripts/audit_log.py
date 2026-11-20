@@ -98,8 +98,12 @@ def read_events(since=None, home=None):
     return events
 
 
-def has_write_since(since, home=None):
-    return any(e.get("tool") in WRITE_TOOLS and e.get("ok", True) for e in read_events(since=since, home=home))
+def has_write_since(since, home=None, client=None):
+    """True if a successful write happened since `since` (optionally only by one client)."""
+    return any(
+        e.get("tool") in WRITE_TOOLS and e.get("ok", True) and (client is None or e.get("client") == client)
+        for e in read_events(since=since, home=home)
+    )
 
 
 def _day_start(now):

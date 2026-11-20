@@ -142,7 +142,7 @@ def handle(event, payload, memory_root):
             return {}
         if now - state.get("nudge_t", 0) < COOLDOWN_SECONDS:
             return {}
-        if audit_log.has_write_since(prompt_t):
+        if audit_log.has_write_since(prompt_t, client="Cursor"):
             return {}
         state["nudge_t"] = now
         save_state(conv_id, state)

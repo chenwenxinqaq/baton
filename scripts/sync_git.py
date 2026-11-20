@@ -22,6 +22,12 @@ LAYER_HEADINGS = (
     ("L4", "archive", "## L4 事故归档"),
 )
 CONFLICT_MARKER_RE = re.compile(r"\.conflict-\d{8}-\d{6}(?:-\d+|-[a-f0-9]+)?\.md$", re.IGNORECASE)
+REMOTE_DELETED_SENTINEL = "<!-- unified-memory:remote-deleted -->"
+REMOTE_DELETED_TEXT = (
+    REMOTE_DELETED_SENTINEL
+    + "\n\n另一台设备已删除此条目，但本机在同一时间修改了它。本机版本已保留在原位。"
+    "选择“采用远端版本”将删除本条目（旧内容会先放入本机回收站）；选择“保留本机”则继续保留并推送。\n"
+)
 DEFAULT_GITIGNORE = ".DS_Store\n.state/\n__pycache__/\n*.pyc\n*.conflict-*.md\n"
 
 
@@ -145,7 +151,10 @@ def resolve_conflict(
             remote_text = conflict_path.read_text(encoding="utf-8")
             _backup(orig_path, f"conflict-local-{orig_path.stem}")
             _backup(conflict_path, f"conflict-remote-{conflict_path.stem}")
-            _atomic_write(orig_path, remote_text)
+            if remote_text.lstrip().startswith(REMOTE_DELETED_SENTINEL):
+                orig_path.unlink(missing_ok=True)  # the other device deleted it; honour that choice
+            else:
+                _atomic_write(orig_path, remote_text)
             conflict_path.unlink()
             rebuild_index(root, lock=False)
         else:
@@ -273,8 +282,15 @@ def is_git_repo(root):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         return False
-    proc = _run_git(root, "rev-parse", "--is-inside-work-tree", check=False)
-    return proc.returncode == 0 and proc.stdout.strip() == "true"
+    # Require the library itself to be the work-tree top level: a library living inside some other
+    # repository (e.g. a dotfiles repo) must not inherit that repo's remote or history.
+    proc = _run_git(root, "rev-parse", "--show-toplevel", check=False)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return False
+    try:
+        return Path(proc.stdout.strip()).resolve() == root
+    except OSError:
+        return False
 
 
 def _ensure_git_identity(root):
@@ -451,11 +467,16 @@ def auto_commit(root, message):
     return {"committed": True, "revision": rev, "files": len(changes)}
 
 
-def _extract_theirs_conflict_copy(root, rel_path, stamp):
-    """Save remote version (:3:<path>) beside the local file without losing either side."""
-    show = _run_git(root, "show", f":3:{rel_path}", check=False)
-    if show.returncode != 0:
-        return None
+def _extract_theirs_conflict_copy(root, rel_path, stamp, text=None):
+    """Save remote version (:3:<path>) beside the local file without losing either side.
+
+    `text` overrides the content (used for the remote-deleted tombstone).
+    """
+    if text is None:
+        show = _run_git(root, "show", f":3:{rel_path}", check=False)
+        if show.returncode != 0:
+            return None
+        text = show.stdout
     orig = Path(root) / rel_path
     conflict_name = f"{orig.stem}.conflict-{stamp}{orig.suffix}"
     conflict_path = orig.with_name(conflict_name)
@@ -464,7 +485,7 @@ def _extract_theirs_conflict_copy(root, rel_path, stamp):
         while conflict_path.exists():
             conflict_path = orig.with_name(f"{orig.stem}.conflict-{stamp}-{idx}{orig.suffix}")
             idx += 1
-    _atomic_write(conflict_path, show.stdout)
+    _atomic_write(conflict_path, text)
     return conflict_path.relative_to(root).as_posix()
 
 
@@ -548,6 +569,7 @@ def pull(root, remote="origin", branch="", mode="rw"):
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         saved_conflicts = []
+        restored_remote = []
         index_conflicted = False
 
         for rel in unmerged:
@@ -556,16 +578,25 @@ def pull(root, remote="origin", branch="", mode="rw"):
                 _run_git(root, "checkout", "--ours", "MEMORY.md", check=False)
                 continue
             # Keep local file at original path and preserve remote copy beside it
-            copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
-            if copy_rel:
-                saved_conflicts.append({"original": rel, "remote_copy": copy_rel})
-            if _run_git(root, "show", f":2:{rel}", check=False).returncode == 0:
+            has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
+            has_theirs = _run_git(root, "show", f":3:{rel}", check=False).returncode == 0
+            if has_ours and not has_theirs:
+                # Remote deleted what we edited: keep our copy and ask, instead of silently resurrecting it.
+                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp, text=REMOTE_DELETED_TEXT)
+                saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "remote_deleted"})
                 _run_git(root, "checkout", "--ours", rel)
-            else:
+            elif has_theirs and not has_ours:
+                # We deleted what the remote edited: never drop their edit; restore it and report.
                 _run_git(root, "checkout", "--theirs", rel)
+                restored_remote.append(rel)
+            else:
+                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                if copy_rel:
+                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "both_modified"})
+                _run_git(root, "checkout", "--ours", rel)
 
         # Deterministically rebuild MEMORY.md so additions from both sides are indexed cleanly
-        if index_conflicted or saved_conflicts:
+        if index_conflicted or saved_conflicts or restored_remote:
             rebuild_index(root, lock=False)
 
         _ensure_git_identity(root)
@@ -584,6 +615,7 @@ def pull(root, remote="origin", branch="", mode="rw"):
             "remote": remote,
             "index_rebuilt": index_conflicted,
             "conflicts": saved_conflicts,
+            "restored_remote": restored_remote,
         }
 
 

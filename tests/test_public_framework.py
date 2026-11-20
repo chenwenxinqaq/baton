@@ -226,6 +226,13 @@ class PublicFrameworkTests(unittest.TestCase):
         mcp_session(("memory_upsert", dict(layer="L2", name="csv-pref", title="周报用 CSV",
                                            description="周报一律 CSV(更新)", body="x")))
         self.assertEqual(hook("stop", {**stop, "conversation_id": "c2"}, **fast), {})
+        # A write by a different client must not silence Cursor's own reminder.
+        hook("beforeSubmitPrompt", {"conversation_id": "c3", "prompt": "第三件事"})
+        other = {"source": "mcp", "client": "Codex", "tool": "memory_upsert", "ok": True}
+        subprocess.check_call([sys.executable, "-c", f"import sys; sys.path.insert(0, {str(CODE / 'scripts')!r}); "
+                               f"import audit_log; audit_log.record({other!r})"], env=self.environment(), cwd=self.home)
+        self.assertIn("followup_message", hook("stop", {**stop, "conversation_id": "c3"},
+                                               UNIFIED_MEMORY_NUDGE_COOLDOWN="0", **fast))
 
         command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0", "--memory-root", str(self.library)]
         with subprocess.Popen(command, env=self.environment(), stdout=subprocess.PIPE, text=True) as process:
@@ -233,7 +240,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 address = process.stdout.readline().strip()
                 with urlopen(address, timeout=5) as response:
                     page = response.read().decode()
-                for expected in ("AI 读写动态", "今日写入 2 次", "不存在的主题", "沉淀提醒 1 次"):
+                for expected in ("AI 读写动态", "今日写入 3 次", "不存在的主题", "沉淀提醒 2 次"):
                     self.assertIn(expected, page)
             finally:
                 process.terminate()
@@ -300,6 +307,64 @@ class PublicFrameworkTests(unittest.TestCase):
                 process.kill()
             process.stdout.close()
             process.stderr.close()
+
+    def test_sync_remote_delete_vs_local_edit_and_nested_repo_detection(self):
+        sys.path.insert(0, str(CODE / "scripts"))
+        import sync_git
+        from unittest import mock
+
+        bare_remote = self.home / "remote.git"
+        subprocess.check_call(["git", "init", "--bare", "-b", "main", str(bare_remote)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.cli("sync", "setup", "personal", "--remote-url", str(bare_remote), "--branch", "main")
+        self.tool("memory_upsert", dict(layer="L1", name="doomed", title="将被删", description="d", body="原文"))
+        self.assertEqual(self.cli("sync", "run", "personal")["results"][0]["status"], "ok")
+
+        home_b, lib_b = self.home / "b-home", self.home / "b-lib"
+        home_b.mkdir()
+        subprocess.check_call(["git", "clone", str(bare_remote), str(lib_b)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env_b = {**os.environ, "HOME": str(home_b), "UNIFIED_MEMORY_ROOT": str(lib_b), "PYTHONDONTWRITEBYTECODE": "1"}
+
+        def cli_b(*args):
+            return json.loads(subprocess.check_output([sys.executable, str(CODE / "scripts/memoryctl.py"), *args],
+                                                      env=env_b, cwd=home_b, text=True))
+
+        cli_b("sync", "setup", "personal", "--remote-url", str(bare_remote), "--branch", "main")
+        # Device A deletes the entry and syncs; device B edits the same entry concurrently.
+        (self.library / "methods/doomed.md").unlink()
+        self.cli("rebuild-index", "personal")
+        self.assertEqual(self.cli("sync", "run", "personal")["results"][0]["status"], "ok")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_upsert", "arguments": dict(
+            layer="L1", name="doomed", title="将被删", description="d", body="B机的修订")}}
+        subprocess.check_output([sys.executable, str(CODE / "mcp/server.py")], input=json.dumps(request) + "\n",
+                                env=env_b, cwd=home_b, text=True)
+        result = cli_b("sync", "run", "personal")["results"][0]
+        self.assertEqual(result["status"], "needs_manual_merge", result)  # never silently resurrected
+        conflict = result["pull"]["conflicts"][0]
+        self.assertEqual(conflict["kind"], "remote_deleted")
+        self.assertIn("B机的修订", (lib_b / "methods/doomed.md").read_text(encoding="utf-8"))
+        self.assertIn(sync_git.REMOTE_DELETED_SENTINEL, (lib_b / conflict["remote_copy"]).read_text(encoding="utf-8"))
+        remote_tree = subprocess.check_output(["git", "--git-dir", str(bare_remote), "ls-tree", "-r", "--name-only", "main"],
+                                              text=True)
+        self.assertNotIn("methods/doomed.md", remote_tree)  # nothing was pushed back
+        # Accepting the remote deletion removes the entry (old content goes to local trash).
+        with mock.patch.dict(os.environ, {"UNIFIED_MEMORY_STATE_DIR": str(self.home / "state-b")}):
+            sync_git.resolve_conflict(lib_b, conflict["remote_copy"], "use_remote")
+        self.assertFalse((lib_b / "methods/doomed.md").exists())
+        self.assertTrue(cli_b("doctor")["ok"])
+        self.assertEqual(cli_b("sync", "run", "personal")["results"][0]["status"], "ok")
+
+        # A library nested inside another repository must not inherit the parent's repo.
+        parent = self.home / "dotfiles"
+        parent.mkdir()
+        subprocess.check_call(["git", "init", "-b", "main", str(parent)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        nested = parent / "memory"
+        nested.mkdir()
+        self.assertFalse(sync_git.is_git_repo(nested))
+        self.assertTrue(sync_git.is_git_repo(parent))
+        sync_git.ensure_repo(nested)
+        self.assertTrue(sync_git.is_git_repo(nested))
 
     def test_multi_library_mounts_permissions_and_web_ro_guard(self):
         team_rw = self.home / "team-rw"
