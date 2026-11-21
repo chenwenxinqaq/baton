@@ -69,7 +69,8 @@ class PublicFrameworkTests(unittest.TestCase):
         (self.library / "skills/resources.json").write_text(json.dumps({"sample": ["shared-guides"]}))
         (self.home / ".codex").mkdir()
         config = self.home / ".codex/config.toml"
-        config.write_text('[sample]\nkeep = true\n', encoding="utf-8")
+        original = '[features]\nmemories = true\n\n[sample]\nkeep = true\n'
+        config.write_text(original, encoding="utf-8")
         self.cli("connect", "all")
         report = self.cli("doctor")
         self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 5)
@@ -79,6 +80,7 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertIn(f"FW={CODE}", launcher.read_text())
         self.assertTrue(report["ok"], report["findings"])  # doctor probes MCP through the launcher
         self.assertIn(str(self.library), config.read_text())
+        self.assertIn("memories = true", config.read_text())
         self.assertTrue((self.home / ".codex/skills/sample").samefile(skill))
         self.assertTrue((self.home / ".codex/skills/shared-guides").samefile(resource))
         self.cli("skill", "disable", "sample")
@@ -87,8 +89,37 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("skill", "enable", "sample")
         self.assertTrue((self.home / ".codex/skills/sample").samefile(skill))
         self.cli("disconnect", "all")
-        self.assertEqual(config.read_text().strip(), '[sample]\nkeep = true')
+        self.assertEqual(config.read_text().strip(), original.strip())
         self.assertTrue((skill / "SKILL.md").is_file())
+
+    def test_codex_reconnect_restores_only_legacy_memory_override(self):
+        self.cli("connect", "codex")
+        config = self.home / ".codex/config.toml"
+        mcp_config = config.read_text()
+        self.assertNotIn("memories =", mcp_config)
+        restore_file = next(self.home.rglob("restore/codex.json"))
+        for previous, setting, expected in (
+            ("true", "memories = false", "memories = true"),
+            ("absent", "memories = false", None),
+            ("true", "memories = false # my setting", "memories = false # my setting"),
+            ("false", "memories = false", "memories = false"),
+        ):
+            with self.subTest(previous=previous, setting=setting):
+                restore = json.loads(restore_file.read_text())
+                restore["previous_codex_features_memories"] = previous
+                restore_file.write_text(json.dumps(restore))
+                config.write_text(f"[features]\n{setting}\nother = true\n\n{mcp_config}")
+                self.cli("connect", "codex")
+                settings = config.read_text()
+                self.assertIn("other = true", settings)
+                if expected:
+                    self.assertIn(expected, settings.splitlines())
+                else:
+                    self.assertNotIn("memories =", settings)
+                self.assertNotIn("previous_codex_features_memories", json.loads(restore_file.read_text()))
+        config.write_text(config.read_text().replace("memories = false", "memories = true"))
+        self.cli("disconnect", "codex")
+        self.assertIn("memories = true", config.read_text())
 
     def test_workbuddy_one_click_connect_and_disconnect(self):
         from urllib.error import HTTPError

@@ -416,89 +416,23 @@ def parse_toml_mcp_section(section_text):
     return cmd, args
 
 
-def get_codex_features_memories(toml_text):
-    """Return 'true', 'false', or 'absent' for [features] memories in Codex config.toml."""
-    header_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
+def restore_legacy_codex_memories(toml_text, restore):
+    """Undo the exact setting older versions wrote, if it is still in place."""
+    previous = restore.get("previous_codex_features_memories")
+    if previous not in {"true", "absent"}:
+        return toml_text
+    lines = toml_text.splitlines(keepends=True)
     in_features = False
-    for raw in toml_text.splitlines():
-        s = raw.strip()
-        m = header_re.match(s)
-        if m:
-            in_features = m.group(1).strip() == "features"
-            continue
-        if not in_features or not s or s.startswith("#"):
-            continue
-        key, sep, val = s.partition("=")
-        if sep and key.strip() == "memories":
-            v = val.split("#", 1)[0].strip().lower()
-            if v in {"true", "false"}:
-                return v
-            return v
-    return "absent"
-
-
-def set_codex_features_memories(toml_text, desired_state):
-    """Set or remove memories key inside [features] in Codex config.toml.
-
-    desired_state: 'false', 'true', or 'absent' (removes key, and removes empty [features]).
-    """
-    header_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
-    lines = toml_text.splitlines()
-    feat_idx = None
-    feat_end = len(lines)
-    mem_line_idx = None
-
-    for idx, raw in enumerate(lines):
-        m = header_re.match(raw.strip())
-        if m:
-            if feat_idx is not None:
-                feat_end = idx
-                break
-            if m.group(1).strip() == "features":
-                feat_idx = idx
-            continue
-        if feat_idx is not None:
-            s = raw.strip()
-            if s and not s.startswith("#"):
-                k, sep, _ = s.partition("=")
-                if sep and k.strip() == "memories":
-                    mem_line_idx = idx
-
-    if desired_state == "absent":
-        if mem_line_idx is None:
-            return toml_text
-        del lines[mem_line_idx]
-        # Check if [features] now has zero keys
-        has_other_keys = False
-        for idx in range(feat_idx + 1, feat_end - 1):
-            s = lines[idx].strip()
-            if s and not s.startswith("#"):
-                has_other_keys = True
-                break
-        if not has_other_keys:
-            del lines[feat_idx:feat_end - 1]
-        out = "\n".join(lines).strip()
-        return out + "\n" if out else ""
-
-    new_kv = f"memories = {desired_state}"
-    if feat_idx is not None:
-        if mem_line_idx is not None:
-            lines[mem_line_idx] = new_kv
-        else:
-            lines.insert(feat_idx + 1, new_kv)
-        return "\n".join(lines).rstrip() + "\n"
-
-    # Insert [features] cleanly before managed MCP block if present, else append
-    block_pos = toml_text.find(TOML_START)
-    if block_pos == -1:
-        block_pos = toml_text.find(TOML_SECTION_HEADER)
-    feat_section = f"[features]\n{new_kv}\n"
-    if block_pos != -1:
-        head = toml_text[:block_pos].rstrip()
-        tail = toml_text[block_pos:].lstrip("\n")
-        return (f"{head}\n\n{feat_section}\n{tail}" if head else f"{feat_section}\n{tail}")
-    prefix = toml_text.rstrip()
-    return f"{prefix}\n\n{feat_section}" if prefix else feat_section
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            in_features = line.split("#", 1)[0].strip() == "[features]"
+        elif in_features and line.rstrip("\r\n") == "memories = false":
+            if previous == "true":
+                lines[index] = line.replace("false", "true")
+            else:
+                del lines[index]
+            return "".join(lines)
+    return toml_text
 
 
 def scan_stray_agent_memories(home=None):
@@ -1016,19 +950,19 @@ def inspect_agent(agent_id, spec):
         if mcp_path.is_file():
             text = mcp_path.read_text(encoding="utf-8")
             sec = extract_toml_section(text)
-            feat_mem = get_codex_features_memories(text)
             if sec is None:
                 mcp_state = "unmanaged"
             else:
                 cmd, args = parse_toml_mcp_section(sec[1])
-                if cmd == exp_cmd and args == exp_args and feat_mem == "false":
+                if cmd == exp_cmd and args == exp_args:
                     mcp_state = "managed"
                 else:
                     mcp_state = "drifted"
                     if cmd != exp_cmd or args != exp_args:
                         issues.append("Codex [mcp_servers.unified_memory] drifted")
-                    if feat_mem != "false":
-                        issues.append(f"Codex native [features] memories={feat_mem} (should be false to prevent split-brain)")
+                if restore_legacy_codex_memories(text, restore) != text:
+                    mcp_state = "drifted"
+                    issues.append("此版本可恢复此前接入时被关闭的 Codex 记忆设置，请点「同步」。")
         else:
             mcp_state = "missing"
 
@@ -1174,11 +1108,10 @@ def connect_agent(agent_id, spec, dry_run=False):
         else:
             toml_text = mcp_path.read_text(encoding="utf-8") if mcp_path.is_file() else ""
             orig_toml = toml_text
-            if "previous_codex_features_memories" not in restore:
-                restore["previous_codex_features_memories"] = get_codex_features_memories(toml_text)
-            if get_codex_features_memories(toml_text) != "false":
-                toml_text = set_codex_features_memories(toml_text, "false")
-                changes.append(f"set [features] memories = false in {mcp_path}")
+            toml_text = restore_legacy_codex_memories(toml_text, restore)
+            if toml_text != orig_toml:
+                changes.append(f"restored the previous Codex memory setting in {mcp_path}")
+            restore.pop("previous_codex_features_memories", None)
 
             block = desired_toml_block()
             exp_cmd, exp_args = desired_mcp_args()
@@ -1299,10 +1232,10 @@ def disconnect_agent(agent_id, spec, force=False):
                 else:
                     text = base
                     changes.append(f"removed {TOML_SECTION_HEADER} from {mcp_path}")
-            prev_feat_mem = restore.get("previous_codex_features_memories")
-            if prev_feat_mem in {"true", "false", "absent"}:
-                text = set_codex_features_memories(text, prev_feat_mem)
-                changes.append(f"restored [features] memories -> {prev_feat_mem} in {mcp_path}")
+            restored_text = restore_legacy_codex_memories(text, restore)
+            if restored_text != text:
+                changes.append(f"restored the previous Codex memory setting in {mcp_path}")
+            text = restored_text
             if text != orig_toml:
                 atomic_write(mcp_path, text)
 
