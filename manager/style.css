@@ -12,10 +12,11 @@
     --line: #e2e8f0;
     --line-strong: #cbd5e1;
 
-    --primary: #0f766e;
-    --primary-hover: #115e59;
-    --primary-soft: #f0fdfa;
-    --primary-border: #99f6e4;
+    --primary: #0169cc;
+    --primary-hover: #004f99;
+    --primary-soft: #e5f3ff;
+    --primary-border: #cce6ff;
+    --on-primary: #fff;
 
     --l0-fg: #be123c;
     --l0-bg: #fff1f2;
@@ -137,7 +138,7 @@
     block-size: 2rem;
     border-radius: 0.5rem;
     background: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     font-weight: 750;
     font-size: 0.95rem;
     letter-spacing: -0.02em;
@@ -172,7 +173,7 @@
   }
   .mode-tab:hover { color: var(--text); text-decoration: none; }
   .mode-tab[aria-current="page"] {
-    background: var(--surface);
+    background: var(--primary-soft);
     color: var(--primary);
     box-shadow: var(--shadow-sm);
   }
@@ -197,8 +198,8 @@
     text-decoration: none;
   }
   .lib-pills a[aria-current="page"] {
-    background: var(--surface);
-    color: var(--text);
+    background: var(--primary-soft);
+    color: var(--primary);
     font-weight: 600;
     box-shadow: var(--shadow-sm);
   }
@@ -232,7 +233,7 @@
 
   .btn-primary {
     background: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border-color: var(--primary);
   }
   .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
@@ -397,12 +398,6 @@
 
   .ops-flat { display: grid; gap: 0.85rem; }
   .ops-flat :is(.agents-global-actions, .agent-btns) .btn { min-block-size: 2rem; }
-  .ops-flat :is(.agents-global-actions, .agent-btns) .btn-primary {
-    background: var(--text);
-    border-color: var(--text);
-    color: var(--bg);
-  }
-  .ops-flat :is(.agents-global-actions, .agent-btns) .btn-primary:hover { opacity: 0.86; }
 
   .settings-view :is(.sidebar, .agents-section) { display: none; }
   .settings-view .workspace { grid-template-columns: minmax(0, 1fr); max-inline-size: 60rem; }
@@ -491,14 +486,15 @@
     text-decoration: none;
   }
   .pill-tab[aria-current="page"] {
-    background: var(--text);
-    color: #fff;
-    border-color: var(--text);
+    background: var(--primary-soft);
+    color: var(--primary);
+    border-color: var(--primary-border);
   }
   .pill-count {
     font-size: 0.7rem;
     opacity: 0.8;
   }
+  .pill-tab[aria-current="page"] .pill-count { opacity: 1; }
 
   .segment-row {
     display: grid;
@@ -533,8 +529,8 @@
   }
   .seg-link:hover { color: var(--text); text-decoration: none; }
   .seg-link[aria-current="page"] {
-    background: var(--surface);
-    color: var(--text);
+    background: var(--primary-soft);
+    color: var(--primary);
     font-weight: 650;
     box-shadow: var(--shadow-sm);
   }
@@ -590,12 +586,6 @@
     border-color: var(--primary-border);
     font-weight: 650;
   }
-  .pill-tab-recent[aria-current="page"] {
-    background: var(--primary);
-    color: #fff;
-    border-color: var(--primary);
-  }
-
   .entry-list {
     list-style: none;
     margin: 0;
