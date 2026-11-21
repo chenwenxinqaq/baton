@@ -867,6 +867,32 @@ os.execv(git, [git, *args])
                 self.assertIn("同步完成", finish(location))
                 subprocess.run([git, "-C", str(bare), "cat-file", "-e", "main:MEMORY.md"], check=True)
 
+                # The same GitHub authorization can run inline while normal pages are usable.
+                (self.home / "session").unlink()
+                request = Request(address + "/sync", data=urlencode({"csrf": csrf, "library": "primary"}).encode(),
+                                  headers={"Accept": "application/json"})
+                def start_inline():
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 202)
+                        return json.load(response)["id"]
+
+                def inline_status():
+                    with urlopen(address + "/sync_jobs", timeout=5) as response:
+                        return json.load(response)[0]
+
+                job_id = start_inline()
+                self.assertEqual(start_inline(), job_id)
+                with urlopen(address + "/?view=clients", timeout=5) as response:
+                    self.assertIn('id="sync-notices"', response.read().decode())
+                self.assertEqual(inline_status()["state"], "running")
+                answer.write_text("allow")
+                deadline = time.monotonic() + 15
+                status = inline_status()
+                while status["state"] == "running" and time.monotonic() < deadline:
+                    time.sleep(.05)
+                    status = inline_status()
+                self.assertEqual((status["id"], status["state"]), (job_id, "success"))
+
                 location, _ = post("/mount_add", git_url=url, mode="ro", layer_L1="1", layer_L3="1")
                 self.assertIn("共享记忆库已挂载", finish(location))
                 self.assertTrue((self.home / "UnifiedMemory-Shared/team-team/MEMORY.md").is_file())

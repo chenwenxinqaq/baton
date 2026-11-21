@@ -109,7 +109,123 @@
     });
   }
 
-  // 5. Prevent accidental double-submission after form validation succeeds.
+  const syncNotices = document.getElementById("sync-notices");
+  const syncCards = new Map();
+  let dismissedJobs = [];
+  try {
+    const storedJobs = JSON.parse(sessionStorage.getItem("dismissed-sync-jobs"));
+    if (Array.isArray(storedJobs)) dismissedJobs = storedJobs;
+  } catch {
+    // Status notifications still work when storage is unavailable.
+  }
+
+  function renderSyncNotice(job) {
+    if (dismissedJobs.includes(job.id)) return;
+    const previous = syncCards.get(job.id);
+    const snapshot = JSON.stringify(job);
+    if (previous?.snapshot === snapshot) return;
+
+    const card = document.createElement("div");
+    card.className = "sync-notice";
+    card.dataset.state = job.state;
+    const indicator = document.createElement("span");
+    indicator.className = "sync-notice-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = job.label ? `${job.title} · ${job.label}` : job.title;
+    copy.append(title);
+    if (job.message) {
+      const message = document.createElement("p");
+      message.textContent = job.message;
+      copy.append(message);
+    }
+    if (job.link) {
+      const link = document.createElement("a");
+      link.href = job.link;
+      link.textContent = job.link_text;
+      copy.append(link);
+    }
+    card.append(indicator, copy);
+    if (job.state !== "running") {
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "sync-notice-dismiss";
+      dismiss.setAttribute("aria-label", `关闭通知：${title.textContent}`);
+      dismiss.textContent = "×";
+      dismiss.addEventListener("click", () => {
+        dismissedJobs = [...dismissedJobs, job.id].slice(-32);
+        try { sessionStorage.setItem("dismissed-sync-jobs", JSON.stringify(dismissedJobs)); } catch {}
+        card.remove();
+        syncCards.delete(job.id);
+      });
+      card.append(dismiss);
+    }
+    if (previous) previous.card.replaceWith(card);
+    else syncNotices.prepend(card);
+    syncCards.set(job.id, { snapshot, card });
+  }
+
+  let syncPollTimer;
+  let syncPollVersion = 0;
+  async function watchSyncJobs() {
+    clearTimeout(syncPollTimer);
+    const version = ++syncPollVersion;
+    if (document.hidden) return;
+    let delay = 8000;
+    try {
+      const response = await fetch("/sync_jobs");
+      if (!response.ok) throw new Error("Sync status unavailable");
+      const jobs = await response.json();
+      if (version !== syncPollVersion) return;
+      const current = new Set(jobs.map(job => job.id));
+      for (const [id, entry] of syncCards) {
+        if (id !== "submit-error" && !current.has(id)) {
+          entry.card.remove();
+          syncCards.delete(id);
+        }
+      }
+      for (const job of jobs) renderSyncNotice(job);
+      if (jobs.some(job => job.state === "running")) delay = 1200;
+    } catch {
+      if (syncCards.size) delay = 2000;
+    }
+    if (version === syncPollVersion && !document.hidden) {
+      syncPollTimer = setTimeout(watchSyncJobs, delay);
+    }
+  }
+
+  async function submitBackgroundSync(form, submitter) {
+    const body = new URLSearchParams(new FormData(form));
+    if (submitter.name) body.append(submitter.name, submitter.value);
+    submitter.disabled = true;
+    try {
+      const response = await fetch(new URL(form.action).pathname, {
+        method: "POST", headers: { Accept: "application/json" }, body, keepalive: true,
+      });
+      if (response.status !== 202) {
+        const detail = response.headers.get("Content-Type")?.startsWith("application/json")
+          ? (await response.json()).error : "请刷新页面后重试。";
+        throw new Error(detail);
+      }
+      syncCards.get("submit-error")?.card.remove();
+      syncCards.delete("submit-error");
+    } catch (error) {
+      dismissedJobs = dismissedJobs.filter(id => id !== "submit-error");
+      renderSyncNotice({ id: "submit-error", state: "error", title: "无法启动同步", message: error.message });
+    } finally {
+      submitter.disabled = false;
+      watchSyncJobs();
+    }
+  }
+
+  if (syncNotices) {
+    watchSyncJobs();
+    document.addEventListener("visibilitychange", watchSyncJobs);
+    window.addEventListener("pageshow", event => { if (event.persisted) watchSyncJobs(); });
+  }
+
+  // Keep sync in the background and prevent double-submission of other forms.
   for (const form of document.querySelectorAll("form[method='post'], form[method='POST']")) {
     form.addEventListener("submit", (event) => {
       if (!form.checkValidity()) return;
@@ -117,6 +233,12 @@
         event.submitter instanceof HTMLButtonElement
           ? event.submitter
           : form.querySelector("button[type='submit']");
+      const action = new URL(form.action).pathname;
+      if (syncNotices && submitter && (action === "/sync" || (action === "/sync_setup" && submitter.value === "sync"))) {
+        event.preventDefault();
+        if (!submitter.disabled) submitBackgroundSync(form, submitter);
+        return;
+      }
       if (submitter) {
         requestAnimationFrame(() => {
           submitter.disabled = true;

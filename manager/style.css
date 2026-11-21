@@ -1365,6 +1365,78 @@
     border-color: transparent;
   }
 
+  .sync-notices {
+    position: fixed;
+    z-index: 15;
+    inset-inline-end: 1rem;
+    inset-block-end: 1rem;
+    inline-size: min(23rem, calc(100% - 2rem));
+    max-block-size: 45vh;
+    overflow: auto;
+    display: grid;
+    gap: 0.5rem;
+  }
+
+  .sync-notice {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 0.625rem;
+    padding: 0.75rem 0.875rem;
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+    overflow-wrap: anywhere;
+    font-size: 0.85rem;
+  }
+
+  .sync-notice p {
+    margin-block: 0.2rem;
+    color: var(--text-secondary);
+    white-space: pre-line;
+  }
+
+  .sync-notice a { display: inline-block; margin-block-start: 0.2rem; }
+
+  .sync-notice-indicator {
+    inline-size: 0.75rem;
+    block-size: 0.75rem;
+    margin-block-start: 0.3rem;
+    border-radius: 50%;
+    background: var(--l3-fg);
+  }
+
+  .sync-notice[data-state="running"] .sync-notice-indicator {
+    background: transparent;
+    border: 2px solid var(--primary-border);
+    border-inline-start-color: var(--primary);
+    animation: sync-notice-spin 0.8s linear infinite;
+  }
+
+  .sync-notice[data-state="conflict"] .sync-notice-indicator { background: var(--warn-fg); }
+  .sync-notice[data-state="error"] .sync-notice-indicator { background: var(--danger-fg); }
+
+  @keyframes sync-notice-spin { to { transform: rotate(1turn); } }
+  @media (prefers-reduced-motion: reduce) {
+    .sync-notice[data-state="running"] .sync-notice-indicator { animation: none; }
+  }
+
+  .sync-notice-dismiss {
+    min-inline-size: 1.75rem;
+    min-block-size: 1.75rem;
+    border: 0;
+    border-radius: 0.375rem;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font: inherit;
+    font-size: 1.15rem;
+    line-height: 1;
+  }
+
+  .sync-notice-dismiss:hover { background: var(--surface-hover); }
+
   .hub-section-title {
     margin: 0 0 0.25rem;
     font-size: 1rem;

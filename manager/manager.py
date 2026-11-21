@@ -94,6 +94,15 @@ DESKTOP = False
 PAGE_TEMPLATE = Template((APP / "page.html").read_text(encoding="utf-8"))
 
 
+@dataclass(frozen=True)
+class SyncJob:
+    identifier: str
+    outcome: Future
+    action: str
+    interactive: bool
+    inline: bool
+
+
 NAV_ICONS = {
     "library": '<path d="M5 4h11a3 3 0 013 3v13H8a3 3 0 01-3-3z"/><path d="M5 17a3 3 0 013-3h11"/>',
     "activity": '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
@@ -3139,7 +3148,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'self'; script-src 'self'; base-uri 'none'; "
+            "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; "
             "form-action 'self'; frame-ancestors 'none'",
         )
         if location:
@@ -3174,8 +3183,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.known_host():
             self.respond(HTTPStatus.FORBIDDEN, "地址无效。", "text/plain; charset=utf-8")
             return
-        self._refresh_mounts()
         url = urlsplit(self.path)
+        if url.path == "/sync_jobs":
+            self.show_inline_sync_jobs()
+            return
+        self._refresh_mounts()
         if url.path == "/sync_progress":
             self.show_sync_progress(parse_qs(url.query).get("job", [""])[0])
             return
@@ -3431,39 +3443,72 @@ class Handler(BaseHTTPRequestHandler):
 
         self.run_sync_job(key, "验证连接" if read_only else "同步", interactive, perform)
 
+    def wants_inline_sync(self):
+        return self.path in {"/sync", "/sync_setup"} and self.headers.get("Accept") == "application/json"
+
+    def respond_json(self, status, data):
+        self.respond(status, json.dumps(data, ensure_ascii=False), "application/json; charset=utf-8")
+
     def run_sync_job(self, key, action, interactive, perform):
-        if not interactive:
-            self.respond(HTTPStatus.SEE_OTHER, "", location=perform() + "#feedback")
-            return
+        inline = self.wants_inline_sync()
         jobs = self.server.sync_jobs
         previous = jobs.get(key)
-        if previous and not previous[1].done():
-            if previous[2] != action:
+        if previous and not previous.outcome.done():
+            if previous.action != action:
                 raise InvalidEntry("这个库正在验证连接或同步，请待当前操作完成后重试。")
-            job_id = previous[0]
+            job = replace(previous, inline=True) if inline else previous
+            jobs[key] = job
         else:
-            job_id = secrets.token_hex(16)
-            outcome = Future()
-            jobs[key] = (job_id, outcome, action)
+            if not interactive and not inline:
+                self.respond(HTTPStatus.SEE_OTHER, "", location=perform() + "#feedback")
+                return
+            job = SyncJob(secrets.token_hex(16), Future(), action, interactive, inline)
+            jobs[key] = job
 
             def run():
                 try:
-                    outcome.set_result(perform())
+                    job.outcome.set_result(perform())
                 except Exception as exc:
-                    outcome.set_exception(exc)
+                    job.outcome.set_exception(exc)
 
-            threading.Thread(target=run, daemon=True, name="github-sync").start()
-        self.respond(HTTPStatus.SEE_OTHER, "", location="/sync_progress?job=" + job_id)
+            threading.Thread(target=run, daemon=True, name="library-sync").start()
+        if inline:
+            self.respond_json(HTTPStatus.ACCEPTED, {"id": job.identifier})
+        else:
+            self.respond(HTTPStatus.SEE_OTHER, "", location="/sync_progress?job=" + job.identifier)
+
+    def show_inline_sync_jobs(self):
+        jobs = []
+        for key, job in self.server.sync_jobs.items():
+            if not job.inline:
+                continue
+            library = self.server.libraries.get(key)
+            destination = query(library=key if library else "primary", view="sync_hub")
+            status = {"id": job.identifier, "label": library.label if library else "记忆库"}
+            if not job.outcome.done():
+                message = "如果浏览器打开了 GitHub 授权页，请在浏览器中完成。" if job.interactive else "可以继续使用记忆库。"
+                status.update(state="running", title="正在同步", message=message)
+            elif job.outcome.exception() is not None:
+                status.update(state="error", title="同步未完成", message=str(job.outcome.exception()),
+                              link=destination, link_text="返回同步")
+            else:
+                result = job.outcome.result()
+                if parse_qs(urlsplit(result).query).get("notice") == ["synced_conflicts"]:
+                    status.update(state="conflict", title="同步有冲突", link=result + "#feedback", link_text="处理冲突")
+                else:
+                    status.update(state="success", title="同步完成", link=destination, link_text="查看同步")
+            jobs.append(status)
+        self.respond_json(HTTPStatus.OK, jobs)
 
     def show_sync_progress(self, job_id):
-        for key, (identifier, outcome, action) in self.server.sync_jobs.items():
-            if identifier != job_id:
+        for key, job in self.server.sync_jobs.items():
+            if job.identifier != job_id:
                 continue
-            if not outcome.done():
+            if not job.outcome.done():
                 # A POST redirect inherits the form's #feedback. Poll a fragment-free URL
                 # so Chromium requests the job result instead of scrolling the same page.
-                progress_url = "/sync_progress?" + urlencode({"job": identifier})
-                title = escape(f"正在{action}")
+                progress_url = "/sync_progress?" + urlencode({"job": job.identifier})
+                title = escape(f"正在{job.action}")
                 back_url = escape(query(library=key if key in self.server.libraries else "primary", view="sync_hub"))
                 content = f"""<!doctype html>
 <html lang="zh-CN">
@@ -3500,7 +3545,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.OK, content)
             else:
                 try:
-                    location = outcome.result()
+                    location = job.outcome.result()
                 except Exception as exc:
                     self.page(HTTPStatus.CONFLICT, key=key if key in self.server.libraries else "primary",
                               view="sync_hub", error=f"操作未完成：{exc}")
@@ -3521,8 +3566,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path in {"/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
                 target = fields.get("target_library") or fields.get("mount_id")
                 target = "primary" if target == "personal" else target
-                for job_key, (_, outcome, action) in self.server.sync_jobs.items():
-                    if not outcome.done() and (action == "挂载共享库" or job_key == target):
+                for job_key, job in self.server.sync_jobs.items():
+                    if not job.outcome.done() and (job.action == "挂载共享库" or job_key == target):
                         raise InvalidEntry("正在连接或同步，请完成后再修改仓库配置。")
             if self.path == "/skill":
                 folder = fields.get("folder", "")
@@ -3722,6 +3767,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise InvalidEntry("不支持的控制操作。")
         except (RuntimeError, ValueError, OSError, SystemExit) as exc:
+            if self.wants_inline_sync():
+                self.respond_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
             err_view = "clients" if self.path == "/agent" and not return_tab else ""
             err_topic = ""
             if self.path in {"/sync", "/sync_test", "/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
