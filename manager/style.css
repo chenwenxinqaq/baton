@@ -397,8 +397,10 @@
 
   .agent-btns {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.35rem;
     flex-shrink: 0;
+    max-inline-size: 100%;
   }
 
   /* Main 2-column Workspace */

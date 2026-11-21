@@ -227,7 +227,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 csrf = re.search(r'name="csrf" value="([^"]+)"', clients)[1]
 
                 def post(**fields):
-                    request = Request(base + "/codex_import", data=urlencode(dict(csrf=csrf, **fields)).encode(),
+                    request = Request(base + "/memory_import", data=urlencode(dict(csrf=csrf, **fields)).encode(),
                                       headers={"Origin": base})
                     with urlopen(request, timeout=8) as response:
                         return response.read().decode()
@@ -241,10 +241,10 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertEqual({p: p.read_bytes() for p in initial_db}, initial_db)
                 self.assertEqual(self.tool("memory_search", {"query": "杜鹃候选记忆"}), [])
                 self.assertEqual(list(self.library.glob("imported")), [])
-                filtered = get("/?view=codex_import&" + urlencode({"q": "杜鹃候选记忆"}))
+                filtered = get("/?view=memory_import&" + urlencode({"q": "杜鹃候选记忆"}))
                 self.assertNotIn("摘要回退", filtered)
                 path = re.search(r"topic=(codex-import-[0-9a-f]{32})", filtered)[1]
-                review = get("/?view=codex_import&topic=" + path)
+                review = get("/?view=memory_import&topic=" + path)
                 self.assertIn("杜鹃候选记忆", review)
                 self.assertNotIn("旧版重复原文", review)
                 revision = re.search(r'name="revision" value="([^"]+)"', review)[1]
@@ -257,7 +257,7 @@ class PublicFrameworkTests(unittest.TestCase):
                     post(**request, revision=revision)
                 self.assertEqual(missing_layer.exception.code, 409)
                 self.assertEqual(memory_index.read_bytes(), initial_index)
-                self.assertIn("已将确认后的 Codex 记忆归入个人记忆库", post(**request, layer="L3", revision=revision))
+                self.assertIn("已将确认后的记忆归入个人记忆库", post(**request, layer="L3", revision=revision))
                 hits = self.tool("memory_search", {"query": "杜鹃候选记忆"})
                 self.assertEqual([hit["path"] for hit in hits], [f"projects/{path}.md"])
                 topic = (self.library / hits[0]["path"]).read_text()
@@ -265,10 +265,58 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertIn("2025-01-01", topic)
                 self.assertIn("same-thread", topic)
                 self.assertIn("新增 0 条", post(op="import"))
-                self.assertIn("待确认 · 1 条", get("/?view=codex_import"))
+                self.assertIn("待确认 · 1 条", get("/?view=memory_import"))
             finally:
                 manager.stdin.close()
                 manager.wait(timeout=8)
+
+    def test_memory_import_for_other_clients(self):
+        claude = self.home / ".claude/projects/sample/memory"
+        claude.mkdir(parents=True)
+        (claude / "MEMORY.md").write_text("- [fixture](fixture.md)")
+        (claude / "fixture.md").write_text("Claude 索引之外的正文")
+        (claude.parent / "session.jsonl").write_text("原始会话不应被导入")
+        configured = self.home / "custom-claude-memory"
+        configured.mkdir()
+        (configured / "MEMORY.md").write_text("自定义 Claude 记忆目录")
+        (self.home / ".claude/settings.json").write_text(json.dumps({"autoMemoryDirectory": str(configured)}))
+        for app in ("antigravity", "antigravity-ide"):
+            knowledge = self.home / f".gemini/{app}/knowledge/sample/artifacts"
+            knowledge.mkdir(parents=True)
+            (knowledge / "knowledge.md").write_text(f"{app} 客户端知识标记")
+        initial = (self.library / "MEMORY.md").read_bytes()
+        self.assertEqual(self.cli("import-memory", "claude")["added"], 2)
+        self.assertEqual(self.cli("import-memory", "antigravity")["added"], 2)
+        self.assertEqual(self.cli("import-memory", "claude")["added"], 0)
+        codebuddy_file = self.home / "MEMORY.md"
+        codebuddy_file.write_text("WorkBuddy 文件导入样本")
+        self.assertEqual(self.cli("import-memory", "workbuddy", "--file", str(codebuddy_file))["added"], 1)
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=self.environment()) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+
+                def queue(client):
+                    with urlopen(base + f"/?view=memory_import&client={client}", timeout=5) as response:
+                        return response.read().decode()
+
+                cursor = queue("cursor")
+                self.assertIn("选择记忆文件", cursor)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', cursor)[1]
+                fields = dict(csrf=csrf, client="cursor", op="text", title="Cursor 导入标题", body="Cursor 原文标记")
+                request = Request(base + "/memory_import", data=urlencode(fields).encode(), headers={"Origin": base})
+                with urlopen(request, timeout=8) as response:
+                    self.assertIn("新增 1 条", response.read().decode())
+                self.assertIn("Cursor 导入标题", queue("cursor"))
+                self.assertIn("待确认 · 1 条", queue("workbuddy"))
+                self.assertIn("待确认 · 2 条", queue("claude"))
+                self.assertIn("待确认 · 2 条", queue("antigravity"))
+                self.assertNotIn("Cursor 导入标题", queue("workbuddy"))
+                self.assertEqual((self.library / "MEMORY.md").read_bytes(), initial)
+                self.assertEqual(self.tool("memory_search", {"query": "Cursor 原文标记"}), [])
+                self.assertEqual(codebuddy_file.read_text(), "WorkBuddy 文件导入样本")
+            finally:
+                manager.terminate()
 
     def test_writing_policy_reaches_clients_without_private_index(self):
         index = self.library / "MEMORY.md"

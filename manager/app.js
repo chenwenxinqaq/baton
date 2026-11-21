@@ -124,4 +124,40 @@
       }
     });
   }
+
+  for (const input of document.querySelectorAll("[data-import-file]")) {
+    input.closest("[data-import-file-picker]").hidden = false;
+    const form = input.form;
+    const status = form.querySelector("[data-import-file-status]");
+    const title = form.elements.namedItem("title");
+    const body = form.elements.namedItem("body");
+    const button = form.querySelector('button[type="submit"]');
+    input.addEventListener("change", async () => {
+      const [file] = input.files;
+      if (!file) {
+        button.disabled = false;
+        return;
+      }
+      button.disabled = true;
+      try {
+        if (!/\.(md|mdc|txt)$/i.test(file.name) || file.size > body.maxLength * 4) {
+          throw new Error("请选择大小合适的 Markdown 或纯文本文件。");
+        }
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+        if (file !== input.files[0]) return;
+        if (text.length > body.maxLength || !text.trim() || text.includes("\0")) {
+          throw new Error("文件为空、过长或包含无法导入的字符。");
+        }
+        title.value = file.name.replace(/\.[^.]+$/, "").slice(0, title.maxLength);
+        body.value = text;
+        status.textContent = "已载入文件，可以核对后加入待确认。";
+      } catch (error) {
+        if (file === input.files[0]) {
+          status.textContent = error instanceof TypeError ? "文件须为 UTF-8 文本。" : error.message;
+        }
+      } finally {
+        if (file === input.files[0]) button.disabled = false;
+      }
+    });
+  }
 })();

@@ -32,7 +32,7 @@ PUBLIC_FILES = (
     "manager/style.css",
     "mcp/server.py",
     "scripts/library_paths.py",
-    "scripts/codex_import.py",
+    "scripts/memory_import.py",
     "scripts/memoryctl.py",
     "scripts/package_release.py",
     "scripts/sync_git.py",

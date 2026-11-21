@@ -1830,6 +1830,9 @@ def main():
 
     sub.add_parser("install-shims", help="Create or refresh the stable launchers client configs point at.")
     sub.add_parser("import-codex", help="Copy Codex memories into the local review queue.")
+    p_import = sub.add_parser("import-memory", help="Add existing client memories to the local review queue.")
+    p_import.add_argument("client", choices=tuple(agent_specs()))
+    p_import.add_argument("--file", type=Path, help="A UTF-8 memory file to import.")
     sub.add_parser("interface", help="Emit machine-readable paths and capabilities.")
 
     p_rb = sub.add_parser("rebuild-index", help="Deterministically rebuild MEMORY.md index from disk entries.")
@@ -2018,12 +2021,19 @@ def main():
                 indent=2,
             )
         )
-    elif args.command == "import-codex":
-        from codex_import import import_memories
+    elif args.command in {"import-codex", "import-memory"}:
+        from memory_import import import_memories, import_text
 
         if not (MEMORY_ROOT / "MEMORY.md").is_file():
             parser.error("Initialize the personal library first with umem init.")
-        print(json.dumps(import_memories(MEMORY_ROOT), ensure_ascii=False, indent=2))
+        client = getattr(args, "client", "codex")
+        source = getattr(args, "file", None)
+        try:
+            report = (import_text(MEMORY_ROOT, client, source.stem, source.read_text(encoding="utf-8"))
+                      if source else import_memories(MEMORY_ROOT, client))
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     elif args.command == "agent" and args.agent_cmd == "list":
         reports = [inspect_agent(aid, spec) for aid, spec in agent_specs().items()]
         print(json.dumps({"agents": reports}, ensure_ascii=False, indent=2))

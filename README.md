@@ -63,13 +63,21 @@ python3 manager/manager.py
 
 ## 接入客户端
 
-### 导入 Codex 已有记忆
+### 导入客户端已有记忆
 
-接入 Codex 会保留它现有的记忆开关。旧版接入时曾关闭此功能的用户，可以在「客户端接入」点 Codex 旁的「同步」，恢复可识别的旧设置。
+打开「客户端接入」，在客户端对应行使用「一键导入记忆」或「待确认与导入」。接入保留客户端自己的记忆设置。旧版本曾关闭 Codex 记忆时，「同步」可恢复仍由旧版管理的设置。
 
-在同一行点「一键导入记忆」，应用会读取 Codex 生成的 v1/v2 记忆及本地会话摘要，按会话去重。只有汇总文件时，会将汇总作为一份待确认条目。导入的副本保存在本机的待确认区，可以在管理页搜索和查看。挑选需要长期保存的内容，编辑后选择 L0–L4，再点「确认归入所选层」。待确认区独立于个人库的索引、MCP 和 Git 同步。归层后的条目会随个人库同步。
+| 客户端 | 导入来源 |
+| --- | --- |
+| Codex | 自动读取 v1/v2 本地会话记忆和摘要，按会话去重。仅保留汇总时可导入汇总。 |
+| Claude Code | 自动读取本机各项目的 Auto Memory，以及用户设置中指定的 `autoMemoryDirectory`。 |
+| Antigravity | 自动读取本机 Antigravity 和 Antigravity IDE 的 `knowledge/` Markdown。 |
+| Cursor | 粘贴「设置 → Rules」里保存的记忆，或选择想导入的 `.mdc` 文件。 |
+| WorkBuddy | 粘贴「设置 → 记忆与进化」的内容，或选择工作空间的 `MEMORY.md`。 |
 
-命令行可运行 `umem import-codex` 将原有记忆加入同一个待确认区，再通过管理页逐条核对。
+五个客户端都可导入 UTF-8 的 Markdown 或纯文本。待确认的副本留在本机，支持按来源搜索。核对原文并选定 L0–L4 后，点「确认归入所选层」写入个人库。此时该条才进入普通搜索和个人库 Git 同步。
+
+命令行可以运行 `umem import-memory codex`、`umem import-memory claude` 或 `umem import-memory antigravity` 扫描本机。选择文件时用 `umem import-memory cursor --file memory.md`，客户端名称可换成表中任意一项对应的 `codex`、`claude`、`cursor`、`workbuddy` 或 `antigravity`。归层在管理页完成。
 
 ### WorkBuddy 和其他客户端
 
