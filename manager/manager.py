@@ -1353,7 +1353,6 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             state = info["state"]
             if state == "managed":
                 managed_count += 1
-                item_cls = "agent-item agent-item-managed"
                 pill_cls = "status-pill status-pill-managed"
                 pill_txt = "● 已配置"
                 btn_html = f"""
@@ -1364,7 +1363,6 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                   </form>"""
             elif state in {"drifted", "partial"}:
                 drifted_count += 1
-                item_cls = "agent-item agent-item-drifted"
                 pill_cls = "status-pill status-pill-drifted"
                 pill_txt = "▲ 待同步"
                 btn_html = f"""
@@ -1379,7 +1377,6 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                     <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
                   </form>"""
             else:
-                item_cls = "agent-item"
                 pill_cls = "status-pill"
                 pill_txt = "○ 未接入"
                 btn_html = f"""
@@ -1391,9 +1388,11 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
 
             if aid in memory_import.CLIENTS and key == "primary":
                 inbox_link = escape(query(view="memory_import", client=aid) + "#detail-title")
+                label = "导入记忆"
                 if aid in memory_import.AUTOMATIC_CLIENTS:
                     btn_html += render_native_import_button(token, aid)
-                btn_html += f'<a class="btn btn-ghost btn-compact" href="{inbox_link}">待确认与导入</a>'
+                    label = "待确认记忆"
+                btn_html += f'<a class="btn btn-ghost btn-compact" href="{inbox_link}">{label}</a>'
             comp = info["components"]
             sk_comp = comp.get("skill", {})
             sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
@@ -1412,7 +1411,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             )
             cards.append(
                 f"""
-            <div class="{item_cls}">
+            <li class="agent-item">
               <div class="agent-info">
                 <div class="agent-name-row">
                   <strong>{escape(info["name"])}</strong>
@@ -1422,7 +1421,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 {issue_html}
               </div>
               <div class="agent-btns">{btn_html}</div>
-            </div>"""
+            </li>"""
             )
 
         connect_all_btn = ""
@@ -1464,30 +1463,26 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 f'<a href="{escape(c_href)}">进入可视化对比合并 →</a></p>'
             )
 
-        body_html = f"""
-              <div class="agents-ribbon-top">
-                <div class="agents-title-row">
-                  <h2>跨 Agent 统一接入控制</h2>
-                  <span class="agents-subtitle">· 状态反映本机配置与技能软链接；是否真在调用，看「读写动态」</span>
-                </div>
-                <div class="agents-global-actions">
+        actions_html = f"""
+                <div class="agents-global-actions" role="group" aria-label="客户端管理操作">
                   {connect_all_btn}
                   {rebuild_btn}
                   <form method="post" action="/doctor#feedback">
                     {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
                     <button class="btn btn-secondary btn-compact" type="submit">自检修复</button>
                   </form>
-                </div>
-              </div>
-              <div class="agents-cards">{"".join(cards)}</div>"""
+                </div>"""
+        clients_html = f'<ul class="agents-cards" aria-label="跨 Agent 统一接入控制">{"".join(cards)}</ul>'
         if flat:
-            # Desktop "client access" page: the page itself is the panel, so no collapsible wrapper.
             return f"""
         <div class="ops-flat">
-          <div class="check-chips">{sync_chips}{agent_chip}</div>
+          <div class="agents-ribbon-top">
+            <div class="check-chips">{sync_chips}{agent_chip}</div>
+            {actions_html}
+          </div>
           {conflict_banner}
           {stray_alert}
-          {body_html}
+          {clients_html}
         </div>"""
         return f"""
         <div class="ops-strip">
@@ -1506,7 +1501,9 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
               <span>客户端接入与运维面板（{managed_count}/{len(specs)} 客户端已配置）</span>
               <span class="ops-drawer-hint">展开管理 ▾</span>
             </summary>
-            <div class="ops-drawer-body">{body_html}
+            <div class="ops-drawer-body">
+              <div class="agents-ribbon-top">{actions_html}</div>
+              {clients_html}
             </div>
           </details>
         </div>"""
@@ -1577,7 +1574,7 @@ def render_memory_import(token, library, client, selected, q, draft):
     automatic = render_native_import_button(token, client) if client in memory_import.AUTOMATIC_CLIENTS else ""
     guidance = IMPORT_INSTRUCTIONS.get(client, "也可选择记忆文件或直接粘贴原文。")
     return f"""
-      <section>
+      <section class="import-review">
         <nav class="sort-switch" aria-label="记忆来源">{tabs}</nav>
         <p>待确认的内容只保存在本机。请核对原文，保留值得长期使用的部分后再归层。</p>
         {automatic}
@@ -2553,6 +2550,7 @@ def render_skills_tab(
 
     return load_template().substitute(
         **(desktop_navigation(key, "skills") if DESKTOP else {}),
+        page_class="",
         library=escape(library.label),
         home_link=escape(query(library=key, tab="skills")),
         mode_tabs=mode_tabs,
@@ -3088,6 +3086,7 @@ def render(
 
     return load_template().substitute(
         **(desktop_navigation(key, selected) if DESKTOP else {}),
+        page_class="settings-view" if view in {"clients", "memory_import"} else "",
         library=escape(library.label),
         home_link=escape(home_link),
         mode_tabs=mode_tabs,
