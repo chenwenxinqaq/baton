@@ -522,7 +522,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 with self.subTest(query=query):
                     with urlopen(address + query, timeout=5) as response:
                         page = response.read().decode()
-                    self.assertIn('class="desk"', page)
+                    self.assertRegex(page, r'<body class="desk(?: [^"]*)?">')
                     self.assertIn("读写动态", page)  # desktop navigation present on every page
                     self.assertIn(expected, page)
             self.assertTrue((self.home / "Library/Application Support/Unified Memory/bin/umem-mcp").is_file())
