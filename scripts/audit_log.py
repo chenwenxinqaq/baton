@@ -34,6 +34,8 @@ def normalize_client(name):
         return "unknown"
     if "workbuddy" in low:
         return "WorkBuddy"
+    if "deepseek harness" in low or low == "dsh":
+        return "DeepSeek Harness"
     if "cursor" in low:
         return "Cursor"
     if "codex" in low:

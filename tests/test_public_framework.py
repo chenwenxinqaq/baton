@@ -27,7 +27,8 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("init")
 
     def environment(self, root=None):
-        return {**os.environ, "HOME": str(self.home), "UNIFIED_MEMORY_ROOT": str(root or self.library),
+        return {**os.environ, "HOME": str(self.home), "DSH_HOME": str(self.home / ".dsh"),
+                "UNIFIED_MEMORY_ROOT": str(root or self.library),
                 "PYTHONDONTWRITEBYTECODE": "1"}
 
     def cli(self, *args, root=None):
@@ -74,7 +75,7 @@ class PublicFrameworkTests(unittest.TestCase):
         config.write_text(original, encoding="utf-8")
         self.cli("connect", "all")
         report = self.cli("doctor")
-        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 5)
+        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 6)
         launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
         self.assertIn(str(launcher), config.read_text())  # clients never point at the source tree / app bundle
         self.assertNotIn(str(CODE / "mcp/server.py"), config.read_text())
@@ -270,6 +271,45 @@ class PublicFrameworkTests(unittest.TestCase):
                 manager.stdin.close()
                 manager.wait(timeout=8)
 
+    def test_deepseek_connect_preserves_patch_and_exposes_import(self):
+        dsh_home = self.home / "custom dsh"
+        dsh_home.mkdir()
+        patch = dsh_home / "cordis.patch.yml"
+        original = b"\xef\xbb\xbf---\r\n# keep this comment\r\n  - id: other-plugin\r\n    disabled: !!js false\r\n...\r\n"
+        patch.write_bytes(original)
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        env = {**self.environment(), "DSH_HOME": str(dsh_home)}
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=env) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+                with urlopen(base + "/?view=clients", timeout=5) as response:
+                    page = response.read().decode()
+                self.assertIn("<strong>DeepSeek Harness</strong>", page)
+                self.assertIn("client=deepseek", page)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+
+                def click(op):
+                    data = urlencode(dict(csrf=csrf, target="deepseek", op=op)).encode()
+                    with urlopen(Request(base + "/agent", data=data, headers={"Origin": base}), timeout=8) as response:
+                        return response.read().decode()
+
+                self.assertIn("DeepSeek Harness 配置已保存", click("connect"))
+                configured = patch.read_bytes()
+                self.assertIn(b"\r\n  - insert:\r\n", configured)
+                self.assertIn(b"serverName: unified_memory", configured)
+                self.assertIn(b"    disabled: !!js false\r\n", configured)
+                click("connect")
+                self.assertEqual(patch.read_bytes(), configured)
+                click("disconnect")
+                self.assertEqual(patch.read_bytes(), original)
+                patch.write_text("[] # empty\n")
+                click("connect")
+                self.assertNotIn("\n[]", patch.read_text())
+                click("disconnect")
+                self.assertEqual(patch.read_text(), "[] # empty\n")
+            finally:
+                manager.terminate()
+
     def test_memory_import_for_other_clients(self):
         claude = self.home / ".claude/projects/sample/memory"
         claude.mkdir(parents=True)
@@ -291,6 +331,7 @@ class PublicFrameworkTests(unittest.TestCase):
         codebuddy_file = self.home / "MEMORY.md"
         codebuddy_file.write_text("WorkBuddy 文件导入样本")
         self.assertEqual(self.cli("import-memory", "workbuddy", "--file", str(codebuddy_file))["added"], 1)
+        self.assertEqual(self.cli("import-memory", "deepseek", "--file", str(codebuddy_file))["added"], 1)
         command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
         with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=self.environment()) as manager:
             try:
@@ -311,6 +352,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertIn("待确认 · 1 条", queue("workbuddy"))
                 self.assertIn("待确认 · 2 条", queue("claude"))
                 self.assertIn("待确认 · 2 条", queue("antigravity"))
+                self.assertIn("待确认 · 1 条", queue("deepseek"))
                 self.assertNotIn("Cursor 导入标题", queue("workbuddy"))
                 self.assertEqual((self.library / "MEMORY.md").read_bytes(), initial)
                 self.assertEqual(self.tool("memory_search", {"query": "Cursor 原文标记"}), [])

@@ -1526,6 +1526,7 @@ def render_native_import_button(token, client):
 IMPORT_INSTRUCTIONS = {
     "cursor": "从 Cursor 的记忆管理页复制已保存的记忆，或选择希望导入的 .mdc 规则。",
     "workbuddy": "可在 WorkBuddy「设置 → 记忆与进化」复制要保留的条目，或选择工作空间的 MEMORY.md。",
+    "deepseek": "选择已有的记忆文件，或粘贴想保留的内容。",
 }
 
 
@@ -3238,6 +3239,7 @@ class Handler(BaseHTTPRequestHandler):
             "restored": "手记已恢复生效。",
             "connected": "客户端配置已保存，可在读写动态查看实际调用。",
             "workbuddy_connected": "WorkBuddy 配置已保存。如果当前会话还看不到记忆工具，请重新打开 WorkBuddy 会话。",
+            "deepseek_connected": "DeepSeek Harness 配置已保存。重启 Harness 后，在新会话中试用 Unified Memory。",
             "disconnected": "客户端接入已干净移除，原备份已还原。",
             "doctored": "自检完成，所有可自动修复项已同步对齐。",
             "skill_enabled": "技能已启用并同步到已连通客户端。",
@@ -3685,7 +3687,7 @@ class Handler(BaseHTTPRequestHandler):
                 if op == "connect":
                     for aid, spec in targets:
                         memoryctl.connect_agent(aid, spec)
-                    notice = "workbuddy_connected" if target == "workbuddy" else "connected"
+                    notice = f"{target}_connected" if target in {"workbuddy", "deepseek"} else "connected"
                 elif op == "disconnect":
                     for aid, spec in targets:
                         memoryctl.disconnect_agent(aid, spec)

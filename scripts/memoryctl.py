@@ -454,6 +454,7 @@ def scan_stray_agent_memories(home=None):
 def agent_specs(home=None):
     """Return per-agent paths and detection rules."""
     home = home or Path.home()
+    dsh_home = Path(os.environ.get("DSH_HOME") or home / ".dsh").expanduser()
     return {
         "claude": {
             "name": "Claude Code",
@@ -504,6 +505,12 @@ def agent_specs(home=None):
             "legacy_mcp_json": home / ".gemini" / "config" / "mcp_config.json",
             "legacy_skill_link": home / ".gemini" / "config" / "skills" / "unified-memory",
         },
+        "deepseek": {
+            "name": "DeepSeek Harness",
+            "mode": "dsh_patch",
+            "detect_paths": [dsh_home],
+            "mcp_path": dsh_home / "cordis.patch.yml",
+        },
     }
 
 
@@ -527,6 +534,116 @@ def save_restore(agent_id, payload):
 def desired_mcp_args():
     """Return (command, args) for the MCP server: always the stable launcher, never a bundle path."""
     return str(shim_path("umem-mcp")), ["--memory-root", str(MEMORY_ROOT)]
+
+
+DSH_START = "# unified-memory:managed:start"
+DSH_END = "# unified-memory:managed:end"
+DSH_EMPTY = "# unified-memory:original-empty-sequence "
+DSH_BLOCK = re.compile(
+    rf"^(?P<indent> *){DSH_START}\r?\n(?:.*\n)*?^(?P=indent){DSH_END}(?:\r?\n|$)", re.MULTILINE
+)
+DSH_OTHER_SERVER = re.compile(r"\b(?:id|serverName)['\"]?\s*:\s*['\"]?(?:umem-unified-memory|unified_memory)(?=['\"\s,#}\]]|$)")
+
+
+def dsh_mcp_block(indent, newline, empty_sequence=""):
+    command, args = desired_mcp_args()
+    lines = [DSH_START]
+    if empty_sequence:
+        lines.append(DSH_EMPTY + json.dumps(empty_sequence, ensure_ascii=False))
+    lines.extend([
+        "- insert:",
+        "    - id: umem-unified-memory",
+        "      name: '@deepseek-ai/dsh-mcp-client'",
+        "      config:",
+        "        serverName: unified_memory",
+        "        transport: stdio",
+        f"        command: {json.dumps(command, ensure_ascii=False)}",
+        f"        args: {json.dumps(args, ensure_ascii=False)}",
+        "        env:",
+        "          UNIFIED_MEMORY_CLIENT: DeepSeek Harness",
+        DSH_END,
+    ])
+    return "".join(indent + line + newline for line in lines)
+
+
+def read_dsh_patch(path):
+    # Preserve the BOM and newline style when editing just our block.
+    raw = path.read_bytes().decode("utf-8") if path.exists() else ""
+    bom = "\ufeff" if raw.startswith("\ufeff") else ""
+    text = raw[len(bom):]
+    block = DSH_BLOCK.search(text)
+    if text.count(DSH_START) != int(block is not None) or text.count(DSH_END) != int(block is not None):
+        raise ValueError(f"DeepSeek Harness 的 Unified Memory 配置块不完整，请核对 {path}")
+    empty_sequence = ""
+    if block:
+        second_line = block[0].splitlines()[1].lstrip()
+        if second_line.startswith(DSH_EMPTY):
+            empty_sequence = json.loads(second_line[len(DSH_EMPTY):])
+            if not isinstance(empty_sequence, str) or not re.fullmatch(r" *\[ *\](?:[ \t]+#[^\r\n]*|[ \t]*)(?:\r?\n)?", empty_sequence):
+                raise ValueError(f"DeepSeek Harness 的空配置记录格式无效，请核对 {path}")
+    return bom, text, block, empty_sequence
+
+
+def dsh_patch_root(text):
+    """Locate the top-level row without interpreting Cordis tags or reformatting YAML."""
+    offset = 0
+    header_end = 0
+    for line in text.splitlines(keepends=True):
+        clean = line.strip()
+        if re.fullmatch(r"---(?:\s+#.*)?", clean):
+            header_end = offset + len(line)
+        elif clean and not clean.startswith(("#", "%")):
+            return offset, line
+        offset += len(line)
+    return header_end, ""
+
+
+def edit_dsh_patch(path, connect, force=False, created=False):
+    bom, text, block, empty_sequence = read_dsh_patch(path)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    if block:
+        before, after = text[:block.start()], text[block.end():]
+        desired = dsh_mcp_block(block["indent"], newline, empty_sequence)
+        if not connect and block[0] != desired and not force:
+            raise RuntimeError(f"DeepSeek Harness 的托管配置已被编辑，请核对 {path}")
+        if connect:
+            updated = before + desired + after
+        else:
+            _, remaining = dsh_patch_root(before + after)
+            restored = empty_sequence if not remaining or remaining.strip() == "..." else ""
+            if empty_sequence and not restored and "#" in empty_sequence:
+                restored = "#" + empty_sequence.split("#", 1)[1].rstrip("\r\n") + newline
+            updated = before + restored + after
+    elif connect:
+        if DSH_OTHER_SERVER.search(text):
+            raise RuntimeError(f"DeepSeek Harness 已有同名服务，请先核对 {path}")
+        offset, line = dsh_patch_root(text)
+        indent = " " * (len(line) - len(line.lstrip(" ")))
+        if re.fullmatch(r"\[ *\](?:[ \t]+#.*|[ \t]*)", line.strip()):
+            empty_sequence = line
+        elif line and not re.match(r"^ *(?:-(?:[ \t]|\r?\n|$)|\.\.\.(?:\s|$))", line):
+            raise ValueError(f"DeepSeek Harness 配置需要块状 YAML 列表，请核对 {path}")
+        if offset and text[offset - 1] != "\n":
+            raise ValueError(f"请在 DeepSeek Harness 配置的文档起始行后换行，再重试接入。{path}")
+        updated = text[:offset] + dsh_mcp_block(indent, newline, empty_sequence) + text[offset + len(empty_sequence):]
+    else:
+        return False
+
+    if updated == text:
+        return False
+    if not updated and not bom and created:
+        path.unlink()
+    else:
+        atomic_write(path.resolve(), bom + updated)
+    return True
+
+
+def inspect_dsh_patch(path):
+    _, text, block, empty_sequence = read_dsh_patch(path)
+    if block:
+        expected = dsh_mcp_block(block["indent"], "\r\n" if "\r\n" in text else "\n", empty_sequence)
+        return "managed" if block[0] == expected else "drifted"
+    return "unmanaged"
 
 
 def is_our_mcp_entry(command, args):
@@ -929,7 +1046,13 @@ def inspect_agent(agent_id, spec):
 
     mcp_path = spec["mcp_path"]
     exp_cmd, exp_args = desired_mcp_args()
-    if spec["mcp_type"] == "json":
+    if spec.get("mode") == "dsh_patch":
+        try:
+            mcp_state = inspect_dsh_patch(mcp_path)
+        except (ValueError, OSError) as exc:
+            issues.append(str(exc))
+            mcp_state = "modified"
+    elif spec["mcp_type"] == "json":
         if mcp_path.is_file():
             try:
                 current = read_json_mcp(mcp_path).get("mcpServers", {}).get(spec["mcp_key"])
@@ -1039,6 +1162,13 @@ def connect_agent(agent_id, spec, dry_run=False):
         restore = load_restore(agent_id)
         for changed in ensure_stable_shims():
             changes.append(f"wrote launcher {changed}")
+        if spec.get("mode") == "dsh_patch":
+            path = spec["mcp_path"]
+            restore.setdefault("dsh_patch_created", not path.exists() and not path.is_symlink())
+            save_restore(agent_id, restore)
+            if edit_dsh_patch(path, connect=True):
+                changes.append(f"configured DeepSeek Harness MCP in {path}")
+            return {"id": agent_id, "state": "managed", "changes": changes or ["already up to date"]}
         if spec.get("mode") == "agy_plugin":
             pdir = spec["plugin_dir"]
             expected = desired_agy_plugin_files()
@@ -1153,6 +1283,12 @@ def disconnect_agent(agent_id, spec, force=False):
 
     with integration_lock():
         restore = load_restore(agent_id)
+        if spec.get("mode") == "dsh_patch":
+            path = spec["mcp_path"]
+            if edit_dsh_patch(path, connect=False, force=force, created=restore.get("dsh_patch_created", False)):
+                changes.append(f"removed Unified Memory MCP from {path}")
+            (RESTORE_DIR / f"{agent_id}.json").unlink(missing_ok=True)
+            return {"id": agent_id, "state": "unmanaged", "changes": changes or ["nothing to remove"]}
         if spec.get("mode") == "agy_plugin":
             pdir = spec["plugin_dir"]
             rule_path = pdir / "rules" / "unified-memory.md"
@@ -1897,7 +2033,7 @@ def main():
     p_sdis = skill_sub.add_parser("disable", help="Disable a skill (folder name) and unlink from connected agents.")
     p_sdis.add_argument("folder")
 
-    p_conn = sub.add_parser("connect", help="Connect an agent (claude, codex, cursor, workbuddy, antigravity, or all).")
+    p_conn = sub.add_parser("connect", help=f"Connect an agent ({', '.join(agent_specs())}, or all).")
     p_conn.add_argument("target", nargs="?", default="all")
     p_conn.add_argument("--dry-run", action="store_true")
 

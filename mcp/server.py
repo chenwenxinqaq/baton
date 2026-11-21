@@ -1313,6 +1313,12 @@ def process_one_message(store, msg):
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "unified-memory", "version": "1.2.0"},
             }
+            if CONFIGURED_CLIENT == "DeepSeek Harness":
+                result["instructions"] = (
+                    "When past decisions or preferences may be relevant, search Unified Memory. "
+                    "When asked to remember something, read MEMORY.md §0 and follow its writing rules. "
+                    "Do not save ordinary conversation automatically."
+                )
         elif method == "ping":
             result = {}
         elif method == "tools/list":

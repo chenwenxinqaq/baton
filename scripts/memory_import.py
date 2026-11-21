@@ -19,6 +19,7 @@ CLIENTS = {
     "cursor": "Cursor",
     "workbuddy": "WorkBuddy",
     "antigravity": "Antigravity",
+    "deepseek": "DeepSeek Harness",
 }
 AUTOMATIC_CLIENTS = frozenset({"claude", "codex", "antigravity"})
 IMPORT_ID = re.compile(r"([a-z]+)-import-[0-9a-f]{32}")
