@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -189,6 +190,85 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertIn("MCP 配置格式无效", error.exception.read().decode())
             finally:
                 manager.terminate()
+
+    def test_codex_import_review_and_classification(self):
+        from urllib.error import HTTPError
+
+        native = self.home / ".codex"
+        native.mkdir()
+        db_v1 = native / "memories_1.sqlite"
+        db_v2 = native / "memories_v2_1.sqlite"
+        for path, body in ((db_v1, "旧版重复原文"), (db_v2, "# 导入样本\n杜鹃候选记忆")):
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE stage1_outputs(thread_id TEXT PRIMARY KEY, source_updated_at INTEGER, "
+                           "raw_memory TEXT, rollout_summary TEXT)")
+                db.execute("INSERT INTO stage1_outputs VALUES (?, ?, ?, ?)", ("same-thread", 1735689600, body, ""))
+        summaries = native / "memories_v2/rollout_summaries"
+        summaries.mkdir(parents=True)
+        (summaries / "kept.md").write_text(
+            "thread_id: another-thread\nupdated_at: 2025-01-02T00:00:00Z\ncwd: /not-imported\n\n# 摘要回退\n白鹭候选记忆",
+            encoding="utf-8",
+        )
+        (native / "memories_v2/MEMORY.md").write_text("重复的合并汇总", encoding="utf-8")
+        memory_index = self.library / "MEMORY.md"
+        initial_index = memory_index.read_bytes()
+        initial_db = {path: path.read_bytes() for path in (db_v1, db_v2)}
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--desktop", "--port", "0"]
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=self.environment()) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+
+                def get(route):
+                    with urlopen(base + route, timeout=5) as response:
+                        return response.read().decode()
+
+                clients = get("/?view=clients")
+                self.assertIn("一键导入记忆", clients)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', clients)[1]
+
+                def post(**fields):
+                    request = Request(base + "/codex_import", data=urlencode(dict(csrf=csrf, **fields)).encode(),
+                                      headers={"Origin": base})
+                    with urlopen(request, timeout=8) as response:
+                        return response.read().decode()
+
+                imported = post(op="import")
+                self.assertIn("新增 2 条", imported)
+                self.assertIn("待确认 · 2 条", imported)
+                self.assertIn("摘要回退", imported)
+                self.assertEqual(self.cli("import-codex")["added"], 0)
+                self.assertEqual(memory_index.read_bytes(), initial_index)
+                self.assertEqual({p: p.read_bytes() for p in initial_db}, initial_db)
+                self.assertEqual(self.tool("memory_search", {"query": "杜鹃候选记忆"}), [])
+                self.assertEqual(list(self.library.glob("imported")), [])
+                filtered = get("/?view=codex_import&" + urlencode({"q": "杜鹃候选记忆"}))
+                self.assertNotIn("摘要回退", filtered)
+                path = re.search(r"topic=(codex-import-[0-9a-f]{32})", filtered)[1]
+                review = get("/?view=codex_import&topic=" + path)
+                self.assertIn("杜鹃候选记忆", review)
+                self.assertNotIn("旧版重复原文", review)
+                revision = re.search(r'name="revision" value="([^"]+)"', review)[1]
+                request = dict(op="approve", import_id=path, title="已确认标题", description="审阅摘要",
+                               body="# 已确认标题\n杜鹃候选记忆")
+                with self.assertRaises(HTTPError) as stale:
+                    post(**request, layer="L3", revision="stale")
+                self.assertEqual(stale.exception.code, 409)
+                with self.assertRaises(HTTPError) as missing_layer:
+                    post(**request, revision=revision)
+                self.assertEqual(missing_layer.exception.code, 409)
+                self.assertEqual(memory_index.read_bytes(), initial_index)
+                self.assertIn("已将确认后的 Codex 记忆归入个人记忆库", post(**request, layer="L3", revision=revision))
+                hits = self.tool("memory_search", {"query": "杜鹃候选记忆"})
+                self.assertEqual([hit["path"] for hit in hits], [f"projects/{path}.md"])
+                topic = (self.library / hits[0]["path"]).read_text()
+                self.assertIn("Codex v2", topic)
+                self.assertIn("2025-01-01", topic)
+                self.assertIn("same-thread", topic)
+                self.assertIn("新增 0 条", post(op="import"))
+                self.assertIn("待确认 · 1 条", get("/?view=codex_import"))
+            finally:
+                manager.stdin.close()
+                manager.wait(timeout=8)
 
     def test_writing_policy_reaches_clients_without_private_index(self):
         index = self.library / "MEMORY.md"

@@ -1829,6 +1829,7 @@ def main():
     p_init.add_argument("--shared", action="store_true", help="Initialize as a shared library (no personal skills/user-managed).")
 
     sub.add_parser("install-shims", help="Create or refresh the stable launchers client configs point at.")
+    sub.add_parser("import-codex", help="Copy Codex memories into the local review queue.")
     sub.add_parser("interface", help="Emit machine-readable paths and capabilities.")
 
     p_rb = sub.add_parser("rebuild-index", help="Deterministically rebuild MEMORY.md index from disk entries.")
@@ -2017,6 +2018,12 @@ def main():
                 indent=2,
             )
         )
+    elif args.command == "import-codex":
+        from codex_import import import_memories
+
+        if not (MEMORY_ROOT / "MEMORY.md").is_file():
+            parser.error("Initialize the personal library first with umem init.")
+        print(json.dumps(import_memories(MEMORY_ROOT), ensure_ascii=False, indent=2))
     elif args.command == "agent" and args.agent_cmd == "list":
         reports = [inspect_agent(aid, spec) for aid, spec in agent_specs().items()]
         print(json.dumps({"agents": reports}, ensure_ascii=False, indent=2))

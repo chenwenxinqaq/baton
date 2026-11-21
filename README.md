@@ -63,6 +63,16 @@ python3 manager/manager.py
 
 ## 接入客户端
 
+### 导入 Codex 已有记忆
+
+接入 Codex 会保留它现有的记忆开关。旧版接入时曾关闭此功能的用户，可以在「客户端接入」点 Codex 旁的「同步」，恢复可识别的旧设置。
+
+在同一行点「一键导入记忆」，应用会读取 Codex 生成的 v1/v2 记忆及本地会话摘要，按会话去重。只有汇总文件时，会将汇总作为一份待确认条目。导入的副本保存在本机的待确认区，可以在管理页搜索和查看。挑选需要长期保存的内容，编辑后选择 L0–L4，再点「确认归入所选层」。待确认区独立于个人库的索引、MCP 和 Git 同步。归层后的条目会随个人库同步。
+
+命令行可运行 `umem import-codex` 将原有记忆加入同一个待确认区，再通过管理页逐条核对。
+
+### WorkBuddy 和其他客户端
+
 使用腾讯 WorkBuddy 桌面版时，打开 Unified Memory 的「客户端接入」，在 WorkBuddy 一行点「接入」。应用将 `unified_memory` 合并到用户级 `~/.workbuddy/mcp.json`，其他项目也能使用。命令行等价操作为 `umem connect workbuddy`。在 WorkBuddy 会话中输入「用 unified_memory 搜索我的记忆」，即可在「读写动态」核对实际调用。可从同一行断开。[WorkBuddy 官方 MCP 配置说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)
 
 以下以 Codex 为例，也可选择 claude、cursor、workbuddy 或 antigravity。接入会更新该客户端的指令与 MCP 配置，命令指向本机的稳定启动器，参数指向当前选定的数据目录。客户端重新启动后能继续找到该库。

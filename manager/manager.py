@@ -37,6 +37,7 @@ if str(ROOT_DIR / "scripts") not in sys.path:
 
 from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
 import audit_log  # noqa: E402
+import codex_import  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
 
@@ -1388,6 +1389,14 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                     <button class="btn btn-primary btn-compact" type="submit">接入</button>
                   </form>"""
 
+            if aid == "codex" and key == "primary":
+                inbox_link = escape(query(view="codex_import") + "#detail-title")
+                btn_html += f"""
+                  <form method="post" action="/codex_import">
+                    {hidden("csrf", token)}{hidden("op", "import")}
+                    <button class="btn btn-ghost btn-compact" type="submit">一键导入记忆</button>
+                  </form>
+                  <a class="btn btn-ghost btn-compact" href="{inbox_link}">待确认记忆</a>"""
             comp = info["components"]
             sk_comp = comp.get("skill", {})
             sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
@@ -1510,6 +1519,58 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             '<p class="agents-subtitle">当前进程受沙盒限制无法直接检测客户端目录；在本地终端运行 python3 manager/manager.py 即可启用客户端接入管理。</p>'
             "</div>"
         )
+
+
+def render_codex_import(token, library, selected, q, draft):
+    try:
+        entries = codex_import.pending(library.root)
+        item = codex_import.read_candidate(library.root, selected) if selected else None
+    except (OSError, ValueError) as exc:
+        return f'<p class="empty">{escape(str(exc))}</p>'
+
+    form = ""
+    if item:
+        title = draft.get("title", item["title"])
+        description = draft.get("description", "")
+        body = draft.get("body", item["body"])
+        date_label = item["source_date"] or "原日期未知"
+        form = f"""
+          <form class="edit-form" method="post" action="/codex_import">
+            {hidden("csrf", token)}{hidden("op", "approve")}{hidden("import_id", item["id"])}
+            {hidden("revision", codex_import.revision(item))}
+            <h2>确认并归层</h2>
+            <p>{escape(item["source"])} · {escape(date_label)} · {escape(item["thread_id"])}</p>
+            <label>标题 <input type="text" name="title" maxlength="{MAX_TITLE_CHARS}" required value="{escape(title)}"></label>
+            <label>检索摘要 <input type="text" name="description" maxlength="{MAX_DESC_CHARS}" value="{escape(description)}"></label>
+            <label>正文 <textarea name="body" rows="14" required>{escape(body)}</textarea></label>
+            {render_layer_radios(draft.get("layer", ""))}
+            <p>确认后会写入个人记忆库。若已启用个人库 Git 同步，这些条目会随个人库同步。</p>
+            <button class="btn btn-primary" type="submit">确认归入所选层</button>
+          </form>
+        """
+    search = q.casefold()
+    rows = []
+    for item in entries:
+        searchable = " ".join((item["title"], item["body"], item["thread_id"])).casefold()
+        if search and search not in searchable:
+            continue
+        href = escape(query(view="codex_import", topic=item["id"], q=q) + "#detail-title")
+        label = escape(item["source_date"][:10] or "日期未知")
+        rows.append(f'<li><a href="{href}">{escape(item["title"])}</a> <small>{label}</small></li>')
+    listing = f'<ul class="entry-list">{"".join(rows)}</ul>' if rows else '<p class="empty">没有找到待确认记忆。</p>'
+    return f"""
+      <section>
+        <p>待确认的内容只保存在本机。请核对原文，保留值得长期使用的部分后再归层。</p>
+        {form}
+        <h2>待确认 · {len(entries)} 条</h2>
+        <form action="/" method="get">
+          {hidden("view", "codex_import")}
+          <label>搜索待确认记忆 <input type="search" name="q" value="{escape(q)}"></label>
+          <button class="btn btn-ghost btn-compact" type="submit">搜索</button>
+        </form>
+        {listing}
+      </section>
+    """
 
 
 def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
@@ -2519,6 +2580,7 @@ def render(
     notice="",
     error="",
     agent_home=None,
+    import_draft=None,
 ):
     library = libraries[key]
     entries, unreadable = library.list()
@@ -2813,6 +2875,10 @@ def render(
     elif view == "clients":
         heading = "客户端接入"
         reader = render_agent_panel(token, key, agent_home=agent_home, library=library, flat=True)
+    elif view == "codex_import":
+        heading = "Codex 待确认记忆"
+        detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(query(view="clients"))}">返回客户端接入</a>'
+        reader = render_codex_import(token, library, topic_path, q, import_draft or {})
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'
@@ -2966,15 +3032,15 @@ def render(
     )
     topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
 
-    agent_and_sync_html = "" if DESKTOP or view == "clients" else render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
+    agent_and_sync_html = "" if DESKTOP or view in {"clients", "codex_import"} else render_agent_panel(token, key, tab="", agent_home=agent_home, library=library)
 
     selected = "library"
     if DESKTOP:
         if view in {"sync_hub", "conflicts"}:
             selected = "sync"
-        elif view in {"clients", "activity"}:
-            selected = view
-            detail_badges = detail_submeta = detail_toolbar = ""
+        elif view in {"clients", "activity", "codex_import"}:
+            selected = "clients" if view == "codex_import" else view
+            detail_badges = detail_submeta = ""
             if view == "activity":
                 heading = "读写动态"
                 reader = render_activity_panel(key)
@@ -3118,8 +3184,9 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients"}
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "codex_import"}
                                 | ({"activity"} if DESKTOP else set()))
+                or (view == "codex_import" and (key != "primary" or tab != "memory"))
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -3152,6 +3219,7 @@ class Handler(BaseHTTPRequestHandler):
             "mount_removed": "已解除挂载（本地目录与文件已完整保留）。",
             "conflict_resolved": "冲突已解决并清理冲突副本。",
             "topic_shared": "已将该个人记忆分享到目标共享库。",
+            "codex_import_approved": "已将确认后的 Codex 记忆归入个人记忆库。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -3199,6 +3267,7 @@ class Handler(BaseHTTPRequestHandler):
             "/mount_remove",
             "/resolve_conflict",
             "/share_topic",
+            "/codex_import",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
@@ -3229,6 +3298,9 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.FORBIDDEN, "请刷新页面后重试。", "text/plain; charset=utf-8")
             return
 
+        if self.path == "/codex_import":
+            self.handle_codex_import(fields)
+            return
         if self.path in {
             "/agent",
             "/doctor",
@@ -3255,6 +3327,46 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_delete(fields)
             return
         self.update_entry(fields)
+
+    def handle_codex_import(self, fields):
+        library = self.server.libraries["primary"]
+        selected = fields.get("import_id", "")
+        draft = None
+        try:
+            if fields.get("op") == "import":
+                report = codex_import.import_memories(library.root, home=self.server.agent_home)
+                if report["found"]:
+                    notice = f'找到 {report["found"]} 条 Codex 记忆，新增 {report["added"]} 条，更新 {report["updated"]} 条。'
+                else:
+                    notice = "未发现可导入的 Codex 会话记忆。"
+                self.page(view="codex_import", notice=notice, error=" ".join(dict.fromkeys(report["warnings"])))
+                return
+            if fields.get("op") != "approve":
+                raise InvalidEntry("未知的 Codex 记忆操作。")
+            with codex_import.review_lock(library.root):
+                item = codex_import.read_candidate(library.root, selected)
+                if fields.get("revision") != codex_import.revision(item):
+                    raise InvalidEntry("导入原文已更新，请重新核对。")
+                draft = {name: fields.get(name, "").strip() for name in ("layer", "title", "description", "body")}
+                validate_common_fields(**draft)
+                original_date = item["source_date"] or "未知"
+                session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
+                provenance = f'> 来源：{item["source"]}，原日期 {original_date}{session}'
+                body = f'{draft["body"]}\n\n{provenance}'
+                # Recover a completed save if the prior process stopped before recording its receipt.
+                _, index = library.read_index()
+                saved = next(
+                    (path for path in index if Path(path).stem == item["id"]
+                     and provenance in library.read_markdown(library.root / path).splitlines()),
+                    None,
+                )
+                if not saved:
+                    saved = library.save_topic("", "", draft["layer"], draft["title"], draft["description"], body, slug=item["id"])
+                codex_import.mark_approved(library.root, item, saved)
+            target = query(topic=saved, notice="codex_import_approved") + "#detail-title"
+            self.respond(HTTPStatus.SEE_OTHER, "", location=target)
+        except (ValueError, OSError) as exc:
+            self.page(HTTPStatus.CONFLICT, view="codex_import", topic_path=selected, error=str(exc), import_draft=draft)
 
     def start_sync_action(self, key, read_only, tab, return_view):
         library = self.server.libraries[key]
