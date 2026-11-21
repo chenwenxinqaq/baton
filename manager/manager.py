@@ -3463,13 +3463,40 @@ class Handler(BaseHTTPRequestHandler):
                 # A POST redirect inherits the form's #feedback. Poll a fragment-free URL
                 # so Chromium requests the job result instead of scrolling the same page.
                 progress_url = "/sync_progress?" + urlencode({"job": identifier})
-                content = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-                    <meta http-equiv="refresh" content="2;url={progress_url}"><link rel="stylesheet" href="/style.css">
-                    <title>正在{action} · Unified Memory</title><main class="sync-progress hub-section">
-                    <h1>正在{action}</h1><p>如果 GitHub 提示授权，请在浏览器中完成。看到授权成功后即可关闭该标签页，
-                    应用会继续检查仓库并自动显示结果。</p><div class="form-actions">
-                    <a class="btn btn-secondary" href="{progress_url}">查看最新状态</a>
-                    <a class="btn btn-ghost" href="/?view=sync_hub">返回共享与同步</a></div></main></html>"""
+                title = escape(f"正在{action}")
+                back_url = escape(query(library=key if key in self.server.libraries else "primary", view="sync_hub"))
+                content = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="2;url={progress_url}">
+  <link rel="stylesheet" href="/style.css">
+  <title>{title} · Unified Memory</title>
+</head>
+<body>
+  <main class="sync-progress">
+    <section class="sync-progress-card" aria-labelledby="sync-progress-title">
+      <header class="sync-progress-header">
+        <span class="sync-progress-icon" aria-hidden="true"><svg viewBox="0 0 24 24">{NAV_ICONS['sync']}</svg></span>
+        <div>
+          <h1 id="sync-progress-title">{title}</h1>
+          <p>完成后会自动显示结果。</p>
+        </div>
+      </header>
+      <div class="sync-progress-track" role="progressbar" aria-labelledby="sync-progress-title"></div>
+      <aside class="sync-progress-help" aria-labelledby="sync-auth-title">
+        <h2 id="sync-auth-title">GitHub 授权</h2>
+        <p>如果浏览器打开了 GitHub 授权页，请完成授权后回到这里。</p>
+      </aside>
+      <div class="sync-progress-actions">
+        <a class="btn btn-ghost" href="{progress_url}">查看最新状态</a>
+        <a class="btn btn-secondary" href="{back_url}">返回共享与同步</a>
+      </div>
+    </section>
+  </main>
+</body>
+</html>"""
                 self.respond(HTTPStatus.OK, content)
             else:
                 try:
