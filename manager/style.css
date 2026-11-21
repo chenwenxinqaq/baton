@@ -408,8 +408,10 @@
   .settings-view .workspace { grid-template-columns: minmax(0, 1fr); max-inline-size: 60rem; }
   .settings-view .detail-pane { min-inline-size: 0; }
   .settings-view .footer { overflow-wrap: anywhere; }
-  .import-review { display: grid; gap: 1rem; }
+  .import-review { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .import-review > .sort-switch { flex-wrap: wrap; justify-self: start; }
   .import-review .edit-form { margin-block-start: 0.6rem; }
+  .import-review .edit-form > .btn { justify-self: start; }
   .import-review [data-import-file-status]:empty { display: none; }
 
   /* Main 2-column Workspace */
