@@ -441,18 +441,26 @@ class AsyncSyncScheduler:
             )
 
     def status(self, root: Union[Path, str]) -> Dict[str, Any]:
-        """Return current in-memory status, falling back to persisted state."""
+        """Return persisted status, falling back to this process's in-memory state.
+
+        The status file is the cross-process source of truth.  A Manager and an MCP
+        server can have separate scheduler instances for the same library, so returning
+        this process's cached job first could hide a newer terminal result written by
+        the other instance.
+        """
         root_path = Path(root).expanduser().resolve()
+        path = self._state_path(root_path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (FileNotFoundError, OSError, ValueError):
+            pass
         with self._lock:
             job = self._jobs.get(_key(root_path))
             if job is not None and job.last_status:
                 return dict(job.last_status)
-        path = self._state_path(root_path)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (FileNotFoundError, OSError, ValueError):
-            return {}
+        return {}
 
     def wait_for_idle(self, root: Union[Path, str], timeout: float = 10.0) -> Dict[str, Any]:
         """Wait until a queued job reaches success/error/conflict (primarily for tests)."""

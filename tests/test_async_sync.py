@@ -194,6 +194,36 @@ class AsyncSyncSchedulerTests(unittest.TestCase):
             self.assertEqual(len(calls), 3)
             self.assertEqual(result["result"]["revision"], 3)
 
+    def test_status_refreshes_from_persisted_state_across_schedulers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            state = Path(tmp) / "state"
+
+            first = AsyncSyncScheduler(
+                lambda path, **kwargs: {"status": "ok", "owner": "first"},
+                debounce_seconds=60,
+                state_dir=state,
+            )
+            second = AsyncSyncScheduler(
+                lambda path, **kwargs: {"status": "ok", "owner": "second"},
+                debounce_seconds=0,
+                state_dir=state,
+            )
+            self.addCleanup(first.shutdown)
+            self.addCleanup(second.shutdown)
+
+            queued = first.enqueue(root, sync_config=self.config(), reason="first write")
+            self.assertEqual(queued["status"], "pending")
+            self.assertEqual(first.status(root)["status"], "pending")
+
+            second.enqueue(root, sync_config=self.config(), reason="second write")
+            result = second.wait_for_idle(root, timeout=2)
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["result"]["owner"], "second")
+            self.assertEqual(first.status(root)["status"], "success")
+            self.assertEqual(first.status(root)["result"]["owner"], "second")
+
 
 if __name__ == "__main__":
     unittest.main()
