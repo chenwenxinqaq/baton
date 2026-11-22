@@ -27,7 +27,7 @@ from library_paths import (
     library_seed_files,
     normalize_layers,
     resolve_libraries,
-    save_mounts_config,
+    update_mounts_config,
     validate_library_path,
     validate_mount_id,
 )
@@ -1510,7 +1510,8 @@ def check_library_integrity(memory_root=MEMORY_ROOT, allow_user_managed=True, li
 
 def mount_list(home=None):
     """List personal library and all configured mounted libraries with Git sync status."""
-    libs = resolve_libraries(primary_root=MEMORY_ROOT, home=home, include_disabled=True)
+    issues = []
+    libs = resolve_libraries(primary_root=MEMORY_ROOT, home=home, include_disabled=True, issues=issues)
     out = []
     for lib in libs:
         path = lib["path"]
@@ -1534,6 +1535,16 @@ def mount_list(home=None):
                 "available": exists,
                 "sync": sync_cfg or None,
                 "git": st,
+            }
+        )
+    # Entries that could not be resolved stay visible instead of silently disappearing.
+    for issue in issues:
+        out.append(
+            {
+                "id": issue["id"],
+                "path": issue["path"],
+                "available": False,
+                "issue": {"code": issue["code"], "message": issue["message"]},
             }
         )
     return out
@@ -1567,13 +1578,20 @@ def mount_add(
         default=ALL_LAYERS if role == "personal" else DEFAULT_SHARED_LAYERS,
     )
 
-    cfg = load_mounts_config(home=home)
-    if any(item.get("id") == mid for item in cfg["mounts"]):
-        raise ValueError(f"Mount '{mid}' already exists. Use 'mount update' or remove it first.")
-    if mpath == MEMORY_ROOT:
-        raise ValueError("Mount path cannot be the same as the personal memory root.")
-    if any(validate_library_path(item["path"]) == mpath for item in cfg["mounts"] if item.get("path")):
-        raise ValueError(f"Path already mounted: {mpath}")
+    def check_mount_free(cfg):
+        if any(item.get("id") == mid for item in cfg["mounts"]):
+            raise ValueError(f"Mount '{mid}' already exists. Use 'mount update' or remove it first.")
+        if mpath == MEMORY_ROOT:
+            raise ValueError("Mount path cannot be the same as the personal memory root.")
+        for item in cfg["mounts"]:
+            try:
+                taken = validate_library_path(item["path"]) if item.get("path") else None
+            except (ValueError, TypeError, OSError):
+                continue
+            if taken == mpath:
+                raise ValueError(f"Path already mounted: {mpath}")
+
+    check_mount_free(load_mounts_config(home=home))
 
     cloned = False
     if git_url and (not mpath.exists() or not any(mpath.iterdir())):
@@ -1614,8 +1632,11 @@ def mount_add(
         "enabled": True,
         "sync": sync_cfg,
     }
-    cfg["mounts"].append(entry)
-    save_mounts_config(cfg, home=home)
+    def append_entry(cfg):
+        check_mount_free(cfg)  # re-check: another process may have mounted while we cloned
+        cfg["mounts"].append(entry)
+
+    update_mounts_config(append_entry, home=home)
     return {"mounted": entry, "cloned": cloned}
 
 
@@ -1634,61 +1655,65 @@ def mount_update(
 ):
     """Update settings of an existing mounted shared library."""
     mid = validate_mount_id(mount_id)
-    cfg = load_mounts_config(home=home)
-    target = None
-    for item in cfg["mounts"]:
-        if item.get("id") == mid:
-            target = item
-            break
-    if target is None:
-        raise ValueError(f"Mount '{mid}' not found.")
 
-    if label is not None:
-        target["label"] = label.strip() or mid
-    if mode is not None:
-        m = mode.strip().lower()
-        if m not in {"ro", "rw"}:
-            raise ValueError("mode must be 'ro' or 'rw'.")
-        target["mode"] = m
-    if layers is not None:
-        target["layers"] = normalize_layers(layers)
-    if enabled is not None:
-        target["enabled"] = bool(enabled)
+    def apply(cfg):
+        target = None
+        for item in cfg["mounts"]:
+            if item.get("id") == mid:
+                target = item
+                break
+        if target is None:
+            raise ValueError(f"Mount '{mid}' not found.")
 
-    if any(v is not None for v in (remote_url, remote, branch, auto_commit)):
-        cur_sync = dict(target.get("sync") or {"driver": "git", "remote": "origin", "branch": "main", "auto_commit": True, "auto_push": False})
-        if remote is not None:
-            cur_sync["remote"] = remote.strip() or "origin"
-        if branch is not None:
-            cur_sync["branch"] = branch.strip()
-        if remote_url is not None:
-            cur_sync["remote_url"] = remote_url.strip()
-        if auto_commit is not None:
-            cur_sync["auto_commit"] = bool(auto_commit)
-        info = sync_git.ensure_repo(
-            Path(target["path"]),
-            remote_url=cur_sync.get("remote_url") or "",
-            remote=cur_sync.get("remote") or "origin",
-            branch=cur_sync.get("branch") or "main",
-            writable=target["mode"] == "rw",
-        )
-        cur_sync["branch"] = cur_sync.get("branch") or info["branch"]
-        cur_sync["remote_url"] = info["remote_url"]
-        target["sync"] = cur_sync
+        if label is not None:
+            target["label"] = label.strip() or mid
+        if mode is not None:
+            m = mode.strip().lower()
+            if m not in {"ro", "rw"}:
+                raise ValueError("mode must be 'ro' or 'rw'.")
+            target["mode"] = m
+        if layers is not None:
+            target["layers"] = normalize_layers(layers)
+        if enabled is not None:
+            target["enabled"] = bool(enabled)
 
-    save_mounts_config(cfg, home=home)
-    return {"updated": target}
+        if any(v is not None for v in (remote_url, remote, branch, auto_commit)):
+            cur_sync = dict(target.get("sync") or {"driver": "git", "remote": "origin", "branch": "main", "auto_commit": True, "auto_push": False})
+            if remote is not None:
+                cur_sync["remote"] = remote.strip() or "origin"
+            if branch is not None:
+                cur_sync["branch"] = branch.strip()
+            if remote_url is not None:
+                cur_sync["remote_url"] = remote_url.strip()
+            if auto_commit is not None:
+                cur_sync["auto_commit"] = bool(auto_commit)
+            info = sync_git.ensure_repo(
+                Path(target["path"]),
+                remote_url=cur_sync.get("remote_url") or "",
+                remote=cur_sync.get("remote") or "origin",
+                branch=cur_sync.get("branch") or "main",
+                writable=target["mode"] == "rw",
+            )
+            cur_sync["branch"] = cur_sync.get("branch") or info["branch"]
+            cur_sync["remote_url"] = info["remote_url"]
+            target["sync"] = cur_sync
+
+        return {"updated": target}
+
+    return update_mounts_config(apply, home=home)
 
 
 def mount_remove(mount_id, home=None):
     """Unmount a shared library from mounts.json without deleting local files."""
     mid = validate_mount_id(mount_id)
-    cfg = load_mounts_config(home=home)
-    before = len(cfg["mounts"])
-    cfg["mounts"] = [item for item in cfg["mounts"] if item.get("id") != mid]
-    if len(cfg["mounts"]) == before:
-        raise ValueError(f"Mount '{mid}' not found.")
-    save_mounts_config(cfg, home=home)
+
+    def apply(cfg):
+        before = len(cfg["mounts"])
+        cfg["mounts"] = [item for item in cfg["mounts"] if item.get("id") != mid]
+        if len(cfg["mounts"]) == before:
+            raise ValueError(f"Mount '{mid}' not found.")
+
+    update_mounts_config(apply, home=home)
     return {"removed": mid, "files_preserved": True}
 
 
@@ -1722,15 +1747,16 @@ def setup_library_sync(
         "auto_commit": bool(auto_commit and lib["mode"] == "rw"),
         "auto_push": bool(auto_push and lib["mode"] == "rw"),
     }
-    cfg = load_mounts_config(home=home)
-    if library_id == "personal":
-        cfg["personal_sync"] = sync_cfg
-    else:
-        for item in cfg["mounts"]:
-            if item.get("id") == library_id:
-                item["sync"] = sync_cfg
-                break
-    save_mounts_config(cfg, home=home)
+    def apply(cfg):
+        if library_id == "personal":
+            cfg["personal_sync"] = sync_cfg
+        else:
+            for item in cfg["mounts"]:
+                if item.get("id") == library_id:
+                    item["sync"] = sync_cfg
+                    break
+
+    update_mounts_config(apply, home=home)
     return {"library": library_id, "repo": info, "sync": sync_cfg}
 
 
