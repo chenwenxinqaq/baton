@@ -531,8 +531,9 @@ class PublicFrameworkTests(unittest.TestCase):
         stop_hooks = json.loads((self.home / ".cursor/hooks.json").read_text())["hooks"]["stop"]
         self.assertEqual(len(stop_hooks), 1)  # legacy entry replaced, not duplicated
 
-        def initialize(command):
-            result = subprocess.run([command, "--memory-root", str(self.library)], env=self.environment(), cwd=self.home,
+        def initialize(command, **extra_env):
+            result = subprocess.run([command, "--memory-root", str(self.library)],
+                                    env={**self.environment(), **extra_env}, cwd=self.home,
                                     input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
                                     capture_output=True, text=True)
             return result
@@ -541,7 +542,7 @@ class PublicFrameworkTests(unittest.TestCase):
         # Simulate the app being moved/replaced: the recorded runtime path disappears.
         broken = launcher.read_text().replace(str(CODE), str(self.home / "gone"))
         launcher.write_text(broken)
-        result = initialize(str(launcher))
+        result = initialize(str(launcher), UNIFIED_MEMORY_DISABLE_APP_FALLBACK="1")
         self.assertEqual(result.returncode, 127)
         self.assertIn("runtime not found", result.stderr)
         # Any app/CLI run regenerates the launcher; configs never needed to change.

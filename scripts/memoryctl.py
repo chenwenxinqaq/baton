@@ -74,12 +74,17 @@ def render_shim(rel_script):
 PY={py}
 FW={framework}
 if [ ! -x "$PY" ] || [ ! -f "$FW/{rel_script}" ]; then
-  for APP in "$HOME/Applications/Unified Memory.app" "/Applications/Unified Memory.app"; do
-    R="$APP/Contents/Resources"
-    if [ -x "$R/umem-python" ] && [ -f "$R/framework/{rel_script}" ]; then
-      PY="$R/umem-python"; FW="$R/framework"; break
-    fi
-  done
+  # Tests and sandboxed callers can disable host-level app discovery.  The
+  # default keeps the recovery path for a moved app without weakening the
+  # normal install behavior.
+  if [ "${{UNIFIED_MEMORY_DISABLE_APP_FALLBACK:-0}}" != "1" ]; then
+    for APP in "$HOME/Applications/Unified Memory.app" "/Applications/Unified Memory.app"; do
+      R="$APP/Contents/Resources"
+      if [ -x "$R/umem-python" ] && [ -f "$R/framework/{rel_script}" ]; then
+        PY="$R/umem-python"; FW="$R/framework"; break
+      fi
+    done
+  fi
 fi
 if [ ! -x "$PY" ] || [ ! -f "$FW/{rel_script}" ]; then
   echo "Unified Memory runtime not found. Open the Unified Memory app once, or run: memoryctl connect all" >&2
