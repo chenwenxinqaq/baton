@@ -7,10 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "scripts"))
 
+import async_sync  # noqa: E402
 from async_sync import AsyncSyncScheduler  # noqa: E402
 
 
@@ -223,6 +225,34 @@ class AsyncSyncSchedulerTests(unittest.TestCase):
             self.assertEqual(result["result"]["owner"], "second")
             self.assertEqual(first.status(root)["status"], "success")
             self.assertEqual(first.status(root)["result"]["owner"], "second")
+
+    def test_status_prefers_newer_in_memory_state_when_persist_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            state = Path(tmp) / "state"
+            scheduler = AsyncSyncScheduler(
+                lambda path, **kwargs: {"status": "ok"},
+                debounce_seconds=60,
+                state_dir=state,
+            )
+            self.addCleanup(scheduler.shutdown)
+
+            first = scheduler.enqueue(root, sync_config=self.config(), reason="first write")
+            self.assertEqual(first["generation"], 1)
+            self.assertEqual(scheduler.status(root)["generation"], 1)
+
+            with mock.patch.object(async_sync, "_atomic_json", side_effect=OSError("read-only")):
+                second = scheduler.enqueue(root, sync_config=self.config(), reason="second write")
+                self.assertEqual(second["generation"], 2)
+                current = scheduler.status(root)
+
+            self.assertEqual(current["generation"], 2)
+            self.assertEqual(current["reason"], "second write")
+            status_files = list(state.rglob("sync-status.json"))
+            self.assertEqual(len(status_files), 1)
+            persisted = json.loads(status_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(persisted["generation"], 1)
 
 
 if __name__ == "__main__":

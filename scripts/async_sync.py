@@ -118,6 +118,7 @@ class _Job:
     timer: Optional[threading.Timer] = None
     reason: str = ""
     last_status: Dict[str, Any] = field(default_factory=dict)
+    status_dirty: bool = False
 
 
 class AsyncSyncScheduler:
@@ -201,10 +202,11 @@ class AsyncSyncScheduler:
         job.last_status = payload
         try:
             _atomic_json(self._state_path(job.root), payload)
+            job.status_dirty = False
         except OSError:
-            # A status write must never break a memory write or worker.  Keep the in-memory
-            # state and let the next status read expose it while this process is alive.
-            pass
+            # A status write must never break a memory write or worker.  Remember that the
+            # in-memory state is newer than the persisted file so status() does not hide it.
+            job.status_dirty = True
         return dict(payload)
 
     def _schedule_locked(self, job: _Job, delay: float, generation: int) -> None:
@@ -450,17 +452,36 @@ class AsyncSyncScheduler:
         """
         root_path = Path(root).expanduser().resolve()
         path = self._state_path(root_path)
+        with self._lock:
+            job = self._jobs.get(_key(root_path))
+            local_status = dict(job.last_status) if job is not None and job.last_status else {}
+            local_dirty = bool(job is not None and job.status_dirty)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                if local_dirty and local_status:
+                    try:
+                        local_generation = int(local_status.get("generation", -1))
+                    except (TypeError, ValueError):
+                        local_generation = -1
+                    try:
+                        persisted_generation = int(data.get("generation", -1))
+                    except (TypeError, ValueError):
+                        persisted_generation = -1
+                    local_updated = str(local_status.get("updated_at") or "")
+                    persisted_updated = str(data.get("updated_at") or "")
+                    if (
+                        local_generation > persisted_generation
+                        or (
+                            local_generation == persisted_generation
+                            and local_updated >= persisted_updated
+                        )
+                    ):
+                        return local_status
                 return data
         except (FileNotFoundError, OSError, ValueError):
             pass
-        with self._lock:
-            job = self._jobs.get(_key(root_path))
-            if job is not None and job.last_status:
-                return dict(job.last_status)
-        return {}
+        return local_status
 
     def wait_for_idle(self, root: Union[Path, str], timeout: float = 10.0) -> Dict[str, Any]:
         """Wait until a queued job reaches success/error/conflict (primarily for tests)."""
