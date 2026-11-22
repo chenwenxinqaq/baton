@@ -111,6 +111,7 @@ class SyncJob:
     action: str
     interactive: bool
     inline: bool
+    created_at: float = 0.0
 
 
 NAV_ICONS = {
@@ -3407,6 +3408,32 @@ def render(
 
 
 class Handler(BaseHTTPRequestHandler):
+    # The current server is single-threaded, but sync workers and future
+    # threaded integrations can observe this registry concurrently.
+    SYNC_JOB_TTL_SECONDS = 15 * 60
+
+    def _sync_jobs_lock(self):
+        lock = getattr(self.server, "sync_jobs_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self.server.sync_jobs_lock = lock
+        return lock
+
+    def _sync_jobs_snapshot(self):
+        jobs = self.server.sync_jobs
+        now = time.time()
+        with self._sync_jobs_lock():
+            # Keep completed jobs long enough for a redirect/poll, then evict
+            # them so a long-running manager cannot grow this map forever.
+            for key, job in list(jobs.items()):
+                if (
+                    job.outcome.done()
+                    and job.created_at
+                    and now - job.created_at > self.SYNC_JOB_TTL_SECONDS
+                ):
+                    jobs.pop(key, None)
+            return list(jobs.items())
+
     def log_message(self, format_string, *args):
         pass
 
@@ -3728,19 +3755,36 @@ class Handler(BaseHTTPRequestHandler):
     def run_sync_job(self, key, action, interactive, perform):
         inline = self.wants_inline_sync()
         jobs = self.server.sync_jobs
-        previous = jobs.get(key)
-        if previous and not previous.outcome.done():
-            if previous.action != action:
-                raise InvalidEntry("这个库正在验证连接或同步，请待当前操作完成后重试。")
-            job = replace(previous, inline=True) if inline else previous
-            jobs[key] = job
-        else:
-            if not interactive and not inline:
-                self.respond(HTTPStatus.SEE_OTHER, "", location=perform() + "#feedback")
-                return
-            job = SyncJob(secrets.token_hex(16), Future(), action, interactive, inline)
-            jobs[key] = job
-
+        with self._sync_jobs_lock():
+            now = time.time()
+            for old_key, old_job in list(jobs.items()):
+                if (
+                    old_job.outcome.done()
+                    and old_job.created_at
+                    and now - old_job.created_at > self.SYNC_JOB_TTL_SECONDS
+                ):
+                    jobs.pop(old_key, None)
+            previous = jobs.get(key)
+            if previous and not previous.outcome.done():
+                if previous.action != action:
+                    raise InvalidEntry("这个库正在验证连接或同步，请待当前操作完成后重试。")
+                job = replace(previous, inline=True) if inline else previous
+                jobs[key] = job
+                start_thread = False
+                run_direct = False
+            elif not interactive and not inline:
+                job = None
+                start_thread = False
+                run_direct = True
+            else:
+                job = SyncJob(secrets.token_hex(16), Future(), action, interactive, inline, now)
+                jobs[key] = job
+                start_thread = True
+                run_direct = False
+        if run_direct:
+            self.respond(HTTPStatus.SEE_OTHER, "", location=perform() + "#feedback")
+            return
+        if start_thread:
             def run():
                 try:
                     job.outcome.set_result(perform())
@@ -3755,7 +3799,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def show_inline_sync_jobs(self):
         jobs = []
-        for key, job in self.server.sync_jobs.items():
+        for key, job in self._sync_jobs_snapshot():
             if not job.inline:
                 continue
             library = self.server.libraries.get(key)
@@ -3777,7 +3821,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond_json(HTTPStatus.OK, jobs)
 
     def show_sync_progress(self, job_id):
-        for key, job in self.server.sync_jobs.items():
+        for key, job in self._sync_jobs_snapshot():
             if job.identifier != job_id:
                 continue
             if not job.outcome.done():
@@ -3842,7 +3886,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path in {"/sync_setup", "/mount_add", "/mount_update", "/mount_remove"}:
                 target = fields.get("target_library") or fields.get("mount_id")
                 target = "primary" if target == "personal" else target
-                for job_key, job in self.server.sync_jobs.items():
+                for job_key, job in self._sync_jobs_snapshot():
                     if not job.outcome.done() and (job.action == "挂载共享库" or job_key == target):
                         raise InvalidEntry("正在连接或同步，请完成后再修改仓库配置。")
             if self.path == "/skill":
@@ -4412,6 +4456,7 @@ def main():
         server.async_scheduler = async_scheduler
         server.mount_issues = mount_issues
         server.sync_jobs = {}
+        server.sync_jobs_lock = threading.RLock()
         server.token = secrets.token_urlsafe(32)
         server.agent_home = None
         # Capture the pre-build signature so a config rewrite during library construction
