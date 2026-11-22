@@ -670,9 +670,20 @@ class PublicFrameworkTests(unittest.TestCase):
         # Unified search returns hits from personal + rw + ro with library attribution and namespace read.
         libs = self.tool("memory_libraries", {})
         self.assertEqual([l["id"] for l in libs], ["personal", "team-rw", "team-ro"])
-        hits = self.tool("memory_search", {"query": "排查"})
+
+        # Search defaults to personal; explicit '*' or 'all' opts into mounted libraries.
+        self.assertEqual(self.tool("memory_search", {"query": "排查"}), [])
+        hits = self.tool("memory_search", {"query": "排查", "library": "*"})
         self.assertEqual(hits[0]["library"], "team-rw")
         self.assertEqual(hits[0]["ref"], "team-rw:methods/k8s-debug.md")
+        self.assertEqual(hits[0]["source_library"], "team-rw")
+        self.assertEqual((hits[0]["provenance"], hits[0]["trust"], hits[0]["read_only"]), ("shared", "shared", False))
+        self.assertEqual(self.tool("memory_search", {"query": "排查", "library": "all"})[0]["ref"],
+                         "team-rw:methods/k8s-debug.md")
+
+        ro_hits = self.tool("memory_search", {"query": "核对", "library": "team-ro"})
+        self.assertEqual((ro_hits[0]["source_library"], ro_hits[0]["trust"], ro_hits[0]["read_only"]),
+                         ("team-ro", "shared", True))
         content = self.tool("memory_read", {"path": "team-ro:methods/release-check.md"})["content"]
         self.assertIn("核对版本号", content)
 
@@ -689,6 +700,56 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertIn("只读挂载", ro_new_html)
             finally:
                 process.terminate()
+
+    def test_default_personal_scope_mount_diagnostics_and_symlink_rejection(self):
+        missing = self.home / "missing-library"
+        self.cli("mount", "add", "broken", "--path", str(missing), "--label", "不可用", "--mode", "rw")
+        # A mounted library becomes unavailable if its required index disappears after mounting.
+        (missing / "MEMORY.md").unlink()
+        config_path = self.home / ".config" / "unified-memory" / "mounts.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["mounts"].append(
+            {"id": "bad-mode", "path": str(self.home / "bad-mode"), "mode": "admin"}
+        )
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.tool("memory_upsert", dict(layer="L1", name="personal-only", title="个人方法",
+                                        description="仅个人", body="个人专用方法"))
+
+        libs = self.tool("memory_libraries", {})
+        broken = next(lib for lib in libs if lib["id"] == "broken")
+        self.assertFalse(broken["available"])
+        self.assertTrue(broken["error"])
+        bad_mode = next(lib for lib in libs if lib["id"] == "bad-mode")
+        self.assertFalse(bad_mode["available"])
+        self.assertIn("Invalid mount mode 'admin'", bad_mode["error"])
+        self.assertEqual(bad_mode["issues"][0]["code"], "invalid_entry")
+        self.assertEqual(self.tool("memory_search", {"query": "个人"})[0]["library"], "personal")
+
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "memory_search", "arguments": {"query": "个人", "library": "broken"}}}
+        output = subprocess.check_output([sys.executable, str(CODE / "mcp/server.py")],
+                                         input=json.dumps(request) + "\n", env=self.environment(), text=True)
+        result = json.loads(output)["result"]
+        self.assertTrue(result.get("isError"), output)
+        self.assertIn("Library 'broken' is unavailable", result["content"][0]["text"])
+
+        request["params"]["arguments"] = {"query": "个人", "library": "bad-mode"}
+        output = subprocess.check_output([sys.executable, str(CODE / "mcp/server.py")],
+                                         input=json.dumps(request) + "\n", env=self.environment(), text=True)
+        result = json.loads(output)["result"]
+        self.assertTrue(result.get("isError"), output)
+        self.assertIn("Invalid mount mode 'admin'", result["content"][0]["text"])
+
+        outside = self.home / "outside.md"
+        outside.write_text("# outside\n", encoding="utf-8")
+        symlink = self.library / "methods" / "linked.md"
+        symlink.symlink_to(outside)
+        request["params"]["arguments"] = {"query": "个人"}
+        output = subprocess.check_output([sys.executable, str(CODE / "mcp/server.py")],
+                                         input=json.dumps(request) + "\n", env=self.environment(), text=True)
+        result = json.loads(output)["result"]
+        self.assertTrue(result.get("isError"), output)
+        self.assertIn("Symlinked memory file is not allowed", result["content"][0]["text"])
 
     def test_multi_host_credentials_and_failure_hints(self):
         sys.path.insert(0, str(CODE / "scripts"))

@@ -17,7 +17,13 @@ from tempfile import NamedTemporaryFile
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
+from library_paths import (
+    ALL_LAYERS,
+    config_signature,
+    data_root,
+    library_state_dir,
+    resolve_libraries,
+)
 import audit_log
 import sync_git
 
@@ -426,9 +432,7 @@ class MemoryStore:
             if layer not in self.allowed_layers:
                 continue
             dir_path = self.root / folder
-            if not dir_path.is_dir():
-                continue
-            for md in sorted(dir_path.glob("*.md")):
+            for md in self._iter_safe_md_files(dir_path):
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
@@ -459,7 +463,7 @@ class MemoryStore:
 
         user_dir = self.root / "user-managed"
         if self.allow_user_managed and user_dir.is_dir():
-            for md in sorted(user_dir.glob("*.md")):
+            for md in self._iter_safe_md_files(user_dir):
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
@@ -500,6 +504,36 @@ class MemoryStore:
     def _entry_ref(self, rel_path):
         return rel_path if self.library_id == "personal" else f"{self.library_id}:{rel_path}"
 
+    def _result_metadata(self):
+        """Return routing and trust metadata for every entry-facing result."""
+        return {
+            "library": self.library_id,
+            "library_role": self.role,
+            "library_mode": self.mode,
+            "source_library": self.library_id,
+            "provenance": self.role,
+            "trust": "personal" if self.role == "personal" else "shared",
+            "read_only": self.mode == "ro",
+        }
+
+    def _iter_safe_md_files(self, directory):
+        """Yield non-symlink Markdown files directly inside a memory layer directory."""
+        if directory.is_symlink():
+            raise ValueError(f"Symlinked memory directory is not allowed: {directory}")
+        if not directory.exists():
+            return
+        if not directory.is_dir():
+            raise ValueError(f"Memory path is not a directory: {directory}")
+        for md in sorted(directory.glob("*.md")):
+            if md.is_symlink():
+                raise ValueError(f"Symlinked memory file is not allowed: {md}")
+            resolved = md.resolve(strict=True)
+            if not resolved.is_relative_to(self.root):
+                raise ValueError(f"Memory file resolves outside the library root: {md}")
+            if not resolved.is_file():
+                raise ValueError(f"Memory path is not a regular file: {md}")
+            yield md
+
     def search(self, query, layer="", include_archived=False, limit=10):
         """Search entries by query terms, CJK bigrams, and temporal recency cues."""
         capped_limit = max(1, min(int(limit), 50))
@@ -526,9 +560,7 @@ class MemoryStore:
             return [
                 {
                     "score": 10,
-                    "library": self.library_id,
-                    "library_role": self.role,
-                    "library_mode": self.mode,
+                    **self._result_metadata(),
                     "ref": self._entry_ref(it["path"]),
                     "path": it["path"],
                     "source": it["source"],
@@ -577,9 +609,7 @@ class MemoryStore:
             results.append(
                 {
                     "score": score,
-                    "library": self.library_id,
-                    "library_role": self.role,
-                    "library_mode": self.mode,
+                    **self._result_metadata(),
                     "ref": self._entry_ref(item["path"]),
                     "path": item["path"],
                     "source": item["source"],
@@ -614,9 +644,7 @@ class MemoryStore:
 
         return [
             {
-                "library": self.library_id,
-                "library_role": self.role,
-                "library_mode": self.mode,
+                **self._result_metadata(),
                 "ref": self._entry_ref(item["path"]),
                 "path": item["path"],
                 "source": item["source"],
@@ -645,7 +673,7 @@ class MemoryStore:
                 f"Layer {folder_to_layer[top_part]} is not enabled for library '{self.library_id}'."
             )
         return {
-            "library": self.library_id,
+            **self._result_metadata(),
             "ref": self._entry_ref(rel_posix),
             "path": rel_posix,
             "content": target.read_text(encoding="utf-8"),
@@ -707,7 +735,7 @@ class MemoryStore:
                 rel_out = target.relative_to(self.root).as_posix()
                 self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_out}")
                 return {
-                    "library": self.library_id,
+                    **self._result_metadata(),
                     "ref": self._entry_ref(rel_out),
                     "path": rel_out,
                     "indexed": False,
@@ -777,7 +805,7 @@ class MemoryStore:
 
             self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_path}")
             res = {
-                "library": self.library_id,
+                **self._result_metadata(),
                 "ref": self._entry_ref(rel_path),
                 "path": rel_path,
                 "indexed": True,
@@ -873,7 +901,7 @@ class MemoryStore:
                 rel_out = target.relative_to(self.root).as_posix()
                 self._maybe_auto_commit(f"memory({self.library_id}): archive {rel_out}")
                 return {
-                    "library": self.library_id,
+                    **self._result_metadata(),
                     "path": rel_out,
                     "status": "archived",
                     "updated_at": ts_now,
@@ -927,7 +955,7 @@ class MemoryStore:
                     candidate.unlink(missing_ok=True)
                     self._maybe_auto_commit(f"memory({self.library_id}): archive {old_rel} -> {new_rel}")
                     return {
-                        "library": self.library_id,
+                        **self._result_metadata(),
                         "from": old_rel,
                         "to": new_rel,
                         "layer": "L4",
@@ -943,22 +971,29 @@ class WorkspaceStore:
     def __init__(self, primary_root, home=None):
         self.primary_root = data_root(primary_root).resolve(strict=True)
         self.home = home
-        self._config_mtime = None
+        self._config_signature = None
         self._stores = {}
         self._descriptors = []
+        self._load_errors = {}
+        self._config_issues = []
         self._load_stores(force=True)
 
     def _load_stores(self, force=False):
-        cfg_path = mounts_config_path(home=self.home)
-        try:
-            cur_mtime = cfg_path.stat().st_mtime if cfg_path.is_file() else None
-        except OSError:
-            cur_mtime = None
-        if not force and cur_mtime == self._config_mtime and "personal" in self._stores:
+        signature = config_signature(home=self.home)
+        if not force and signature == self._config_signature and "personal" in self._stores:
             return
 
-        descriptors = resolve_libraries(primary_root=self.primary_root, home=self.home)
+        config_issues = []
+        descriptors = resolve_libraries(
+            primary_root=self.primary_root, home=self.home, issues=config_issues
+        )
         stores = {}
+        load_errors = {}
+        for issue in config_issues:
+            issue_id = issue.get("id") or "config"
+            diagnostic = issue.get("message") or str(issue)
+            previous = load_errors.get(issue_id)
+            load_errors[issue_id] = f"{previous}; {diagnostic}" if previous else diagnostic
         for desc in descriptors:
             lib_id = desc["id"]
             try:
@@ -972,23 +1007,29 @@ class WorkspaceStore:
                     allow_user_managed=desc["allow_user_managed"],
                     sync_config=desc.get("sync"),
                 )
-            except (ValueError, OSError):
+            except (ValueError, OSError) as exc:
                 if lib_id == "personal":
                     raise
                 # Skip temporarily unavailable mounted libraries instead of crashing MCP startup
+                load_errors[lib_id] = str(exc) or exc.__class__.__name__
                 continue
         self._descriptors = descriptors
         self._stores = stores
-        self._config_mtime = cur_mtime
+        self._load_errors = load_errors
+        self._config_issues = config_issues
+        self._config_signature = signature
 
-    def _target_stores(self, library="*"):
+    def _target_stores(self, library="personal"):
         self._load_stores()
-        sel = (library or "*").strip()
+        sel = (library or "personal").strip()
         if sel in {"*", "all"}:
             return list(self._stores.values())
         if sel not in self._stores:
             known = ", ".join(self._stores.keys())
-            raise ValueError(f"Unknown or unavailable library '{sel}'. Available: {known}")
+            diagnostic = self._load_errors.get(sel)
+            if diagnostic:
+                raise ValueError(f"Library '{sel}' is unavailable: {diagnostic}")
+            raise ValueError(f"Unknown library '{sel}'. Available: {known}")
         return [self._stores[sel]]
 
     def _resolve_single_store(self, library="personal"):
@@ -996,17 +1037,28 @@ class WorkspaceStore:
         sel = (library or "personal").strip()
         if sel not in self._stores:
             known = ", ".join(self._stores.keys())
-            raise ValueError(f"Unknown or unavailable library '{sel}'. Available: {known}")
+            diagnostic = self._load_errors.get(sel)
+            if diagnostic:
+                raise ValueError(f"Library '{sel}' is unavailable: {diagnostic}")
+            raise ValueError(f"Unknown library '{sel}'. Available: {known}")
         return self._stores[sel]
 
     def list_libraries(self):
         self._load_stores()
         out = []
+        represented_issue_ids = set()
         for desc in self._descriptors:
             lib_id = desc["id"]
             store = self._stores.get(lib_id)
             sync_cfg = desc.get("sync")
             entry_count = len(store.collect_entries(include_archived=False)) if store else 0
+            issues = [
+                issue
+                for issue in self._config_issues
+                if issue.get("id") == lib_id
+            ]
+            if issues:
+                represented_issue_ids.add(lib_id)
             out.append(
                 {
                     "id": lib_id,
@@ -1017,13 +1069,47 @@ class WorkspaceStore:
                     "allow_user_managed": bool(desc["allow_user_managed"]),
                     "path": str(desc["path"]),
                     "available": store is not None,
+                    "error": self._load_errors.get(lib_id, ""),
+                    "source_library": lib_id,
+                    "provenance": desc["role"],
+                    "trust": "personal" if desc["role"] == "personal" else "shared",
+                    "read_only": desc["mode"] == "ro",
                     "entry_count": entry_count,
                     "sync_driver": sync_cfg.get("driver") if sync_cfg else "",
+                    "issues": issues,
+                }
+            )
+        # Configuration errors and invalid mount entries may not resolve to a descriptor.
+        # Keep them visible instead of silently disappearing from library diagnostics.
+        for issue in self._config_issues:
+            issue_id = issue.get("id") or "config"
+            if issue_id in represented_issue_ids:
+                continue
+            represented_issue_ids.add(issue_id)
+            message = issue.get("message") or str(issue)
+            out.append(
+                {
+                    "id": issue_id,
+                    "label": issue_id,
+                    "role": "configuration",
+                    "mode": "ro",
+                    "allowed_layers": [],
+                    "allow_user_managed": False,
+                    "path": issue.get("path") or "",
+                    "available": False,
+                    "error": message,
+                    "source_library": issue_id,
+                    "provenance": "configuration",
+                    "trust": "unknown",
+                    "read_only": True,
+                    "entry_count": 0,
+                    "sync_driver": "",
+                    "issues": [issue],
                 }
             )
         return out
 
-    def search(self, query, layer="", include_archived=False, limit=10, library="*"):
+    def search(self, query, layer="", include_archived=False, limit=10, library="personal"):
         capped_limit = max(1, min(int(limit), 50))
         stores = self._target_stores(library)
         if len(stores) == 1:
@@ -1050,7 +1136,7 @@ class WorkspaceStore:
         )
         return [pair[0] for pair in merged[:capped_limit]]
 
-    def list_entries(self, layer="", include_archived=False, sort="updated", library="*"):
+    def list_entries(self, layer="", include_archived=False, sort="updated", library="personal"):
         stores = self._target_stores(library)
         if len(stores) == 1:
             return stores[0].list_entries(layer=layer, include_archived=include_archived, sort=sort)
@@ -1108,7 +1194,7 @@ class WorkspaceStore:
 TOOLS = [
     {
         "name": "memory_libraries",
-        "description": "List the personal memory library and all mounted shared libraries with their read/write mode, allowed layers, and sync driver.",
+        "description": "List the personal memory library and all mounted shared libraries with availability diagnostics, read/write mode, allowed layers, and sync driver.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -1116,7 +1202,7 @@ TOOLS = [
     },
     {
         "name": "memory_search",
-        "description": "Search unified L0-L4 Markdown memories across the personal library and mounted shared libraries by keywords, Chinese phrases, or temporal cues (e.g. '最近工作', '刚刚做了什么').",
+        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1124,21 +1210,21 @@ TOOLS = [
                 "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "default": 10},
-                "library": {"type": "string", "default": "*", "description": "Target library id ('*' for all mounted libraries, or 'personal' / a shared mount id)."},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for all mounted libraries, or a shared mount id)."},
             },
             "required": ["query"],
         },
     },
     {
         "name": "memory_list",
-        "description": "List indexed L0-L4 and user-managed memory entries with created_at and updated_at timestamps across personal and mounted shared libraries.",
+        "description": "List indexed L0-L4 and user-managed memory entries from the personal library by default; pass library='*' or 'all' to include mounted shared libraries.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "sort": {"type": "string", "enum": ["updated", "created", "layer"], "default": "updated"},
-                "library": {"type": "string", "default": "*", "description": "Target library id ('*' for all, 'personal', or a shared mount id)."},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for all mounted libraries, or a shared mount id)."},
             },
         },
     },
@@ -1248,7 +1334,7 @@ def _handle_tool_call(store, name, args):
             limit=args.get("limit", 10),
         )
         if isinstance(store, WorkspaceStore):
-            kwargs["library"] = args.get("library", "*")
+            kwargs["library"] = args.get("library", "personal")
         data = store.search(**kwargs)
     elif name == "memory_list":
         kwargs = dict(
@@ -1257,7 +1343,7 @@ def _handle_tool_call(store, name, args):
             sort=args.get("sort", "updated"),
         )
         if isinstance(store, WorkspaceStore):
-            kwargs["library"] = args.get("library", "*")
+            kwargs["library"] = args.get("library", "personal")
         data = store.list_entries(**kwargs)
     elif name == "memory_read":
         if isinstance(store, WorkspaceStore):
