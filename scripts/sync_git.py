@@ -748,9 +748,8 @@ def current_branch(root, fallback="main"):
     return fallback
 
 
-def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable=True):
-    """Ensure root is a Git repo with sane .gitignore, local identity, and optional remote."""
-    root = Path(root).expanduser().resolve()
+def _ensure_repo_unlocked(root, remote_url="", remote="origin", branch="main", *, writable=True):
+    """Ensure root is a Git repo while the caller already holds the library lock."""
     try:
         validate_remote_url(remote_url)
     except ValueError as exc:
@@ -782,6 +781,25 @@ def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable
         # in mounts.json and Git needs the original remote to work.
         "remote_url": _run_git(root, "remote", "get-url", remote, check=False).stdout.strip(),
     }
+
+
+def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable=True):
+    """Ensure root is a Git repo with sane .gitignore, local identity, and optional remote.
+
+    Repository metadata and the managed ``.gitignore`` are shared mutable state just like
+    memory files.  Serialize initialization/reconfiguration with pulls, pushes, and writes;
+    the unlocked helper is used only by callers that already hold ``_library_lock``.
+    """
+    root = Path(root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with _library_lock(root):
+        return _ensure_repo_unlocked(
+            root,
+            remote_url=remote_url,
+            remote=remote,
+            branch=branch,
+            writable=writable,
+        )
 
 
 def clone_repo(remote_url, dest_path, branch=""):

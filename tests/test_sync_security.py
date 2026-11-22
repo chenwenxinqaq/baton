@@ -87,6 +87,20 @@ class SyncSecurityTests(unittest.TestCase):
             self.assertNotIn("credential.txt", tracked)
             self.assertNotIn("methods/link.md", tracked)
 
+    def test_ensure_repo_serializes_repository_metadata_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(
+                sync_git,
+                "_library_lock",
+                wraps=sync_git._library_lock,
+            ) as lock:
+                info = sync_git.ensure_repo(root)
+
+            self.assertTrue(info["initialized"])
+            lock.assert_called_once_with(root.resolve())
+            self.assertTrue((root / ".git").is_dir())
+
     def test_index_rebuild_ignores_symlink_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
