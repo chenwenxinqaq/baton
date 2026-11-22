@@ -2,10 +2,18 @@
   "name": "unified-memory-desktop",
   "productName": "Unified Memory",
   "description": "Personal memory workspace",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
   "main": "main.cjs",
-  "engines": {"node": ">=22.12.0"},
-  "scripts": {"start": "electron .", "package": "node package.mjs"},
-  "devDependencies": {"electron": "45.4.1", "@electron/packager": "20.3.0"}
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "package": "node package.mjs"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "@electron/packager": "20.3.0"
+  }
 }
