@@ -210,6 +210,24 @@ def _day_start(now):
     return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
+def _ref_library(event, ref):
+    """Return the logical library for an audit ref.
+
+    Multi-library events normally carry both ``library`` and a library-qualified
+    ref for shared entries.  Older events may omit ``library``; in that case a
+    bare ref follows the personal-library convention, while an explicit
+    ``library:path`` prefix remains authoritative.
+    """
+    raw_ref = str(ref or "")
+    prefix, separator, _ = raw_ref.partition(":")
+    if separator and prefix:
+        return prefix
+    library = str(event.get("library") or "").strip()
+    if library in {"", "*", "all"}:
+        return "personal"
+    return library
+
+
 def summarize(now=None, home=None, days=7):
     """Aggregate the last `days` days for the dashboard."""
     now = now or time.time()
@@ -239,11 +257,15 @@ def summarize(now=None, home=None, days=7):
         if e.get("ok") is False:
             continue
         if e.get("tool") == "memory_read" and e.get("ref"):
-            hit_counter[e["ref"]] += 2
+            ref = e["ref"]
+            hit_counter[(_ref_library(e, ref), ref)] += 2
         elif e.get("tool") == "memory_search":
             for ref in e.get("refs") or []:
-                hit_counter[ref] += 1
-    top_hits = [{"ref": r, "score": s} for r, s in hit_counter.most_common(5)]
+                hit_counter[(_ref_library(e, ref), ref)] += 1
+    top_hits = [
+        {"library": library, "ref": ref, "score": score}
+        for (library, ref), score in hit_counter.most_common(5)
+    ]
 
     recent_queries = [
         {"t": e["t"], "client": e.get("client"), "query": e.get("query"), "hits": e.get("hits", 0)}

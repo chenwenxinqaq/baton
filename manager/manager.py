@@ -2293,13 +2293,21 @@ def _ago_zh(epoch, now=None):
     return f"{diff // 86400} 天前"
 
 
-def _ref_link(ref, key):
-    """Return an HTML link for 'library:path' (or bare path) refs."""
+def _ref_link(ref, key, event_library=""):
+    """Return an HTML link for 'library:path' (or bare path) refs.
+
+    Bare paths historically mean the personal library.  The activity dashboard
+    is global, though, so it must use the audit event's library instead of the
+    currently selected navigation library when one is available.
+    """
     ref = str(ref or "")
     lib, _, path = ref.partition(":") if ":" in ref else ("", "", ref)
     if not path:
         return escape(ref)
-    href = query(library=lib or key, topic=path) + "#detail-title"
+    selected_library = lib or str(event_library or "").strip() or key
+    if selected_library == "personal":
+        selected_library = "primary"
+    href = query(library=selected_library, topic=path) + "#detail-title"
     return f'<a href="{escape(href)}">{escape(ref)}</a>'
 
 
@@ -2359,7 +2367,7 @@ def render_activity_panel(key, agent_home=None):
 
     write_rows = "".join(
         f'<li><span class="act-meta">{escape(_ago_zh(e["t"], now))} · {escape(str(e.get("client", "")))}</span> '
-        f'{_ref_link(e.get("ref") or "", key)}'
+        f'{_ref_link(e.get("ref") or "", key, e.get("library"))}'
         f'{" <em>(归档)</em>" if e.get("tool") == "memory_archive" else ""}</li>'
         for e in summary["recent_writes"][:5]
     ) or '<li class="act-meta">近 7 天 AI 还没有写入任何记忆</li>'
@@ -2369,7 +2377,7 @@ def render_activity_panel(key, agent_home=None):
         for q in summary["recent_queries"][:4]
     ) or '<li class="act-meta">近 7 天 AI 还没有查询过记忆</li>'
     hit_rows = "".join(
-        f'<li>{_ref_link(h["ref"], key)} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
+        f'<li>{_ref_link(h["ref"], key, h.get("library"))} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
     ) or '<li class="act-meta">暂无高频命中</li>'
 
     return f"""
