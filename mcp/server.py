@@ -26,6 +26,7 @@ from library_paths import (
 )
 import audit_log
 import sync_git
+from async_sync import AsyncSyncScheduler
 
 DEFAULT_ROOT = data_root()
 LAYER_DIRS = {
@@ -342,6 +343,7 @@ class MemoryStore:
         allowed_layers=None,
         allow_user_managed=True,
         sync_config=None,
+        async_scheduler=None,
     ):
         self.root = data_root(root).resolve(strict=True)
         self.index_path = self.root / "MEMORY.md"
@@ -354,6 +356,10 @@ class MemoryStore:
         self.allowed_layers = frozenset(allowed_layers if allowed_layers is not None else ALL_LAYERS)
         self.allow_user_managed = bool(allow_user_managed)
         self.sync_config = sync_config
+        # The scheduler is supplied by WorkspaceStore so all mounted libraries in
+        # this MCP process share one lightweight worker registry.  Keeping this
+        # optional preserves the small, directly-testable MemoryStore API.
+        self.async_scheduler = async_scheduler
         self.state_dir = library_state_dir(self.root)
         self.lock_path = self.state_dir / "library.lock"
         self.trash_dir = self.state_dir / "trash"
@@ -441,6 +447,58 @@ class MemoryStore:
         if isinstance(sync_status, dict) and sync_status.get("warning"):
             result["sync_warning"] = sync_status["warning"]
         return result
+
+    def _enqueue_async_sync(self, message):
+        """Queue a debounced remote sync after a successful local write.
+
+        Async push is deliberately best-effort: the memory write and local
+        ``auto_commit`` result remain authoritative, while the scheduler persists
+        any remote failure in ``.state/sync-status.json`` for later inspection.
+        The scheduler itself filters read-only, non-Git, and ``auto_push=false``
+        libraries, so callers can invoke this uniformly for every write path.
+        """
+        scheduler = self.async_scheduler
+        if scheduler is None:
+            return None
+        config = self.sync_config or {}
+        if (
+            self.mode != "rw"
+            or str(config.get("driver") or "").casefold() != "git"
+            or not bool(config.get("auto_push", False))
+        ):
+            return None
+        try:
+            return scheduler.enqueue(
+                self.root,
+                sync_config=config,
+                mode=self.mode,
+                reason=message,
+            )
+        except Exception:
+            # Never turn an already successful memory write into an error because
+            # a process-local background scheduler is unavailable.
+            return None
+
+    def async_sync_status(self):
+        """Return the latest background sync status for this library.
+
+        The scheduler keeps an in-memory copy while the MCP process is alive and
+        persists the same bounded payload under the library's private ``.state``
+        directory.  Reading through the scheduler also makes a status left by a
+        previous process visible to the current process.
+        """
+        scheduler = self.async_scheduler
+        if scheduler is not None:
+            try:
+                return scheduler.status(self.root)
+            except Exception:
+                pass
+        path = self.state_dir / "sync-status.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
 
     def resolve_safe(self, rel_path):
         """Resolve a relative path and enforce confinement inside self.root."""
@@ -784,7 +842,9 @@ class MemoryStore:
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body}\n")
                 rel_out = target.relative_to(self.root).as_posix()
-                sync_status = self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_out}")
+                message = f"memory({self.library_id}): upsert {rel_out}"
+                sync_status = self._maybe_auto_commit(message)
+                self._enqueue_async_sync(message)
                 return self._with_sync_warning({
                     **self._result_metadata(),
                     "ref": self._entry_ref(rel_out),
@@ -854,7 +914,9 @@ class MemoryStore:
                 stale_path.unlink(missing_ok=True)
                 migrated_from.append(stale_rel)
 
-            sync_status = self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_path}")
+            message = f"memory({self.library_id}): upsert {rel_path}"
+            sync_status = self._maybe_auto_commit(message)
+            self._enqueue_async_sync(message)
             res = {
                 **self._result_metadata(),
                 "ref": self._entry_ref(rel_path),
@@ -950,7 +1012,9 @@ class MemoryStore:
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
                 rel_out = target.relative_to(self.root).as_posix()
-                sync_status = self._maybe_auto_commit(f"memory({self.library_id}): archive {rel_out}")
+                message = f"memory({self.library_id}): archive {rel_out}"
+                sync_status = self._maybe_auto_commit(message)
+                self._enqueue_async_sync(message)
                 return self._with_sync_warning({
                     **self._result_metadata(),
                     "path": rel_out,
@@ -1004,7 +1068,9 @@ class MemoryStore:
                             pass
                         raise
                     candidate.unlink(missing_ok=True)
-                    sync_status = self._maybe_auto_commit(f"memory({self.library_id}): archive {old_rel} -> {new_rel}")
+                    message = f"memory({self.library_id}): archive {old_rel} -> {new_rel}"
+                    sync_status = self._maybe_auto_commit(message)
+                    self._enqueue_async_sync(message)
                     return self._with_sync_warning({
                         **self._result_metadata(),
                         "from": old_rel,
@@ -1019,15 +1085,24 @@ class MemoryStore:
 class WorkspaceStore:
     """Multi-library facade uniting the personal memory root with mounted shared libraries."""
 
-    def __init__(self, primary_root, home=None):
+    def __init__(self, primary_root, home=None, async_scheduler=None):
         self.primary_root = data_root(primary_root).resolve(strict=True)
         self.home = home
+        # MCP normally owns one process-local scheduler shared by all mounted
+        # libraries.  Tests/embedders may inject one (and then own its lifecycle).
+        self.async_scheduler = async_scheduler or AsyncSyncScheduler()
+        self._owns_async_scheduler = async_scheduler is None
         self._config_signature = None
         self._stores = {}
         self._descriptors = []
         self._load_errors = {}
         self._config_issues = []
         self._load_stores(force=True)
+
+    def shutdown(self):
+        """Stop this workspace's background scheduler during process shutdown."""
+        if self._owns_async_scheduler and self.async_scheduler is not None:
+            self.async_scheduler.shutdown()
 
     def _load_stores(self, force=False):
         signature = config_signature(home=self.home)
@@ -1057,6 +1132,7 @@ class WorkspaceStore:
                     allowed_layers=desc["layers"],
                     allow_user_managed=desc["allow_user_managed"],
                     sync_config=desc.get("sync"),
+                    async_scheduler=self.async_scheduler,
                 )
             except (ValueError, OSError) as exc:
                 if lib_id == "personal":
@@ -1103,6 +1179,7 @@ class WorkspaceStore:
             store = self._stores.get(lib_id)
             sync_cfg = desc.get("sync")
             entry_count = len(store.collect_entries(include_archived=False)) if store else 0
+            async_status = store.async_sync_status() if store else {}
             issues = [
                 issue
                 for issue in self._config_issues
@@ -1126,6 +1203,7 @@ class WorkspaceStore:
                     "trust": "personal" if desc["role"] == "personal" else "shared",
                     "read_only": desc["mode"] == "ro",
                     "entry_count": entry_count,
+                    "async_sync": async_status,
                     "sync_driver": sync_cfg.get("driver") if sync_cfg else "",
                     "issues": issues,
                 }
@@ -1487,27 +1565,32 @@ def send_response(payload):
 
 def serve_stdio(store):
     """Run JSON-RPC 2.0 MCP server loop over stdin/stdout (single & batch)."""
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError as exc:
-            send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
-            continue
-
-        if isinstance(parsed, list):
-            if not parsed:
-                send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Empty batch"}})
+    try:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
                 continue
-            responses = [resp for item in parsed for resp in [process_one_message(store, item)] if resp is not None]
-            if responses:
-                send_response(responses)
-        else:
-            resp = process_one_message(store, parsed)
-            if resp is not None:
-                send_response(resp)
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+                continue
+
+            if isinstance(parsed, list):
+                if not parsed:
+                    send_response({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Empty batch"}})
+                    continue
+                responses = [resp for item in parsed for resp in [process_one_message(store, item)] if resp is not None]
+                if responses:
+                    send_response(responses)
+            else:
+                resp = process_one_message(store, parsed)
+                if resp is not None:
+                    send_response(resp)
+    finally:
+        shutdown = getattr(store, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
 
 def main():
