@@ -27,6 +27,11 @@ REMOTE_URL_WITH_USERINFO_RE = re.compile(
     r"(?P<prefix>(?:https?|ssh)://)(?P<userinfo>[^/\s@]+)@",
     re.IGNORECASE,
 )
+REMOTE_SCP_WITH_PASSWORD_RE = re.compile(
+    r"(?P<prefix>^|[\s(])(?P<userinfo>[^/\s:@]+):(?P<password>[^/\s@]+)"
+    r"@(?P<host>[^/\s:]+):",
+    re.IGNORECASE,
+)
 
 
 def audit_path(home=None):
@@ -34,7 +39,8 @@ def audit_path(home=None):
 
 
 def _redact_remote_urls(value):
-    return REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(value or ""))
+    text = REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(value or ""))
+    return REMOTE_SCP_WITH_PASSWORD_RE.sub(r"\g<prefix>***@\g<host>:", text)
 
 
 def _private_dir(path):

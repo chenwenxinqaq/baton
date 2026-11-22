@@ -43,11 +43,17 @@ REMOTE_URL_WITH_USERINFO_RE = re.compile(
     r"(?P<prefix>(?:https?|ssh)://)(?P<userinfo>[^/\s@]+)@",
     re.IGNORECASE,
 )
+REMOTE_SCP_WITH_PASSWORD_RE = re.compile(
+    r"(?P<prefix>^|[\s(])(?P<userinfo>[^/\s:@]+):(?P<password>[^/\s@]+)"
+    r"@(?P<host>[^/\s:]+):",
+    re.IGNORECASE,
+)
 
 
 def _redact_remote_urls(text):
     """Hide URL userinfo (including tokens) before returning/logging Git output."""
-    return REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(text or ""))
+    value = REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(text or ""))
+    return REMOTE_SCP_WITH_PASSWORD_RE.sub(r"\g<prefix>***@\g<host>:", value)
 
 
 def redact_remote_url(remote_url):
@@ -74,6 +80,8 @@ def validate_remote_url(remote_url):
         userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
         if userinfo and ":" in unquote(userinfo):
             raise ValueError("远端地址不能包含内嵌密码或访问令牌，请改用钥匙串、凭据助手或 SSH 密钥。")
+    if REMOTE_SCP_WITH_PASSWORD_RE.match(raw):
+        raise ValueError("远端地址不能包含内嵌密码或访问令牌，请改用钥匙串、凭据助手或 SSH 密钥。")
     return raw
 
 

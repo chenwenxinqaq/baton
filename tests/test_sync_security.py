@@ -3,22 +3,68 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "scripts"))
+sys.path.insert(0, str(CODE / "mcp"))
 
 import audit_log  # noqa: E402
+import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
 
 
 class SyncSecurityTests(unittest.TestCase):
+    def test_mcp_auto_commit_failure_is_a_sync_event_and_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "MEMORY.md").write_text(
+                "# Unified Memory\n\n## L0\n\n## L1\n\n## L2\n\n## L3\n\n## L4\n",
+                encoding="utf-8",
+            )
+            for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
+                (root / folder).mkdir()
+            events = []
+            with mock.patch.object(
+                mcp_server.sync_git,
+                "auto_commit",
+                side_effect=RuntimeError("https://alice:secret@gitee.com/team/memory.git failed"),
+            ), mock.patch.object(
+                mcp_server.audit_log,
+                "record",
+                side_effect=lambda event, **_: events.append(event) or True,
+            ):
+                store = mcp_server.MemoryStore(
+                    root,
+                    sync_config={"driver": "git", "auto_commit": True},
+                )
+                result = store.upsert_entry("L1", "sync-demo", "同步失败", "测试", "正文")
+
+            self.assertIn("sync_warning", result)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["source"], "sync")
+            self.assertEqual(events[0]["event"], "git_auto_commit")
+            self.assertEqual(events[0]["reason"], "sync_error")
+            self.assertNotIn("secret", events[0]["error"])
+            self.assertIn("https://***@gitee.com", events[0]["error"])
+
     def test_remote_passwords_are_rejected_and_errors_redacted(self):
         with self.assertRaisesRegex(ValueError, "不能包含内嵌密码"):
             sync_git.validate_remote_url("https://alice:secret@gitee.com/team/memory.git")
+        with self.assertRaisesRegex(ValueError, "不能包含内嵌密码"):
+            sync_git.validate_remote_url("alice:secret@git.example.com:team/memory.git")
         self.assertEqual(
             sync_git._redact_remote_urls("fatal: https://alice:secret@gitee.com/team/memory.git"),
             "fatal: https://***@gitee.com/team/memory.git",
+        )
+        self.assertEqual(
+            sync_git._redact_remote_urls("fatal: alice:secret@git.example.com:team/memory.git"),
+            "fatal: ***@git.example.com:team/memory.git",
+        )
+        self.assertEqual(
+            audit_log._redact_remote_urls("alice:secret@git.example.com:team/memory.git"),
+            "***@git.example.com:team/memory.git",
         )
 
     def test_auto_commit_stages_only_memory_markdown(self):

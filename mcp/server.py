@@ -403,7 +403,7 @@ class MemoryStore:
             if isinstance(result, dict):
                 status = dict(result)
             else:
-                status = {"committed": False, "reason": "invalid_result"}
+                status = {"committed": False, "reason": "sync_error"}
             status["committed"] = False
             reason = redacted(status.get("reason") or "unknown")
             detail = redacted(error or status.get("error") or "")
@@ -413,7 +413,7 @@ class MemoryStore:
             status["warning"] = f"记忆已保存，但 Git 快照未提交（原因：{reason}）。"
             audit_log.record(
                 {
-                    "source": "mcp",
+                    "source": "sync",
                     "event": "git_auto_commit",
                     "client": CLIENT_NAME,
                     "tool": "git_auto_commit",
