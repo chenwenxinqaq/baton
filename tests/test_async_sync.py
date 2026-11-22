@@ -118,6 +118,42 @@ class AsyncSyncSchedulerTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("projects/topic.md", result["result"]["conflicts"])
 
+    def test_new_enqueue_clears_terminal_status_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            calls = []
+
+            def sync_fn(path, **kwargs):
+                calls.append(1)
+                return {"status": "ok", "revision": len(calls)}
+
+            scheduler = AsyncSyncScheduler(
+                sync_fn,
+                debounce_seconds=0.05,
+                state_dir=Path(tmp) / "state",
+            )
+            self.addCleanup(scheduler.shutdown)
+
+            scheduler.enqueue(root, sync_config=self.config(), reason="first write")
+            first = scheduler.wait_for_idle(root, timeout=2)
+            self.assertEqual(first["status"], "success")
+            self.assertIn("result", first)
+            self.assertIn("finished_at", first)
+
+            second = scheduler.enqueue(root, sync_config=self.config(), reason="second write")
+            self.assertEqual(second["status"], "pending")
+            self.assertEqual(second["reason"], "second write")
+            self.assertNotIn("result", second)
+            self.assertNotIn("started_at", second)
+            self.assertNotIn("finished_at", second)
+            self.assertNotIn("error", second)
+            self.assertNotIn("next_attempt_at", second)
+
+            final = scheduler.wait_for_idle(root, timeout=2)
+            self.assertEqual(final["status"], "success")
+            self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

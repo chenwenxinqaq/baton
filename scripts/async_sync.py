@@ -281,11 +281,13 @@ class AsyncSyncScheduler:
             status = self._persist_locked(
                 job,
                 "pending",
-                queued_at=job.last_status.get("queued_at") or now,
+                queued_at=now,
+                started_at=None,
+                finished_at=None,
                 next_attempt_at=None,
                 reason=job.reason,
                 error=None,
-                finished_at=None,
+                result=None,
             )
             generation = job.generation
             self._schedule_locked(job, self.debounce_seconds, generation)
