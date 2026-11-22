@@ -351,7 +351,6 @@ class AsyncSyncScheduler:
             if current is None:
                 return
             current.running = False
-            current.attempts = attempt
             if current.generation != generation:
                 # A write landed while this run was active.  Keep the result as diagnostic data,
                 # but schedule a fresh coalesced run for the newer generation.
@@ -367,6 +366,7 @@ class AsyncSyncScheduler:
                 self._schedule_locked(current, self.debounce_seconds, current.generation)
                 return
 
+            current.attempts = attempt
             if error is not None:
                 detail = _redact(f"{error.__class__.__name__}: {error}")
                 if attempt <= self.max_retries:

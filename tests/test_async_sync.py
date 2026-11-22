@@ -154,6 +154,46 @@ class AsyncSyncSchedulerTests(unittest.TestCase):
             self.assertEqual(final["status"], "success")
             self.assertEqual(len(calls), 2)
 
+    def test_write_during_running_sync_keeps_new_generation_retry_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            first_started = threading.Event()
+            release_first = threading.Event()
+            calls = []
+            calls_lock = threading.Lock()
+
+            def sync_fn(path, **kwargs):
+                with calls_lock:
+                    calls.append(len(calls) + 1)
+                    call_number = len(calls)
+                if call_number == 1:
+                    first_started.set()
+                    self.assertTrue(release_first.wait(timeout=2))
+                    raise RuntimeError("first generation failed")
+                if call_number == 2:
+                    raise RuntimeError("new generation first attempt failed")
+                return {"status": "ok", "revision": call_number}
+
+            scheduler = AsyncSyncScheduler(
+                sync_fn,
+                debounce_seconds=0,
+                max_retries=1,
+                retry_backoff=0,
+                state_dir=Path(tmp) / "state",
+            )
+            self.addCleanup(scheduler.shutdown)
+
+            scheduler.enqueue(root, sync_config=self.config(), reason="first write")
+            self.assertTrue(first_started.wait(timeout=2))
+            scheduler.enqueue(root, sync_config=self.config(), reason="second write")
+            release_first.set()
+
+            result = scheduler.wait_for_idle(root, timeout=2)
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(result["result"]["revision"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
