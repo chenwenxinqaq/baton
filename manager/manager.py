@@ -1734,7 +1734,11 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
                 f'<a class="btn btn-warn btn-compact" href="{escape(query(library=nav_key, view="conflicts"))}#detail-title">处理冲突</a>'
             )
         if git.get("is_repo") and git.get("remote_url") and nav_key in libraries:
-            test_label = "连接 GitHub（仅验证）" if sync_git.github_browser_login(git["remote_url"]) else "测试读取连接"
+            test_label = {
+                "github-browser": "连接 GitHub（仅验证）",
+                "https-credential": "测试读取连接（钥匙串凭据）",
+                "ssh": "测试读取连接（SSH 密钥）",
+            }.get(sync_git.auth_method(git["remote_url"]), "测试读取连接")
             act_btns.append(
                 f'<form method="post" action="/sync_test#feedback">'
                 f'{hidden("csrf", token)}{hidden("library", nav_key)}'
@@ -1837,7 +1841,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
       <section class="hub-section">
         <h2 class="hub-section-title">个人主库跨设备同步（GitHub / Gitee / 自建 Git）</h2>
-        <p class="hub-section-desc">粘贴你有写入权限的仓库地址。桌面版首次连接私有 GitHub HTTPS 仓库时会打开浏览器授权，完成后自动继续同步。同步会上传本地记忆和提交历史。</p>
+        <p class="hub-section-desc">粘贴你有写入权限的仓库地址。GitHub HTTPS 仓库首次连接时会打开浏览器授权；Gitee、GitLab 和自建平台的 HTTPS 地址使用钥匙串中保存的用户名与访问令牌（可写成 https://用户名@主机/...）；SSH 地址使用本机 SSH 密钥。同步会上传本地记忆和提交历史。</p>
         <form method="post" action="/sync_setup#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}{hidden("target_library", "personal")}
           <div class="form-row-two">
@@ -1864,12 +1868,12 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
       <section class="hub-section">
         <h2 class="hub-section-title">挂载新的共享记忆库</h2>
-        <p class="hub-section-desc">粘贴团队仓库链接并选择权限即可加入。首次使用私有 GitHub 仓库时，请用已接受邀请的账号完成浏览器授权。共享库使用独立目录，个人库保存在原处。</p>
+        <p class="hub-section-desc">粘贴团队仓库链接并选择权限即可加入。私有 GitHub 仓库会打开浏览器授权；其他平台的 HTTPS 地址读取钥匙串中的用户名与访问令牌，SSH 地址使用本机密钥。共享库使用独立目录，个人库保存在原处。</p>
         <form method="post" action="/mount_add#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}
           <div class="field-group">
-            <label class="field-label" for="m-git">团队仓库 HTTPS 地址</label>
-            <input id="m-git" type="text" name="git_url" placeholder="https://github.com/团队/记忆库">
+            <label class="field-label" for="m-git">团队仓库地址（HTTPS 或 SSH）</label>
+            <input id="m-git" type="text" name="git_url" placeholder="https://github.com/团队/记忆库 或 https://用户名@gitee.com/团队/记忆库">
           </div>
           <div class="field-group">
             <label class="field-label" for="m-mode">权限模式</label>

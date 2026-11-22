@@ -15,6 +15,7 @@ import sys
 import subprocess
 import time
 from tempfile import NamedTemporaryFile
+from urllib.parse import unquote
 from urllib.request import getproxies, proxy_bypass
 
 from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
@@ -293,6 +294,106 @@ def github_browser_login(remote_url):
                              remote_url, re.IGNORECASE) and github_helper())
 
 
+NETWORK_COMMANDS = {"ls-remote", "fetch", "push", "clone"}
+# Non-interactive network commands must not hang a sync job forever.
+NETWORK_TIMEOUT = 120
+KNOWN_HTTPS_PROVIDERS = {
+    "github.com": "GitHub",
+    "gitee.com": "Gitee",
+    "gitlab.com": "GitLab",
+    "bitbucket.org": "Bitbucket",
+}
+_HTTPS_URL_RE = re.compile(r"https://(?:(?P<user>[^@/\s]+)@)?(?P<host>[A-Za-z0-9.-]+(?::\d+)?)(?:[/?#]|$)",
+                           re.IGNORECASE)
+_SSH_URL_RE = re.compile(r"(?:ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:)")
+_MAC_KEYCHAIN_HELPERS = (
+    "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-credential-osxkeychain",
+    "/Applications/Xcode.app/Contents/Developer/usr/libexec/git-core/git-credential-osxkeychain",
+    "/opt/homebrew/opt/git/libexec/git-core/git-credential-osxkeychain",
+    "/usr/local/opt/git/libexec/git-core/git-credential-osxkeychain",
+)
+
+
+def https_remote(remote_url):
+    """Return host details for an HTTPS remote, or None for SSH and local paths."""
+    match = _HTTPS_URL_RE.match(remote_url or "")
+    if not match:
+        return None
+    host = match["host"].lower()
+    return {
+        "host": host,
+        "username": unquote(match["user"] or ""),
+        "scope": f"https://{host}",
+        "provider": KNOWN_HTTPS_PROVIDERS.get(host, ""),
+    }
+
+
+def auth_method(remote_url):
+    """Describe how the desktop Git authenticates to a remote."""
+    info = https_remote(remote_url)
+    if info and info["host"] == "github.com" and github_helper():
+        return "github-browser"
+    if info:
+        return "https-credential"
+    if _SSH_URL_RE.match(remote_url or ""):
+        return "ssh"
+    return "local"
+
+
+def https_credential_helper():
+    """Find a credential store for non-GitHub HTTPS hosts.
+
+    The bundled Git does not read the system gitconfig, so the macOS keychain helper
+    configured by Apple's Git is invisible unless it is passed explicitly.
+    Returns (helper_path, kind) or (None, "").
+    """
+    explicit = os.environ.get("UNIFIED_MEMORY_GIT_CREDENTIAL_HELPER")
+    if explicit:
+        return (explicit, "custom") if os.access(explicit, os.X_OK) else (None, "")
+    if sys.platform == "darwin":
+        for candidate in (shutil.which("git-credential-osxkeychain"), *_MAC_KEYCHAIN_HELPERS):
+            if candidate and os.access(candidate, os.X_OK):
+                return candidate, "osxkeychain"
+        helper = github_helper()
+        if helper:
+            return helper, "gcm"
+    return None, ""
+
+
+def _credential_options(remote_url, browser_login, env):
+    """Host-scoped credential settings: GCM browser login for GitHub, keychain for other HTTPS hosts."""
+    options = []
+    helper = github_helper()
+    if helper:
+        options += ["-c", "credential.https://github.com.helper=!" + shlex.quote(helper),
+                    "-c", "credential.https://github.com.gitHubAuthModes=browser",
+                    "-c", "credential.https://github.com.interactive=" + ("true" if browser_login else "false")]
+    info = https_remote(remote_url)
+    if info and info["host"] != "github.com":
+        store, kind = https_credential_helper()
+        if store:
+            options += ["-c", f"credential.{info['scope']}.helper=!" + shlex.quote(store)]
+            if kind == "gcm":
+                options += ["-c", f"credential.{info['scope']}.interactive=false"]
+                env.setdefault("GCM_CREDENTIAL_STORE", "keychain")
+    return options
+
+
+def _network_url(root, args, env):
+    """Resolve the URL a network command talks to, so credentials can be scoped to its host."""
+    rest = list(args[1:])
+    if "--" in rest:
+        candidates = rest[rest.index("--") + 1:]
+    else:
+        candidates = [arg for arg in rest if not arg.startswith("-")]
+    target = candidates[0] if candidates else "origin"
+    if args[0] == "clone" or "://" in target or _SSH_URL_RE.match(target) or target.startswith(("/", ".", "~")):
+        return target
+    proc = subprocess.run(["git", "remote", "get-url", target], cwd=str(root), env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def _github_proxy_options(root, env):
     """Supply macOS's static HTTPS proxy as a host-scoped Git default."""
     if sys.platform != "darwin" or any(key.lower() in {"http_proxy", "https_proxy", "all_proxy"}
@@ -320,13 +421,11 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
     if env_extra:
         env.update(env_extra)
     cmd = ["git", "-c", "core.quotepath=false"]
-    if args[0] in {"ls-remote", "fetch", "push", "clone"}:
+    if args[0] in NETWORK_COMMANDS:
         cmd += _github_proxy_options(root, env)
-        helper = github_helper()
-        if helper:
-            cmd += ["-c", "credential.https://github.com.helper=!" + shlex.quote(helper),
-                    "-c", "credential.https://github.com.gitHubAuthModes=browser",
-                    "-c", "credential.https://github.com.interactive=" + ("true" if browser_login else "false")]
+        cmd += _credential_options(_network_url(root, args, env), browser_login, env)
+        if timeout is None and not browser_login:
+            timeout = NETWORK_TIMEOUT
     # A timed-out Git can leave its credential helper listening for an OAuth callback.
     with subprocess.Popen(cmd + list(args), cwd=str(root), env=env, text=True, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
@@ -338,7 +437,9 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
             except ProcessLookupError:
                 pass
             process.communicate()
-            raise GitSyncError("等待 GitHub 授权或网络连接超时，请返回同步页重试。") from exc
+            if browser_login:
+                raise GitSyncError("等待 GitHub 授权或网络连接超时，请返回同步页重试。") from exc
+            raise GitSyncError(f"连接远端仓库超时（{int(timeout)} 秒），请检查网络、代理或仓库地址后重试。") from exc
     return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
@@ -346,20 +447,47 @@ class _InterruptedTlsHandshake(GitSyncError):
     """Git lost the transport while establishing TLS with the remote."""
 
 
-def _git_failure(action, detail):
+def _detail_tail(detail, lines=3):
+    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", detail)
+    kept = [line.strip() for line in plain.splitlines()
+            if line.strip() and not line.strip().startswith("Cloning into")]
+    return " / ".join(kept[-lines:])[:400]
+
+
+def _auth_hint(remote_url):
+    info = https_remote(remote_url)
+    if info and info["host"] == "github.com":
+        return "可在桌面版「共享与同步」点击「连接 GitHub」重新授权。"
+    if info:
+        name = info["provider"] or info["host"]
+        user = f"（当前地址指定用户名 {info['username']}）" if info["username"] else ""
+        return (f"{name} 使用 HTTPS 用户名 + 访问令牌认证{user}。请在钥匙串中保存 {info['host']} 的凭据，"
+                f"用户名需与平台账号一致；也可把地址写成 https://用户名@{info['host']}/... 后重试。")
+    if _SSH_URL_RE.match(remote_url or ""):
+        return "SSH 地址使用本机 SSH 密钥，请确认公钥已添加到代码平台，且 ssh-agent 已加载私钥。"
+    return "请检查 Git 凭据。"
+
+
+def _git_failure(action, detail, remote_url=""):
     lowered = detail.lower()
+    info = https_remote(remote_url)
+    is_github = not remote_url or (info is not None and info["host"] == "github.com")
+    raw = _detail_tail(detail)
     if "ssl_connect" in lowered and "ssl_error_syscall" in lowered:
         return _InterruptedTlsHandshake("与远端仓库建立 HTTPS 安全连接时中断。请检查网络或代理后重试。")
-    if "repository not found" in lowered or re.search(r"(?:http |error: )403\b", lowered) or "write access to repository not granted" in lowered:
-        return GitSyncError("仓库地址有误或当前账号权限不足。请在 GitHub 确认仓库归属、接受协作邀请，并核对读写权限。")
     if any(word in lowered for word in ("user_cancel", "access_denied", "authentication was canceled", "user canceled", "user cancelled")):
-        return GitSyncError("GitHub 授权已取消，可以重新点击连接。")
-    if ("terminal prompts disabled" in lowered or "authentication failed" in lowered
-            or "permission denied (publickey" in lowered):
-        return GitSyncError(
-            "本机 Git 未能通过远端身份验证。"
-            "使用 GitHub HTTPS 地址时，可在桌面版「共享与同步」点击「连接 GitHub」重新授权。其他地址请检查 Git 凭据。"
-        )
+        return GitSyncError(("GitHub " if is_github else "") + "授权已取消，可以重新点击连接。")
+    auth_failed = any(word in lowered for word in (
+        "terminal prompts disabled", "authentication failed", "permission denied (publickey",
+        "incorrect username or password", "invalid username or password", "could not read username",
+        "could not read password", "http basic: access denied"))
+    if auth_failed:
+        return GitSyncError(f"本机 Git 未能通过远端身份验证。{_auth_hint(remote_url)}（Git：{raw}）")
+    if "repository not found" in lowered or re.search(r"(?:http |error: )403\b", lowered) or "write access to repository not granted" in lowered:
+        if is_github:
+            return GitSyncError("仓库地址有误或当前账号权限不足。请在 GitHub 确认仓库归属、接受协作邀请，并核对读写权限。")
+        # Gitee and several self-hosted platforms answer "not found" for wrong credentials too.
+        return GitSyncError(f"仓库地址有误、账号权限不足，或凭据不正确。{_auth_hint(remote_url)}（Git：{raw}）")
     if "refusing to merge unrelated histories" in lowered:
         return GitSyncError("本地库与远端已有独立的提交历史。要加入已有团队仓库，请在「共享与同步」挂载共享库，个人记忆会保留在原目录。")
     return GitSyncError(f"{action} failed: {detail}")
@@ -369,7 +497,8 @@ def _run_git(root, *args, check=True, env_extra=None, timeout=None, browser_logi
     proc = _git_process(root, args, env_extra=env_extra, timeout=timeout, browser_login=browser_login)
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-        raise _git_failure(f"git {args[0]}", detail)
+        remote_url = _network_url(root, args, dict(os.environ)) if args[0] in NETWORK_COMMANDS else ""
+        raise _git_failure(f"git {args[0]}", detail, remote_url)
     return proc
 
 
@@ -455,16 +584,25 @@ def clone_repo(remote_url, dest_path, branch=""):
     dest = Path(dest_path).expanduser().resolve()
     if dest.exists() and any(dest.iterdir()):
         raise GitSyncError(f"Target directory already exists and is not empty: {dest}")
+    created = not dest.exists()
     dest.parent.mkdir(parents=True, exist_ok=True)
     args = ["clone"]
     if branch:
         args.extend(["--branch", branch])
     args.extend(["--", remote_url, str(dest)])
     interactive = github_browser_login(remote_url)
-    proc = _git_process(dest.parent, args, browser_login=interactive, timeout=300 if interactive else None)
+    try:
+        proc = _git_process(dest.parent, args, browser_login=interactive, timeout=300 if interactive else None)
+    except GitSyncError:
+        if created and dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
     if proc.returncode != 0:
+        if created and dest.exists():
+            # Only remove what this clone created; a pre-existing empty directory stays.
+            shutil.rmtree(dest, ignore_errors=True)
         detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-        raise _git_failure("git clone", detail)
+        raise _git_failure("git clone", detail, remote_url)
     _ensure_git_identity(dest)
     return {
         "path": str(dest),

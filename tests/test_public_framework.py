@@ -690,6 +690,51 @@ class PublicFrameworkTests(unittest.TestCase):
             finally:
                 process.terminate()
 
+    def test_multi_host_credentials_and_failure_hints(self):
+        sys.path.insert(0, str(CODE / "scripts"))
+        import sync_git
+        from unittest.mock import patch
+
+        gitee = sync_git.https_remote("https://chenwenxin01@gitee.com/team/memory.git")
+        self.assertEqual((gitee["host"], gitee["username"], gitee["provider"]), ("gitee.com", "chenwenxin01", "Gitee"))
+        self.assertIsNone(sync_git.https_remote("git@gitee.com:team/memory.git"))
+        self.assertEqual(sync_git.auth_method("git@gitee.com:team/memory.git"), "ssh")
+        self.assertEqual(sync_git.auth_method("https://git.example.com/team/memory.git"), "https-credential")
+        self.assertEqual(sync_git.auth_method(str(self.home)), "local")
+
+        helper = self.home / "fake-credential-helper"
+        helper.write_text("#!/bin/sh\nexit 0\n")
+        helper.chmod(0o755)
+        with patch.dict(os.environ, {"UNIFIED_MEMORY_GIT_CREDENTIAL_HELPER": str(helper)}):
+            env = {}
+            options = sync_git._credential_options("https://git.example.com/team/memory.git", False, env)
+        self.assertIn("credential.https://git.example.com.helper=!" + str(helper), options)
+        self.assertFalse(any("credential.https://github.com.interactive=true" == o for o in options))
+
+        url = "https://git.example.com/team/memory.git"
+        denied = sync_git._git_failure("git clone", "remote: \x1b[31mIncorrect username or password (access token)\x1b[0m\n"
+                                       f"fatal: repository '{url}/' not found", url)
+        self.assertIn("本机 Git 未能通过远端身份验证", str(denied))
+        self.assertIn("git.example.com", str(denied))
+        self.assertNotIn("GitHub", str(denied))
+        self.assertNotIn("\x1b", str(denied))
+        missing = sync_git._git_failure("git fetch", "remote: Repository not found.", url)
+        self.assertIn("凭据不正确", str(missing))
+        self.assertNotIn("GitHub", str(missing))
+        self.assertIn("GitHub", str(sync_git._git_failure("git fetch", "remote: Repository not found.",
+                                                           "https://github.com/a/b.git")))
+
+        # A failed clone removes the directory it created, so the mount form can be retried.
+        target = self.home / "Shared" / "team"
+        failed = subprocess.CompletedProcess([], 128, "", "fatal: could not read Username: terminal prompts disabled")
+        def fake_clone(root, args, **kwargs):
+            target.mkdir()
+            return failed
+        with patch.object(sync_git, "_git_process", side_effect=fake_clone):
+            with self.assertRaisesRegex(sync_git.GitSyncError, "未能通过远端身份验证"):
+                sync_git.clone_repo(url, target)
+        self.assertFalse(target.exists())
+
     def test_remote_read_probe_and_auth_failure(self):
         from unittest.mock import patch
         sys.path.insert(0, str(CODE / "scripts"))
