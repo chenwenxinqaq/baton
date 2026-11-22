@@ -71,6 +71,7 @@ STATES = {"active": "生效中", "archived": "已归档"}
 SOURCES = {"all": "全部来源", "index": "现有记忆", "user": "用户管理"}
 ENTRY_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
 TOPIC_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+MASKED_REMOTE_URL_RE = re.compile(r"^(?:https?|ssh)://\*\*\*@", re.IGNORECASE)
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9]+")
 INDEX_LAYER = re.compile(r"^## (L[0-4])(?:\s|$)")
 INDEX_LINK = re.compile(
@@ -365,6 +366,9 @@ class Library:
         self.lock_path = self.state_dir / "library.lock"
         self.trash_dir = self.state_dir / "trash"
         self.label = label
+        # The web UI keeps the primary write API stable (save_topic still returns a path), while
+        # retaining the latest non-fatal Git snapshot outcome for notices and diagnostics.
+        self.last_sync_status = None
 
     @property
     def is_readonly(self):
@@ -380,14 +384,68 @@ class Library:
             raise InvalidEntry(f"记忆库「{self.label}」未启用层级 {layer}（允许：{allowed_str}）。")
 
     def _maybe_auto_commit(self, message):
+        """Auto-commit to Git without making the primary web write fail.
+
+        Existing manager callers intentionally ignore the return value, so a successful write
+        still returns the same path/None as before.  The returned status and
+        ``last_sync_status`` make failures observable to callers that opt in, while the audit
+        event and stderr warning provide a durable/operator-visible trail.
+        """
+        self.last_sync_status = None
         if not self.sync_config or self.sync_config.get("driver") != "git":
-            return
+            return None
         if not self.sync_config.get("auto_commit", True):
-            return
+            return None
+
+        def redacted(value):
+            return sync_git.redact_remote_url(str(value or ""))[:320]
+
+        def failure(result, *, error="", reason=None):
+            if isinstance(result, dict):
+                status = dict(result)
+            else:
+                status = {"committed": False, "reason": reason or "sync_error"}
+            status["committed"] = False
+            reason = redacted(status.get("reason") or "unknown")
+            detail = redacted(error or status.get("error") or "")
+            status["reason"] = reason
+            if detail:
+                status["error"] = detail
+            status["warning"] = f"记忆已保存，但 Git 快照未提交（原因：{reason}）。"
+            self.last_sync_status = status
+            audit_log.record(
+                {
+                    "source": "manager",
+                    "event": "git_auto_commit",
+                    "client": "Unified Memory Web",
+                    "tool": "git_auto_commit",
+                    "ok": False,
+                    "library": self.library_id,
+                    "message": redacted(message),
+                    "reason": reason,
+                    "error": detail,
+                }
+            )
+            try:
+                print(f"[unified-memory] {status['warning']}", file=sys.stderr)
+            except Exception:
+                pass
+            return status
+
         try:
-            sync_git.auto_commit(self.root, message)
-        except Exception:
-            pass
+            result = sync_git.auto_commit(self.root, message)
+        except Exception as exc:
+            return failure(None, error=exc, reason="exception")
+        if isinstance(result, dict) and not result.get("committed") and result.get("reason") in {
+            "clean",
+            "nothing_allowed",
+        }:
+            self.last_sync_status = result
+            return result
+        if not isinstance(result, dict) or not result.get("committed"):
+            return failure(result)
+        self.last_sync_status = result
+        return result
 
     @contextmanager
     def write_lock(self):
@@ -794,6 +852,17 @@ def hidden(name, value):
 def query(**fields):
     clean = {k: v for k, v in fields.items() if v != ""}
     return "/?" + urlencode(clean) if clean else "/"
+
+
+def display_remote_url(remote_url):
+    """Return a credential-free URL for HTML values and status text."""
+    return sync_git.redact_remote_url(remote_url or "")
+
+
+def reject_masked_remote_url(remote_url):
+    """Do not persist the UI's redacted placeholder as a real Git remote."""
+    if MASKED_REMOTE_URL_RE.match(str(remote_url or "").strip()):
+        raise InvalidEntry("远端地址中的凭据已隐藏，请重新填写不带 token 的仓库地址。")
 
 
 def render_layer_radios(selected_layer):
@@ -1684,7 +1753,9 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
     personal_info = next((item for item in all_libs if item["id"] == "personal"), None)
     personal_sync = (personal_info or {}).get("sync") or {}
     personal_git = (personal_info or {}).get("git") or {}
-    personal_remote = personal_sync.get("remote_url") or personal_git.get("remote_url") or ""
+    personal_remote = display_remote_url(
+        personal_sync.get("remote_url") or personal_git.get("remote_url") or ""
+    )
     personal_branch = personal_sync.get("branch") or personal_git.get("branch") or "main"
     personal_auto_commit = personal_sync.get("auto_commit", True)
 
@@ -1721,7 +1792,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
             status_chips.append('<span class="chip-off">○ 未初始化 Git</span>')
 
         remote_line = (
-            f'<p class="hub-card-path">远端：<code>{escape(git.get("remote_url") or sync_cfg.get("remote_url") or "")}</code></p>'
+            f'<p class="hub-card-path">远端：<code>{escape(display_remote_url(git.get("remote_url") or sync_cfg.get("remote_url") or ""))}</code></p>'
             if (git.get("remote_url") or sync_cfg.get("remote_url"))
             else ""
         )
@@ -1761,7 +1832,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
         manage_drawer = ""
         if not is_personal:
-            cur_remote = sync_cfg.get("remote_url") or git.get("remote_url") or ""
+            cur_remote = display_remote_url(sync_cfg.get("remote_url") or git.get("remote_url") or "")
             cur_branch = sync_cfg.get("branch") or git.get("branch") or "main"
             ro_sel = " selected" if is_ro else ""
             rw_sel = " selected" if not is_ro else ""
@@ -3604,6 +3675,7 @@ class Handler(BaseHTTPRequestHandler):
                 remote_url = fields.get("remote_url", "").strip()
                 if not remote_url:
                     raise InvalidEntry("请填写 Git 仓库地址。")
+                reject_masked_remote_url(remote_url)
                 branch = fields.get("branch", "main").strip() or "main"
                 auto_commit = fields.get("auto_commit") == "1"
                 memoryctl.setup_library_sync(
@@ -3628,6 +3700,8 @@ class Handler(BaseHTTPRequestHandler):
                 mode_val = fields.get("mode", "ro").strip()
                 git_url = fields.get("git_url", "").strip()
                 branch = fields.get("branch", "").strip()
+                if git_url:
+                    reject_masked_remote_url(git_url)
                 repo_name = git_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
                 if not git_url and not (path_val and mount_id):
                     raise InvalidEntry("请填写团队仓库地址。挂载本地库时，请在目录设置中填写库标识和路径。")
@@ -3656,6 +3730,8 @@ class Handler(BaseHTTPRequestHandler):
                 label = fields.get("label", "").strip()
                 mode_val = fields.get("mode", "ro").strip()
                 remote_url = fields.get("remote_url", "").strip()
+                if remote_url:
+                    reject_masked_remote_url(remote_url)
                 branch = fields.get("branch", "main").strip()
                 enabled = fields.get("enabled") == "1"
                 auto_commit = fields.get("auto_commit") == "1"
