@@ -35,7 +35,15 @@ if str(ROOT_DIR / "mcp") not in sys.path:
 if str(ROOT_DIR / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
-from library_paths import ALL_LAYERS, data_root, library_state_dir, mounts_config_path, resolve_libraries
+from library_paths import (
+    ALL_LAYERS,
+    config_signature,
+    data_root,
+    library_state_dir,
+    library_unavailable_reason,
+    resolve_libraries,
+    unavailable_issue,
+)
 import audit_log  # noqa: E402
 import memory_import  # noqa: E402
 import server as mcp_server  # noqa: E402
@@ -1761,8 +1769,33 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
     cards = []
     for item in all_libs:
-        lid = item["id"]
+        # mount_list also keeps configuration-level diagnostics that do not have a
+        # usable mount id (for example, a malformed top-level mounts.json file).
+        # Render those as a normal unavailable card instead of letting html.escape(None)
+        # abort the whole sync hub.
+        lid = item.get("id") or "unavailable"
         nav_key = "primary" if lid == "personal" else lid
+        if not item.get("available", True):
+            issue = item.get("issue") or {}
+            reason = issue.get("message") or "记忆库目录不可用。"
+            label = item.get("label") or lid
+            status = issue.get("code") or "unavailable"
+            cards.append(
+                f"""
+          <article class="hub-card hub-card-unavailable">
+            <div class="hub-card-head">
+              <div>
+                <strong>{escape(label)}</strong>
+                <span class="hub-card-id"><code>{escape(lid)}</code></span>
+              </div>
+              <div class="hub-card-actions"><span class="chip-warn">! 不可用</span></div>
+            </div>
+            <div class="check-chips"><span class="chip-warn">配置问题：{escape(status)}</span></div>
+            <p class="hub-card-path">目录：<code>{escape(str(item.get("path") or ""))}</code></p>
+            <p class="agent-issue">{escape(reason)}</p>
+          </article>"""
+            )
+            continue
         git = item.get("git") or {}
         sync_cfg = item.get("sync") or {}
         is_personal = lid == "personal"
@@ -4125,9 +4158,15 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
 
 
-def build_libraries_map(primary_root, also_root=None, home=None):
-    """Build ordered mapping of key -> Library from primary root, mounts.json, and optional --also-root."""
-    descriptors = resolve_libraries(primary_root=primary_root, home=home)
+def build_libraries_map(primary_root, also_root=None, home=None, issues=None):
+    """Build ordered mapping of key -> Library from primary root, mounts.json, and optional --also-root.
+
+    Invalid or unavailable shared mounts are reported through ``issues`` instead of silently
+    disappearing from the web console.  The personal library remains fatal because the console
+    cannot operate without its primary index.
+    """
+    mount_issues = issues if issues is not None else []
+    descriptors = resolve_libraries(primary_root=primary_root, home=home, issues=mount_issues)
     libraries = {}
     for desc in descriptors:
         key = "primary" if desc["id"] == "personal" else desc["id"]
@@ -4142,9 +4181,11 @@ def build_libraries_map(primary_root, also_root=None, home=None):
                 allow_user_managed=desc["allow_user_managed"],
                 sync_config=desc.get("sync"),
             )
-        except (InvalidEntry, ValueError, OSError):
+        except (InvalidEntry, ValueError, OSError) as exc:
             if key == "primary":
                 raise
+            reason = library_unavailable_reason(desc["path"]) or str(exc) or exc.__class__.__name__
+            mount_issues.append(unavailable_issue(desc, reason))
             continue
     if also_root:
         alternate = Library(also_root, "对照记忆库", library_id="local")
@@ -4171,7 +4212,9 @@ def main():
     try:
         primary = data_root(args.memory_root).resolve(strict=True)
         os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
-        libraries = build_libraries_map(primary, also_root=args.also_root)
+        initial_config_signature = config_signature()
+        mount_issues = []
+        libraries = build_libraries_map(primary, also_root=args.also_root, issues=mount_issues)
         server = HTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
@@ -4185,20 +4228,21 @@ def main():
         parser.exit(2, f"{exc}\n")
     with server:
         server.libraries = libraries
+        server.mount_issues = mount_issues
         server.sync_jobs = {}
         server.token = secrets.token_urlsafe(32)
         server.agent_home = None
-        cfg_file = mounts_config_path()
-        state_holder = {"mtime": cfg_file.stat().st_mtime if cfg_file.is_file() else None}
+        # Capture the pre-build signature so a config rewrite during library construction
+        # is observed on the first request instead of being mistaken for the initial state.
+        state_holder = {"signature": initial_config_signature}
 
         def reload_mounts(force=False):
-            try:
-                cur_mtime = cfg_file.stat().st_mtime if cfg_file.is_file() else None
-            except OSError:
-                cur_mtime = None
-            if force or cur_mtime != state_holder["mtime"]:
-                server.libraries = build_libraries_map(primary, also_root=args.also_root)
-                state_holder["mtime"] = cur_mtime
+            cur_signature = config_signature()
+            if force or cur_signature != state_holder["signature"]:
+                issues = []
+                server.libraries = build_libraries_map(primary, also_root=args.also_root, issues=issues)
+                server.mount_issues = issues
+                state_holder["signature"] = cur_signature
 
         if DESKTOP:
             # The native window owns the write end. EOF also covers a parent crash.

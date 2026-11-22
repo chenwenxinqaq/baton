@@ -23,6 +23,7 @@ from library_paths import (
     FRAMEWORK_ROOT,
     data_root,
     global_state_dir,
+    library_unavailable_reason,
     load_mounts_config,
     library_seed_files,
     normalize_layers,
@@ -1527,21 +1528,25 @@ def mount_list(home=None):
             remote=sync_cfg.get("remote") or "origin",
             branch=sync_cfg.get("branch") or "",
         ) if path.is_dir() else {"is_repo": False, "conflicts": []}
-        out.append(
-            {
-                "id": lib["id"],
-                "label": lib["label"],
-                "path": str(path),
-                "role": lib["role"],
-                "mode": lib["mode"],
-                "layers": list(lib["layers"]),
-                "allow_user_managed": bool(lib["allow_user_managed"]),
-                "enabled": bool(lib["enabled"]),
-                "available": exists,
-                "sync": sync_cfg or None,
-                "git": st,
+        item = {
+            "id": lib["id"],
+            "label": lib["label"],
+            "path": str(path),
+            "role": lib["role"],
+            "mode": lib["mode"],
+            "layers": list(lib["layers"]),
+            "allow_user_managed": bool(lib["allow_user_managed"]),
+            "enabled": bool(lib["enabled"]),
+            "available": exists,
+            "sync": sync_cfg or None,
+            "git": st,
+        }
+        if not exists:
+            item["issue"] = {
+                "code": "unavailable",
+                "message": library_unavailable_reason(path) or "library is unavailable",
             }
-        )
+        out.append(item)
     # Entries that could not be resolved stay visible instead of silently disappearing.
     for issue in issues:
         out.append(

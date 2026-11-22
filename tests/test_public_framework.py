@@ -752,6 +752,20 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertTrue(result.get("isError"), output)
         self.assertIn("Symlinked memory file is not allowed", result["content"][0]["text"])
 
+        # A corrupt mounts.json must remain visible in the Web sync hub rather than
+        # turning the whole page into a 500 or silently dropping the diagnostics.
+        config_path.write_text("{not json", encoding="utf-8")
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0",
+                   "--memory-root", str(self.library)]
+        with subprocess.Popen(command, env=self.environment(), stdout=subprocess.PIPE, text=True) as process:
+            try:
+                address = process.stdout.readline().strip()
+                hub_html = urlopen(address + "?view=sync_hub", timeout=5).read().decode()
+                self.assertIn("配置问题：invalid_config", hub_html)
+                self.assertIn("not valid JSON", hub_html)
+            finally:
+                process.terminate()
+
     def test_multi_host_credentials_and_failure_hints(self):
         sys.path.insert(0, str(CODE / "scripts"))
         import sync_git
