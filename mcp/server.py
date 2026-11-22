@@ -1090,7 +1090,9 @@ class WorkspaceStore:
         self.home = home
         # MCP normally owns one process-local scheduler shared by all mounted
         # libraries.  Tests/embedders may inject one (and then own its lifecycle).
-        self.async_scheduler = async_scheduler or AsyncSyncScheduler()
+        self.async_scheduler = (
+            async_scheduler if async_scheduler is not None else AsyncSyncScheduler()
+        )
         self._owns_async_scheduler = async_scheduler is None
         self._config_signature = None
         self._stores = {}

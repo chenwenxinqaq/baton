@@ -1571,6 +1571,7 @@ def mount_add(
     remote="origin",
     branch="",
     auto_commit=True,
+    auto_push=False,
     role="shared",
     home=None,
 ):
@@ -1629,7 +1630,7 @@ def mount_add(
             "branch": branch or info["branch"],
             "remote_url": info["remote_url"],
             "auto_commit": bool(auto_commit and mode == "rw"),
-            "auto_push": False,
+            "auto_push": bool(auto_push and mode == "rw"),
         }
 
     entry = {
@@ -1661,6 +1662,7 @@ def mount_update(
     remote=None,
     branch=None,
     auto_commit=None,
+    auto_push=None,
     home=None,
 ):
     """Update settings of an existing mounted shared library."""
@@ -1687,7 +1689,7 @@ def mount_update(
         if enabled is not None:
             target["enabled"] = bool(enabled)
 
-        if any(v is not None for v in (remote_url, remote, branch, auto_commit)):
+        if any(v is not None for v in (remote_url, remote, branch, auto_commit, auto_push)):
             cur_sync = dict(target.get("sync") or {"driver": "git", "remote": "origin", "branch": "main", "auto_commit": True, "auto_push": False})
             if remote is not None:
                 cur_sync["remote"] = remote.strip() or "origin"
@@ -1697,6 +1699,8 @@ def mount_update(
                 cur_sync["remote_url"] = remote_url.strip()
             if auto_commit is not None:
                 cur_sync["auto_commit"] = bool(auto_commit)
+            if auto_push is not None:
+                cur_sync["auto_push"] = bool(auto_push)
             info = sync_git.ensure_repo(
                 Path(target["path"]),
                 remote_url=cur_sync.get("remote_url") or "",
@@ -2023,6 +2027,12 @@ def main():
     p_madd.add_argument("--remote", default="origin", help="Git remote name (default: origin).")
     p_madd.add_argument("--branch", default="", help="Git branch name.")
     p_madd.add_argument("--auto-commit", type=_parse_bool_flag, default=True, help="Auto-commit writes on rw Git mounts.")
+    p_madd.add_argument(
+        "--auto-push",
+        type=_parse_bool_flag,
+        default=False,
+        help="Debounced background pull/push after successful writes on rw Git mounts.",
+    )
     p_madd.add_argument("--role", choices=("shared", "personal"), default="shared", help="Library role.")
 
     p_mupd = mount_sub.add_parser("update", help="Update an existing mount configuration.")
@@ -2035,6 +2045,12 @@ def main():
     p_mupd.add_argument("--remote", default=None)
     p_mupd.add_argument("--branch", default=None)
     p_mupd.add_argument("--auto-commit", type=_parse_bool_flag, default=None)
+    p_mupd.add_argument(
+        "--auto-push",
+        type=_parse_bool_flag,
+        default=None,
+        help="Enable or disable debounced background pull/push after writes.",
+    )
 
     p_mrm = mount_sub.add_parser("remove", help="Unmount a shared library (keeps local files intact).")
     p_mrm.add_argument("id")
@@ -2120,6 +2136,7 @@ def main():
                 remote=args.remote,
                 branch=args.branch,
                 auto_commit=args.auto_commit,
+                auto_push=args.auto_push,
                 role=args.role,
             )
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -2134,6 +2151,7 @@ def main():
                 remote=args.remote,
                 branch=args.branch,
                 auto_commit=args.auto_commit,
+                auto_push=args.auto_push,
             )
             print(json.dumps(res, ensure_ascii=False, indent=2))
         elif args.mount_cmd == "remove":

@@ -1483,9 +1483,20 @@ def render_library_sync_bar(library, key, token, tab=""):
     remote = sync_cfg.get("remote") or "origin"
     branch = sync_cfg.get("branch") or ""
     st = sync_git.git_status(library.root, remote=remote, branch=branch)
+    async_status = library.async_sync_status() if hasattr(library, "async_sync_status") else {}
     role_badge = "个人主库" if library.role == "personal" else ("共享只读" if library.is_readonly else "团队共写")
 
     parts = [f'<span class="meta-chip">{role_badge}</span>']
+    if sync_cfg.get("auto_push") and library.mode == "rw":
+        async_state = str(async_status.get("status") or "").casefold()
+        if async_state in {"pending", "running"}:
+            parts.append('<span class="chip-ok">⟳ 后台同步中</span>')
+        elif async_state == "conflict":
+            parts.append('<span class="chip-warn">⚠ 后台同步有冲突</span>')
+        elif async_state == "error":
+            parts.append('<span class="chip-warn">! 后台同步失败</span>')
+        else:
+            parts.append('<span class="meta-chip">后台同步已开启</span>')
     if st.get("is_repo"):
         br_txt = st.get("branch") or "main"
         parts.append(f'<span class="meta-chip">Git: {escape(br_txt)}</span>')
@@ -1878,6 +1889,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
     )
     personal_branch = personal_sync.get("branch") or personal_git.get("branch") or "main"
     personal_auto_commit = personal_sync.get("auto_commit", True)
+    personal_auto_push = personal_sync.get("auto_push", False)
 
     cards = []
     for item in all_libs:
@@ -1983,6 +1995,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
             rw_sel = " selected" if not is_ro else ""
             en_chk = " checked" if item.get("enabled", True) else ""
             ac_chk = " checked" if sync_cfg.get("auto_commit", True) else ""
+            ap_chk = " checked" if sync_cfg.get("auto_push", False) else ""
             manage_drawer = f"""
             <details class="mount-edit-drawer">
               <summary>修改挂载与同步设置 / 解除挂载 ▾</summary>
@@ -2018,6 +2031,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
                 <div class="checkbox-inline-group">
                   <label class="checkbox-row"><input type="checkbox" name="enabled" value="1"{en_chk}><span>启用挂载</span></label>
                   <label class="checkbox-row"><input type="checkbox" name="auto_commit" value="1"{ac_chk}><span>写入时自动本地 Git 提交</span></label>
+                  <label class="checkbox-row"><input type="checkbox" name="auto_push" value="1"{ap_chk}><span>写入后防抖异步 Git 同步</span></label>
                 </div>
                 <div class="form-actions">
                   <button class="btn btn-primary btn-compact" type="submit">保存设置</button>
@@ -2047,6 +2061,7 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
         )
 
     p_ac_chk = " checked" if personal_auto_commit else ""
+    p_ap_chk = " checked" if personal_auto_push else ""
     return f"""
     <div class="sync-hub">
       <section class="hub-section">
@@ -2074,6 +2089,10 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
           <label class="checkbox-row">
             <input type="checkbox" name="auto_commit" value="1"{p_ac_chk}>
             <span>Agent 或网页每次修改后自动在本地 Git 提交快照</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="auto_push" value="1"{p_ap_chk}>
+            <span>写入后防抖异步拉取并推送（仅读写库，约 2 秒合并一批写入）</span>
           </label>
           <div class="form-actions">
             <button class="btn btn-primary" type="submit" name="after_save" value="sync">连接并同步</button>
@@ -2126,6 +2145,10 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
           <label class="checkbox-row">
             <input type="checkbox" name="auto_commit" value="1" checked>
             <span>共写模式下写入后自动在本地 Git 提交</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="auto_push" value="1">
+            <span>共写模式下写入后防抖异步拉取并推送（可随时关闭）</span>
           </label>
           <div class="form-actions">
             <button class="btn btn-primary" type="submit">挂载共享库</button>
@@ -3856,11 +3879,13 @@ class Handler(BaseHTTPRequestHandler):
                 reject_masked_remote_url(remote_url)
                 branch = fields.get("branch", "main").strip() or "main"
                 auto_commit = fields.get("auto_commit") == "1"
+                auto_push = fields.get("auto_push") == "1"
                 memoryctl.setup_library_sync(
                     target_lib,
                     remote_url=remote_url,
                     branch=branch,
                     auto_commit=auto_commit,
+                    auto_push=auto_push,
                     home=agent_home,
                 )
                 self._refresh_mounts(force=True)
@@ -3892,13 +3917,14 @@ class Handler(BaseHTTPRequestHandler):
                         raise InvalidEntry("默认保存目录已被使用。请在目录设置中选择一个空目录。")
                     path_val = str(default_dir)
                 auto_commit = fields.get("auto_commit") == "1"
+                auto_push = fields.get("auto_push") == "1"
                 selected_layers = [lyr for lyr in ALL_LAYERS if fields.get(f"layer_{lyr}") == "1"]
                 if not selected_layers:
                     raise InvalidEntry("请至少勾选一个允许生效的记忆层级。")
                 def mount():
                     memoryctl.mount_add(mount_id, path_val, label=label or repo_name or mount_id,
                                         mode=mode_val, layers=selected_layers, git_url=git_url, branch=branch,
-                                        auto_commit=auto_commit, home=agent_home)
+                                        auto_commit=auto_commit, auto_push=auto_push, home=agent_home)
                     return query(library=key, view="sync_hub", notice="mount_added")
 
                 self.run_sync_job(mount_id, "挂载共享库", sync_git.github_browser_login(git_url), mount)
@@ -3913,6 +3939,7 @@ class Handler(BaseHTTPRequestHandler):
                 branch = fields.get("branch", "main").strip()
                 enabled = fields.get("enabled") == "1"
                 auto_commit = fields.get("auto_commit") == "1"
+                auto_push = fields.get("auto_push") == "1"
                 selected_layers = [lyr for lyr in ALL_LAYERS if fields.get(f"layer_{lyr}") == "1"]
                 if not selected_layers:
                     raise InvalidEntry("请至少勾选一个允许生效的记忆层级。")
@@ -3925,6 +3952,7 @@ class Handler(BaseHTTPRequestHandler):
                     remote_url=remote_url if remote_url else None,
                     branch=branch if remote_url else None,
                     auto_commit=auto_commit if remote_url else None,
+                    auto_push=auto_push if remote_url else None,
                     home=agent_home,
                 )
                 self._refresh_mounts(force=True)
@@ -3985,6 +4013,7 @@ class Handler(BaseHTTPRequestHandler):
                     allowed_layers=dst_lib.allowed_layers,
                     allow_user_managed=dst_lib.allow_user_managed,
                     sync_config=dst_lib.sync_config,
+                    async_scheduler=getattr(self.server, "async_scheduler", None),
                 )
                 saved = dst_store.upsert_entry(
                     layer=target_layer,
