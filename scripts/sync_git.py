@@ -6,7 +6,7 @@ import fcntl
 import getpass
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -15,7 +15,7 @@ import sys
 import subprocess
 import time
 from tempfile import NamedTemporaryFile
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from urllib.request import getproxies, proxy_bypass
 
 from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
@@ -36,6 +36,147 @@ REMOTE_DELETED_TEXT = (
     "选择“采用远端版本”将删除本条目（旧内容会先放入本机回收站）；选择“保留本机”则继续保留并推送。\n"
 )
 DEFAULT_GITIGNORE = ".DS_Store\n.state/\n__pycache__/\n*.pyc\n*.conflict-*.md\n"
+SYNC_ROOT_FILES = frozenset({"MEMORY.md", ".gitignore"})
+SYNC_ENTRY_DIRS = frozenset(folder for _, folder, _ in LAYER_HEADINGS) | {"user-managed"}
+SYNC_SEED_FILES = frozenset(library_seed_files().keys())
+REMOTE_URL_WITH_USERINFO_RE = re.compile(
+    r"(?P<prefix>(?:https?|ssh)://)(?P<userinfo>[^/\s@]+)@",
+    re.IGNORECASE,
+)
+
+
+def _redact_remote_urls(text):
+    """Hide URL userinfo (including tokens) before returning/logging Git output."""
+    return REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(text or ""))
+
+
+def redact_remote_url(remote_url):
+    """Return a display-safe remote URL without userinfo credentials."""
+    return _redact_remote_urls(remote_url)
+
+
+def validate_remote_url(remote_url):
+    """Reject HTTP(S)/SSH URLs that embed a password or access token in userinfo.
+
+    A username-only HTTPS URL remains supported for providers that use it as a
+    credential lookup hint (for example ``https://alice@gitee.com/...``), while
+    ``https://alice:token@...`` is rejected before it can enter Git config,
+    mounts.json, logs, or a subprocess argument.
+    """
+    raw = str(remote_url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError as exc:
+        raise ValueError("远端仓库地址格式无效。") from exc
+    if parsed.scheme.lower() in {"http", "https", "ssh"} and parsed.netloc:
+        userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
+        if userinfo and ":" in unquote(userinfo):
+            raise ValueError("远端地址不能包含内嵌密码或访问令牌，请改用钥匙串、凭据助手或 SSH 密钥。")
+    return raw
+
+
+def _normalize_git_relpath(rel_path):
+    """Normalize a Git path without allowing absolute paths or traversal."""
+    if not isinstance(rel_path, str) or not rel_path or "\\" in rel_path:
+        return None
+    path = PurePosixPath(rel_path)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix()
+
+
+def _is_safe_sync_relpath(rel_path, *, include_conflict=False):
+    """Return whether a relative path belongs to the Markdown sync allowlist."""
+    normalized = _normalize_git_relpath(rel_path)
+    if not normalized:
+        return False
+    if normalized in SYNC_ROOT_FILES or normalized in SYNC_SEED_FILES:
+        return True
+    path = PurePosixPath(normalized)
+    if not path.parts or path.parts[0] not in SYNC_ENTRY_DIRS:
+        return False
+    if path.suffix.lower() != ".md":
+        return False
+    return include_conflict or not is_conflict_filename(path.name)
+
+
+def _safe_library_path(root, rel_path, *, allow_missing=True):
+    """Resolve a library-relative path while refusing symlink components."""
+    normalized = _normalize_git_relpath(rel_path)
+    if not normalized:
+        return None
+    root = Path(root)
+    candidate = root.joinpath(*PurePosixPath(normalized).parts)
+    current = root
+    try:
+        for part in PurePosixPath(normalized).parts:
+            current = current / part
+            if current.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return None
+    try:
+        if not resolved.is_relative_to(root):
+            return None
+    except AttributeError:
+        if root not in resolved.parents and resolved != root:
+            return None
+    if candidate.exists() and not candidate.is_file():
+        return None
+    if not allow_missing and not candidate.is_file():
+        return None
+    return candidate
+
+
+def _safe_markdown_files(root, folder):
+    """Yield regular top-level Markdown files, excluding symlink entries."""
+    root = Path(root)
+    directory = root / folder
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.suffix.lower() != ".md" or entry.is_symlink() or not entry.is_file():
+            continue
+        safe = _safe_library_path(root, entry.relative_to(root).as_posix(), allow_missing=False)
+        if safe is not None:
+            yield safe
+
+
+def _discover_sync_paths(root):
+    """Discover existing regular files that are safe to stage for a memory library."""
+    root = Path(root)
+    found = set()
+    for rel in SYNC_ROOT_FILES | SYNC_SEED_FILES:
+        path = _safe_library_path(root, rel, allow_missing=False)
+        if path is not None:
+            found.add(rel)
+    for folder in SYNC_ENTRY_DIRS:
+        base = root / folder
+        if base.is_symlink() or not base.is_dir():
+            continue
+        for current, directories, files in os.walk(base, followlinks=False):
+            current_path = Path(current)
+            directories[:] = sorted(
+                name for name in directories
+                if not (current_path / name).is_symlink()
+            )
+            for name in sorted(files):
+                if not name.lower().endswith(".md") or is_conflict_filename(name):
+                    continue
+                path = current_path / name
+                if path.is_symlink() or not path.is_file():
+                    continue
+                rel = path.relative_to(root).as_posix()
+                if _is_safe_sync_relpath(rel) and _safe_library_path(root, rel, allow_missing=False):
+                    found.add(rel)
+    return found
 
 
 def _atomic_write(path, content):
@@ -46,6 +187,7 @@ def _atomic_write(path, content):
             mode="w", encoding="utf-8", dir=path.parent, prefix=".tmp-", delete=False
         ) as handle:
             staged = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -58,13 +200,23 @@ def _atomic_write(path, content):
 @contextmanager
 def _library_lock(root):
     lock_path = library_state_dir(root) / "library.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    if lock_path.parent.is_symlink() or lock_path.is_symlink():
+        raise GitSyncError("本地同步状态目录不能是符号链接。")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(lock_path.parent, 0o700)
+    except OSError:
+        pass
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _parse_frontmatter(text):
@@ -127,15 +279,15 @@ def resolve_conflict(
     import shutil
 
     root = Path(root).expanduser().resolve()
-    conflict_path = (root / conflict_rel_path).resolve()
-    if not conflict_path.is_relative_to(root) or not conflict_path.is_file():
+    conflict_path = _safe_library_path(root, conflict_rel_path, allow_missing=False)
+    if conflict_path is None or not conflict_path.is_file():
         raise ValueError(f"Conflict copy not found: {conflict_rel_path}")
     if not is_conflict_filename(conflict_path.name):
         raise ValueError(f"Not a conflict copy: {conflict_rel_path}")
 
     orig_rel = original_path_for_conflict(conflict_path.relative_to(root).as_posix())
-    orig_path = (root / orig_rel).resolve()
-    if not orig_path.is_relative_to(root):
+    orig_path = _safe_library_path(root, orig_rel, allow_missing=True)
+    if orig_path is None:
         raise ValueError("Resolved original path escapes library root.")
     if strategy not in {"keep_local", "use_remote", "custom_merge"}:
         raise ValueError(f"Unknown conflict resolution strategy: {strategy}")
@@ -143,12 +295,23 @@ def resolve_conflict(
     trash_dir = library_state_dir(root) / "trash"
 
     def _backup(src, tag):
-        if not src.is_file():
+        if src.is_symlink() or not src.is_file():
             return
+        if trash_dir.is_symlink():
+            raise ValueError("本地回收站不能是符号链接。")
         trash_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(trash_dir, 0o700)
+        except OSError:
+            pass
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag)[:80] or "conflict"
-        shutil.copy2(src, trash_dir / f"{stamp}-{safe}-{secrets.token_hex(2)}.md")
+        target = trash_dir / f"{stamp}-{safe}-{secrets.token_hex(2)}.md"
+        shutil.copy2(src, target, follow_symlinks=False)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
 
     with _library_lock(root):
         if strategy == "keep_local":
@@ -189,15 +352,24 @@ def find_conflict_files(memory_root):
     """Return sorted relative paths of unresolved *.conflict-*.md files."""
     root = Path(memory_root).expanduser().resolve()
     found = []
+    # MEMORY.md conflicts live at the library root; entry conflicts live only in
+    # the managed Markdown directories.  Do not follow symlinks while scanning.
+    root_conflicts = [
+        path for path in sorted(root.glob("*.conflict-*.md"))
+        if not path.is_symlink() and path.is_file() and is_conflict_filename(path.name)
+    ]
+    found.extend(path.relative_to(root).as_posix() for path in root_conflicts)
     scan_dirs = [folder for _, folder, _ in LAYER_HEADINGS] + ["user-managed"]
     for folder in scan_dirs:
-        d = root / folder
-        if not d.is_dir():
-            continue
-        for md in sorted(d.glob("*.md")):
+        for md in _safe_markdown_files(root, folder):
             if is_conflict_filename(md.name):
                 found.append(md.relative_to(root).as_posix())
-    return found
+    return sorted(set(found))
+
+
+def _is_index_conflict_path(rel_path):
+    path = PurePosixPath(str(rel_path))
+    return len(path.parts) == 1 and path.name.startswith("MEMORY.conflict-") and path.suffix == ".md"
 
 
 def rebuild_index(memory_root, policy_template=None, lock=True):
@@ -229,20 +401,19 @@ def rebuild_index(memory_root, policy_template=None, lock=True):
             lines = [heading]
             dir_path = root / folder
             count = 0
-            if dir_path.is_dir():
-                for md in sorted(dir_path.glob("*.md"), key=lambda p: p.name.casefold()):
-                    if md.name == "README.md" or is_conflict_filename(md.name):
-                        continue
-                    raw = md.read_text(encoding="utf-8", errors="replace")
-                    meta, body = _parse_frontmatter(raw)
-                    title = str(meta.get("title") or "").strip() or _extract_title(body, md.stem)
-                    desc = str(meta.get("description") or "").strip() or title
-                    title = " ".join(title.splitlines()).strip() or md.stem
-                    desc = " ".join(desc.splitlines()).strip() or title
-                    rel = f"{folder}/{md.name}"
-                    lines.append(f"- [{title}]({rel}) — {desc}")
-                    count += 1
-                    total += 1
+            for md in _safe_markdown_files(root, folder):
+                if md.name == "README.md" or is_conflict_filename(md.name):
+                    continue
+                raw = md.read_text(encoding="utf-8", errors="replace")
+                meta, body = _parse_frontmatter(raw)
+                title = str(meta.get("title") or "").strip() or _extract_title(body, md.stem)
+                desc = str(meta.get("description") or "").strip() or title
+                title = " ".join(title.splitlines()).strip() or md.stem
+                desc = " ".join(desc.splitlines()).strip() or title
+                rel = f"{folder}/{md.name}"
+                lines.append(f"- [{title}]({rel}) — {desc}")
+                count += 1
+                total += 1
             per_layer[layer] = count
             sections.append("\n".join(lines))
 
@@ -290,6 +461,10 @@ def github_helper():
 
 
 def github_browser_login(remote_url):
+    try:
+        validate_remote_url(remote_url)
+    except ValueError:
+        return False
     return bool(re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?",
                              remote_url, re.IGNORECASE) and github_helper())
 
@@ -316,6 +491,7 @@ _MAC_KEYCHAIN_HELPERS = (
 
 def https_remote(remote_url):
     """Return host details for an HTTPS remote, or None for SSH and local paths."""
+    validate_remote_url(remote_url)
     match = _HTTPS_URL_RE.match(remote_url or "")
     if not match:
         return None
@@ -362,6 +538,7 @@ def https_credential_helper():
 
 def _credential_options(remote_url, browser_login, env):
     """Host-scoped credential settings: GCM browser login for GitHub, keychain for other HTTPS hosts."""
+    validate_remote_url(remote_url)
     options = []
     helper = github_helper()
     if helper:
@@ -422,8 +599,13 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
         env.update(env_extra)
     cmd = ["git", "-c", "core.quotepath=false"]
     if args[0] in NETWORK_COMMANDS:
+        network_url = _network_url(root, args, env)
+        try:
+            validate_remote_url(network_url)
+        except ValueError as exc:
+            raise GitSyncError(str(exc)) from exc
         cmd += _github_proxy_options(root, env)
-        cmd += _credential_options(_network_url(root, args, env), browser_login, env)
+        cmd += _credential_options(network_url, browser_login, env)
         if timeout is None and not browser_login:
             timeout = NETWORK_TIMEOUT
     # A timed-out Git can leave its credential helper listening for an OAuth callback.
@@ -448,19 +630,22 @@ class _InterruptedTlsHandshake(GitSyncError):
 
 
 def _detail_tail(detail, lines=3):
-    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", detail)
+    plain = _redact_remote_urls(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", detail))
     kept = [line.strip() for line in plain.splitlines()
             if line.strip() and not line.strip().startswith("Cloning into")]
     return " / ".join(kept[-lines:])[:400]
 
 
 def _auth_hint(remote_url):
-    info = https_remote(remote_url)
+    try:
+        info = https_remote(remote_url)
+    except ValueError:
+        info = None
     if info and info["host"] == "github.com":
         return "可在桌面版「共享与同步」点击「连接 GitHub」重新授权。"
     if info:
         name = info["provider"] or info["host"]
-        user = f"（当前地址指定用户名 {info['username']}）" if info["username"] else ""
+        user = "（当前地址指定了用户名）" if info["username"] else ""
         return (f"{name} 使用 HTTPS 用户名 + 访问令牌认证{user}。请在钥匙串中保存 {info['host']} 的凭据，"
                 f"用户名需与平台账号一致；也可把地址写成 https://用户名@{info['host']}/... 后重试。")
     if _SSH_URL_RE.match(remote_url or ""):
@@ -470,7 +655,10 @@ def _auth_hint(remote_url):
 
 def _git_failure(action, detail, remote_url=""):
     lowered = detail.lower()
-    info = https_remote(remote_url)
+    try:
+        info = https_remote(remote_url)
+    except ValueError:
+        info = None
     is_github = not remote_url or (info is not None and info["host"] == "github.com")
     raw = _detail_tail(detail)
     if "ssl_connect" in lowered and "ssl_error_syscall" in lowered:
@@ -490,7 +678,7 @@ def _git_failure(action, detail, remote_url=""):
         return GitSyncError(f"仓库地址有误、账号权限不足，或凭据不正确。{_auth_hint(remote_url)}（Git：{raw}）")
     if "refusing to merge unrelated histories" in lowered:
         return GitSyncError("本地库与远端已有独立的提交历史。要加入已有团队仓库，请在「共享与同步」挂载共享库，个人记忆会保留在原目录。")
-    return GitSyncError(f"{action} failed: {detail}")
+    return GitSyncError(f"{action} failed: {_redact_remote_urls(detail)}")
 
 
 def _run_git(root, *args, check=True, env_extra=None, timeout=None, browser_login=False):
@@ -529,6 +717,8 @@ def _ensure_git_identity(root):
 
 def _ensure_gitignore(root):
     gi = Path(root) / ".gitignore"
+    if gi.is_symlink():
+        raise GitSyncError("库内 .gitignore 不能是符号链接。")
     if not gi.is_file():
         _atomic_write(gi, DEFAULT_GITIGNORE)
         return
@@ -553,6 +743,10 @@ def current_branch(root, fallback="main"):
 def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable=True):
     """Ensure root is a Git repo with sane .gitignore, local identity, and optional remote."""
     root = Path(root).expanduser().resolve()
+    try:
+        validate_remote_url(remote_url)
+    except ValueError as exc:
+        raise GitSyncError(str(exc)) from exc
     root.mkdir(parents=True, exist_ok=True)
     initialized = False
     if not is_git_repo(root):
@@ -575,13 +769,22 @@ def ensure_repo(root, remote_url="", remote="origin", branch="main", *, writable
         "initialized": initialized,
         "branch": current_branch(root, fallback=branch or "main"),
         "remote": remote,
+        # validate_remote_url() has already rejected embedded passwords/tokens. Keep
+        # username-only hints (and SSH URLs) intact because callers persist this value
+        # in mounts.json and Git needs the original remote to work.
         "remote_url": _run_git(root, "remote", "get-url", remote, check=False).stdout.strip(),
     }
 
 
 def clone_repo(remote_url, dest_path, branch=""):
     """Clone a remote Git repository into dest_path."""
+    try:
+        validate_remote_url(remote_url)
+    except ValueError as exc:
+        raise GitSyncError(str(exc)) from exc
     dest = Path(dest_path).expanduser().resolve()
+    if dest.is_symlink():
+        raise GitSyncError(f"Target directory cannot be a symlink: {dest}")
     if dest.exists() and any(dest.iterdir()):
         raise GitSyncError(f"Target directory already exists and is not empty: {dest}")
     created = not dest.exists()
@@ -607,6 +810,8 @@ def clone_repo(remote_url, dest_path, branch=""):
     return {
         "path": str(dest),
         "branch": current_branch(dest, fallback=branch or "main"),
+        # The URL was validated before clone; returning it is safe and preserves
+        # username-only HTTPS hints used by credential helpers.
         "remote_url": remote_url,
     }
 
@@ -635,6 +840,54 @@ def _porcelain_changes(root):
     if proc.returncode != 0:
         return []
     return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _git_path_list(root, *args):
+    """Read a NUL-delimited Git path list without interpreting path contents."""
+    proc = _run_git(root, *args, check=False)
+    if proc.returncode != 0:
+        return []
+    return [item for item in proc.stdout.split("\0") if item]
+
+
+def _stage_allowed_paths(root):
+    """Stage only memory Markdown and framework seed files.
+
+    Git's ``add -A`` is intentionally avoided: an accidental credential file,
+    attachment, or unrelated artifact inside the library must never be swept
+    into a memory commit or pushed to a shared remote.  Existing disallowed
+    staged paths are explicitly reset (the worktree is left untouched).
+    """
+    root = Path(root).expanduser().resolve()
+    tracked = _git_path_list(root, "ls-files", "-z")
+    candidates = _discover_sync_paths(root)
+    candidates.update(
+        rel for rel in tracked
+        if _is_safe_sync_relpath(rel) and _safe_library_path(root, rel, allow_missing=True) is not None
+    )
+
+    staged = _git_path_list(root, "diff", "--cached", "--name-only", "-z")
+    disallowed = [rel for rel in staged if rel not in candidates]
+    if disallowed:
+        reset = _run_git(root, "reset", "--quiet", "--", *sorted(disallowed), check=False)
+        if reset.returncode != 0:
+            raise GitSyncError("无法撤销非记忆文件的暂存状态，已停止自动提交。")
+
+    if candidates:
+        _run_git(root, "add", "--", *sorted(candidates))
+
+    # A symlink may have appeared between discovery and `git add`; verify the
+    # final index before allowing commit/push to continue.
+    staged_after = _git_path_list(root, "diff", "--cached", "--name-only", "-z")
+    unsafe_after = [
+        rel for rel in staged_after
+        if not _is_safe_sync_relpath(rel)
+        or _safe_library_path(root, rel, allow_missing=True) is None
+    ]
+    if unsafe_after:
+        _run_git(root, "reset", "--quiet", "--", *sorted(unsafe_after), check=False)
+        raise GitSyncError("暂存区包含不受支持或符号链接路径，已阻止自动提交。")
+    return staged_after
 
 
 def git_status(root, remote="origin", branch=""):
@@ -680,7 +933,7 @@ def git_status(root, remote="origin", branch=""):
         "is_repo": True,
         "branch": br,
         "remote": remote,
-        "remote_url": remote_url,
+        "remote_url": _redact_remote_urls(remote_url),
         "has_commits": has_head,
         "dirty": bool(changes),
         "dirty_count": len(changes),
@@ -701,15 +954,12 @@ def auto_commit(root, message):
         return {"committed": False, "reason": "clean"}
     _ensure_git_identity(root)
     _ensure_gitignore(root)
-    _run_git(root, "add", "-A")
-    # Re-check staged diff (e.g., if only ignored files existed)
-    if _has_commits(root):
-        staged = _run_git(root, "diff", "--cached", "--quiet", check=False)
-        if staged.returncode == 0:
-            return {"committed": False, "reason": "clean"}
+    staged_paths = _stage_allowed_paths(root)
+    if not staged_paths:
+        return {"committed": False, "reason": "nothing_allowed", "files": 0}
     _run_git(root, "commit", "-m", message)
     rev = _run_git(root, "rev-parse", "--short", "HEAD").stdout.strip()
-    return {"committed": True, "revision": rev, "files": len(changes)}
+    return {"committed": True, "revision": rev, "files": len(staged_paths)}
 
 
 def _extract_theirs_conflict_copy(root, rel_path, stamp, text=None):
@@ -717,12 +967,17 @@ def _extract_theirs_conflict_copy(root, rel_path, stamp, text=None):
 
     `text` overrides the content (used for the remote-deleted tombstone).
     """
+    normalized = _normalize_git_relpath(rel_path)
+    if not normalized or not _is_safe_sync_relpath(normalized):
+        raise GitSyncError(f"远端冲突路径不在记忆 Markdown 允许列表中：{_redact_remote_urls(rel_path)}")
     if text is None:
-        show = _run_git(root, "show", f":3:{rel_path}", check=False)
+        show = _run_git(root, "show", f":3:{normalized}", check=False)
         if show.returncode != 0:
             return None
         text = show.stdout
-    orig = Path(root) / rel_path
+    orig = _safe_library_path(root, normalized, allow_missing=True)
+    if orig is None:
+        raise GitSyncError(f"冲突路径包含符号链接或越界：{_redact_remote_urls(normalized)}")
     conflict_name = f"{orig.stem}.conflict-{stamp}{orig.suffix}"
     conflict_path = orig.with_name(conflict_name)
     if conflict_path.exists():
@@ -730,6 +985,8 @@ def _extract_theirs_conflict_copy(root, rel_path, stamp, text=None):
         while conflict_path.exists():
             conflict_path = orig.with_name(f"{orig.stem}.conflict-{stamp}-{idx}{orig.suffix}")
             idx += 1
+    if conflict_path.is_symlink():
+        raise GitSyncError("冲突副本目标不能是符号链接。")
     _atomic_write(conflict_path, text)
     return conflict_path.relative_to(root).as_posix()
 
@@ -779,6 +1036,10 @@ def pull(root, remote="origin", branch="", mode="rw"):
         remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
         if not remote_url:
             raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
+        try:
+            validate_remote_url(remote_url)
+        except ValueError as exc:
+            raise GitSyncError(str(exc)) from exc
 
         changes = _porcelain_changes(root)
         seeds = _unmodified_seeds(root) if changes else []
@@ -847,6 +1108,24 @@ def pull(root, remote="origin", branch="", mode="rw"):
             detail = (merge.stderr or merge.stdout or "merge failed").strip()
             raise _git_failure(f"git merge {remote_ref}", detail)
 
+        unsafe_unmerged = [rel for rel in unmerged if not _is_safe_sync_relpath(rel)]
+        if unsafe_unmerged:
+            _run_git(root, "merge", "--abort", check=False)
+            raise GitSyncError(
+                "远端合并包含不在记忆 Markdown 允许列表中的文件，已中止合并："
+                + ", ".join(_redact_remote_urls(rel) for rel in unsafe_unmerged[:5])
+            )
+        unsafe_paths = [
+            rel for rel in unmerged
+            if _safe_library_path(root, rel, allow_missing=True) is None
+        ]
+        if unsafe_paths:
+            _run_git(root, "merge", "--abort", check=False)
+            raise GitSyncError(
+                "合并路径包含符号链接或越界路径，已中止合并："
+                + ", ".join(_redact_remote_urls(rel) for rel in unsafe_paths[:5])
+            )
+
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         saved_conflicts = []
         restored_remote = []
@@ -855,7 +1134,11 @@ def pull(root, remote="origin", branch="", mode="rw"):
         for rel in unmerged:
             if rel == "MEMORY.md":
                 index_conflicted = True
-                _run_git(root, "checkout", "--ours", "MEMORY.md", check=False)
+                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                if not copy_rel:
+                    raise GitSyncError("无法保存远端 MEMORY.md 冲突副本，已停止自动合并。")
+                saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "index"})
+                _run_git(root, "checkout", "--ours", "MEMORY.md")
                 continue
             # Keep local file at original path and preserve remote copy beside it
             has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
@@ -881,20 +1164,34 @@ def pull(root, remote="origin", branch="", mode="rw"):
 
         _ensure_git_identity(root)
         _ensure_gitignore(root)
-        _run_git(root, "add", "-A")
+        _stage_allowed_paths(root)
+        still_unmerged = _git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z")
+        if still_unmerged:
+            raise GitSyncError(
+                "合并后仍有未解决冲突，已阻止自动提交：" + ", ".join(still_unmerged[:5])
+            )
         msg = (
             "sync: merge remote (auto-rebuilt MEMORY.md)"
             if not saved_conflicts
-            else f"sync: merge remote ({len(saved_conflicts)} entry conflict copy preserved)"
+            else f"sync: merge remote ({len(saved_conflicts)} conflict copies preserved)"
         )
         _run_git(root, "commit", "--no-edit", "-m", msg)
+        blocking_conflicts = [
+            conflict for conflict in saved_conflicts
+            if conflict.get("kind") != "index"
+        ]
+        preserved_index_conflicts = [
+            conflict for conflict in saved_conflicts
+            if conflict.get("kind") == "index"
+        ]
         return {
             "pulled": True,
             "status": "merged_with_conflicts" if saved_conflicts else "merged_index_rebuilt",
             "branch": br,
             "remote": remote,
             "index_rebuilt": index_conflicted,
-            "conflicts": saved_conflicts,
+            "conflicts": blocking_conflicts,
+            "preserved_conflicts": preserved_index_conflicts,
             "restored_remote": restored_remote,
         }
 
@@ -912,11 +1209,16 @@ def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
         remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
         if not remote_url:
             raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
+        try:
+            validate_remote_url(remote_url)
+        except ValueError as exc:
+            raise GitSyncError(str(exc)) from exc
 
         existing_conflicts = find_conflict_files(root)
-        if existing_conflicts:
+        blocking_conflicts = [rel for rel in existing_conflicts if not _is_index_conflict_path(rel)]
+        if blocking_conflicts:
             raise GitSyncError(
-                f"Unresolved conflict copies exist ({', '.join(existing_conflicts)}); merge and remove them before pushing."
+                f"Unresolved conflict copies exist ({', '.join(blocking_conflicts)}); merge and remove them before pushing."
             )
 
         commit_res = auto_commit(root, "sync: commit local memory updates")
@@ -940,6 +1242,10 @@ def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only
     result = {"path": str(Path(root).expanduser().resolve()), "mode": mode, "pull": None, "push": None}
     if browser_login:
         remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
+        try:
+            validate_remote_url(remote_url)
+        except ValueError as exc:
+            raise GitSyncError(str(exc)) from exc
         if github_browser_login(remote_url):
             # Finish the interactive step before taking the library write lock or making a snapshot.
             test_remote_access(root, remote, browser_login=True)
@@ -948,7 +1254,11 @@ def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only
     if not push_only:
         pull_res = pull(root, remote=remote, branch=branch, mode=mode)
         result["pull"] = pull_res
-        if pull_res.get("conflicts"):
+        blocking_conflicts = [
+            conflict for conflict in pull_res.get("conflicts") or []
+            if conflict.get("kind") != "index"
+        ]
+        if blocking_conflicts:
             result["status"] = "needs_manual_merge"
             return result
     if mode == "rw" and not pull_only:

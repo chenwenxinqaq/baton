@@ -8,11 +8,13 @@ All functions are best-effort: auditing must never break MCP calls or hooks.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
 import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import time
 
 from library_paths import global_state_dir
@@ -21,10 +23,70 @@ MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
 READ_TOOLS = {"memory_search", "memory_list", "memory_read"}
 WRITE_TOOLS = {"memory_upsert", "memory_archive"}
+REMOTE_URL_WITH_USERINFO_RE = re.compile(
+    r"(?P<prefix>(?:https?|ssh)://)(?P<userinfo>[^/\s@]+)@",
+    re.IGNORECASE,
+)
 
 
 def audit_path(home=None):
     return global_state_dir(home=home) / "audit.jsonl"
+
+
+def _redact_remote_urls(value):
+    return REMOTE_URL_WITH_USERINFO_RE.sub(r"\g<prefix>***@", str(value or ""))
+
+
+def _private_dir(path):
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError(f"Refusing symlinked audit directory: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _open_private(path, flags, mode=0o600):
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags, mode)
+    try:
+        os.fchmod(fd, mode)
+    except OSError:
+        pass
+    return fd
+
+
+@contextmanager
+def _audit_lock(path):
+    """Lock a stable companion inode so rotation cannot invalidate the lock."""
+    path = Path(path)
+    _private_dir(path.parent)
+    lock_path = path.with_name(path.name + ".lock")
+    fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _sanitize_value(value):
+    if isinstance(value, str):
+        return _redact_remote_urls(value)
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_value(item) for key, item in value.items()}
+    return value
 
 
 def normalize_client(name):
@@ -51,19 +113,24 @@ def record(event, home=None):
     """Append one event. Returns True if written."""
     try:
         path = audit_path(home=home)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _private_dir(path.parent)
         now = time.time()
         payload = {"t": round(now, 3), "ts": datetime.fromtimestamp(now).isoformat(timespec="seconds")}
-        payload.update({k: v for k, v in event.items() if v not in (None, "")})
+        payload.update({k: _sanitize_value(v) for k, v in event.items() if v not in (None, "")})
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            os.write(fd, line.encode("utf-8"))
-            if os.fstat(fd).st_size > MAX_BYTES:
+        with _audit_lock(path):
+            fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            try:
+                encoded = line.encode("utf-8")
+                offset = 0
+                while offset < len(encoded):
+                    offset += os.write(fd, encoded[offset:])
+                os.fsync(fd)
+                too_large = os.fstat(fd).st_size > MAX_BYTES
+            finally:
+                os.close(fd)
+            if too_large:
                 _rotate(path)
-        finally:
-            os.close(fd)
         return True
     except Exception:
         return False
@@ -71,10 +138,25 @@ def record(event, home=None):
 
 def _rotate(path):
     try:
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            return
         lines = path.read_text(encoding="utf-8").splitlines()[-KEEP_LINES:]
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        fd = _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        try:
+            content = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""
+            offset = 0
+            while offset < len(content):
+                offset += os.write(fd, content[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except Exception:
         pass
 
@@ -82,21 +164,28 @@ def _rotate(path):
 def read_events(since=None, home=None):
     """Return events (oldest first) with t >= since (epoch)."""
     path = audit_path(home=home)
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return []
     events = []
     try:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if since is None or float(ev.get("t", 0)) >= since:
-                    events.append(ev)
+        with _audit_lock(path):
+            fd = _open_private(path, os.O_RDONLY)
+            try:
+                with os.fdopen(fd, encoding="utf-8") as fh:
+                    fd = None
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except ValueError:
+                            continue
+                        if since is None or float(ev.get("t", 0)) >= since:
+                            events.append(ev)
+            finally:
+                if fd is not None:
+                    os.close(fd)
     except OSError:
         return []
     return events
