@@ -48,6 +48,7 @@ import audit_log  # noqa: E402
 import memory_import  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
+from async_sync import AsyncSyncScheduler  # noqa: E402
 
 LAYERS = {
     "L0": ("操作约束", "feedback", "操作红线、只读范围与环境授权边界"),
@@ -353,6 +354,7 @@ class Library:
         allowed_layers=None,
         allow_user_managed=True,
         sync_config=None,
+        async_scheduler=None,
     ):
         root = data_root(root).resolve(strict=True)
         self.root = root
@@ -362,6 +364,10 @@ class Library:
         self.allowed_layers = frozenset(allowed_layers if allowed_layers is not None else ALL_LAYERS)
         self.allow_user_managed = bool(allow_user_managed)
         self.sync_config = sync_config
+        # One scheduler is shared by all libraries in a manager process.  Keeping
+        # this injectable preserves the lightweight Library API used by tests and
+        # lets the process owner control worker shutdown.
+        self.async_scheduler = async_scheduler
         self.index = root / "MEMORY.md"
         if root.name.casefold() in {"memories", "memories_v2"} or not self.index.is_file():
             raise InvalidEntry("请选择包含 MEMORY.md 的手工记忆库目录。")
@@ -377,6 +383,49 @@ class Library:
         # The web UI keeps the primary write API stable (save_topic still returns a path), while
         # retaining the latest non-fatal Git snapshot outcome for notices and diagnostics.
         self.last_sync_status = None
+
+    def _enqueue_async_sync(self, message):
+        """Queue a debounced remote Git sync after a successful local write.
+
+        This is deliberately best-effort.  Local writes and their existing
+        ``auto_commit`` behavior remain authoritative; scheduler failures are
+        persisted by the worker and must never turn a completed web write into
+        an HTTP error.
+        """
+        scheduler = self.async_scheduler
+        if scheduler is None:
+            return None
+        config = self.sync_config or {}
+        if (
+            self.mode != "rw"
+            or str(config.get("driver") or "").casefold() != "git"
+            or not bool(config.get("auto_push", False))
+        ):
+            return None
+        try:
+            return scheduler.enqueue(
+                self.root,
+                sync_config=config,
+                mode=self.mode,
+                reason=message,
+            )
+        except Exception:
+            return None
+
+    def async_sync_status(self):
+        """Return the latest persisted/in-process asynchronous sync status."""
+        scheduler = self.async_scheduler
+        if scheduler is not None:
+            try:
+                return scheduler.status(self.root)
+            except Exception:
+                pass
+        path = self.state_dir / "sync-status.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
 
     @property
     def is_readonly(self):
@@ -540,7 +589,9 @@ class Library:
             if cur_rev != expected_revision:
                 raise StaleEntry
             mcp_server.atomic_write(self.index, normalized + "\n")
-        self._maybe_auto_commit(f"memory({self.library_id}): update MEMORY.md")
+        message = f"memory({self.library_id}): update MEMORY.md"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
 
     @staticmethod
     def _topic_revision(raw_bytes, topic):
@@ -691,7 +742,9 @@ class Library:
                     raise
                 if new_rel != orig_path:
                     (self.root / orig_path).unlink(missing_ok=True)
-                self._maybe_auto_commit(f"memory({self.library_id}): update {new_rel}")
+                message = f"memory({self.library_id}): update {new_rel}"
+                self._maybe_auto_commit(message)
+                self._enqueue_async_sync(message)
                 return new_rel
 
             final_slug = self._generate_unique_slug(title, slug)
@@ -717,7 +770,9 @@ class Library:
             except Exception:
                 new_file.unlink(missing_ok=True)
                 raise
-            self._maybe_auto_commit(f"memory({self.library_id}): create {new_rel}")
+            message = f"memory({self.library_id}): create {new_rel}"
+            self._maybe_auto_commit(message)
+            self._enqueue_async_sync(message)
             return new_rel
 
     def archive_topic(self, topic_path, expected_revision):
@@ -767,7 +822,9 @@ class Library:
                 dest.unlink(missing_ok=True)
                 raise
             (self.root / topic_path).unlink(missing_ok=True)
-            self._maybe_auto_commit(f"memory({self.library_id}): archive {topic_path} -> {new_rel}")
+            message = f"memory({self.library_id}): archive {topic_path} -> {new_rel}"
+            self._maybe_auto_commit(message)
+            self._enqueue_async_sync(message)
             return new_rel
 
     def delete_topic(self, topic_path, expected_revision):
@@ -786,7 +843,9 @@ class Library:
             self._backup_to_trash(target, cur.slug)
             target.unlink()
             store._remove_index_line(topic_path)
-        self._maybe_auto_commit(f"memory({self.library_id}): delete {topic_path}")
+        message = f"memory({self.library_id}): delete {topic_path}"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
 
     def path(self, name):
         if not self.allow_user_managed:
@@ -847,7 +906,9 @@ class Library:
             finally:
                 if staged is not None:
                     staged.unlink(missing_ok=True)
-        self._maybe_auto_commit(f"memory({self.library_id}): save user-managed/{entry.name}.md")
+        message = f"memory({self.library_id}): save user-managed/{entry.name}.md"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
 
     def delete_user_entry(self, name, expected_revision):
         self._ensure_writable(user_managed=True)
@@ -861,7 +922,9 @@ class Library:
                 raise StaleEntry
             self._backup_to_trash(path, name)
             path.unlink()
-        self._maybe_auto_commit(f"memory({self.library_id}): delete user-managed/{name}.md")
+        message = f"memory({self.library_id}): delete user-managed/{name}.md"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
 
 
 def validate_common_fields(layer, title, description, body):
@@ -4240,7 +4303,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
 
 
-def build_libraries_map(primary_root, also_root=None, home=None, issues=None):
+def build_libraries_map(primary_root, also_root=None, home=None, issues=None, async_scheduler=None):
     """Build ordered mapping of key -> Library from primary root, mounts.json, and optional --also-root.
 
     Invalid or unavailable shared mounts are reported through ``issues`` instead of silently
@@ -4262,6 +4325,7 @@ def build_libraries_map(primary_root, also_root=None, home=None, issues=None):
                 allowed_layers=desc["layers"],
                 allow_user_managed=desc["allow_user_managed"],
                 sync_config=desc.get("sync"),
+                async_scheduler=async_scheduler,
             )
         except (InvalidEntry, ValueError, OSError) as exc:
             if key == "primary":
@@ -4270,7 +4334,7 @@ def build_libraries_map(primary_root, also_root=None, home=None, issues=None):
             mount_issues.append(unavailable_issue(desc, reason))
             continue
     if also_root:
-        alternate = Library(also_root, "对照记忆库", library_id="local")
+        alternate = Library(also_root, "对照记忆库", library_id="local", async_scheduler=async_scheduler)
         if all(lib.root != alternate.root for lib in libraries.values()):
             libraries["local"] = alternate
     return libraries
@@ -4296,7 +4360,13 @@ def main():
         os.environ["UNIFIED_MEMORY_ROOT"] = str(primary)
         initial_config_signature = config_signature()
         mount_issues = []
-        libraries = build_libraries_map(primary, also_root=args.also_root, issues=mount_issues)
+        async_scheduler = AsyncSyncScheduler()
+        libraries = build_libraries_map(
+            primary,
+            also_root=args.also_root,
+            issues=mount_issues,
+            async_scheduler=async_scheduler,
+        )
         server = HTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
@@ -4310,6 +4380,7 @@ def main():
         parser.exit(2, f"{exc}\n")
     with server:
         server.libraries = libraries
+        server.async_scheduler = async_scheduler
         server.mount_issues = mount_issues
         server.sync_jobs = {}
         server.token = secrets.token_urlsafe(32)
@@ -4322,7 +4393,12 @@ def main():
             cur_signature = config_signature()
             if force or cur_signature != state_holder["signature"]:
                 issues = []
-                server.libraries = build_libraries_map(primary, also_root=args.also_root, issues=issues)
+                server.libraries = build_libraries_map(
+                    primary,
+                    also_root=args.also_root,
+                    issues=issues,
+                    async_scheduler=server.async_scheduler,
+                )
                 server.mount_issues = issues
                 state_holder["signature"] = cur_signature
 
@@ -4340,6 +4416,8 @@ def main():
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            server.async_scheduler.shutdown()
 
 
 if __name__ == "__main__":
