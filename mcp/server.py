@@ -381,15 +381,66 @@ class MemoryStore:
         return str(dest)
 
     def _maybe_auto_commit(self, message):
-        """Auto-commit to Git when configured on this library; never fail the primary write."""
+        """Auto-commit to Git while keeping the primary memory write non-fatal.
+
+        The write API intentionally remains backward compatible: a Git failure is returned as
+        status metadata and is surfaced on the write result as ``sync_warning``.  It is also
+        recorded separately so a successful memory write cannot hide a failed Git snapshot.
+        """
         if not self.sync_config or self.sync_config.get("driver") != "git":
             return None
         if not self.sync_config.get("auto_commit", True):
             return None
+
+        def redacted(value):
+            text = str(value or "")
+            redact_url = getattr(sync_git, "_redact_remote_urls", None)
+            if callable(redact_url):
+                text = redact_url(text)
+            return text[:320]
+
+        def failure(result, *, error=""):
+            if isinstance(result, dict):
+                status = dict(result)
+            else:
+                status = {"committed": False, "reason": "invalid_result"}
+            status["committed"] = False
+            reason = redacted(status.get("reason") or "unknown")
+            detail = redacted(error or status.get("error") or "")
+            status["reason"] = reason
+            if detail:
+                status["error"] = detail
+            status["warning"] = f"记忆已保存，但 Git 快照未提交（原因：{reason}）。"
+            audit_log.record(
+                {
+                    "source": "mcp",
+                    "event": "git_auto_commit",
+                    "client": CLIENT_NAME,
+                    "tool": "git_auto_commit",
+                    "ok": False,
+                    "library": self.library_id,
+                    "message": redacted(message),
+                    "reason": reason,
+                    "error": detail,
+                },
+                home=AUDIT_HOME,
+            )
+            return status
+
         try:
-            return sync_git.auto_commit(self.root, message)
-        except Exception:
-            return None
+            result = sync_git.auto_commit(self.root, message)
+        except Exception as exc:
+            return failure(None, error=exc)
+        if not isinstance(result, dict) or not result.get("committed"):
+            return failure(result)
+        return result
+
+    @staticmethod
+    def _with_sync_warning(result, sync_status):
+        """Attach a non-fatal Git warning without changing successful write payloads."""
+        if isinstance(sync_status, dict) and sync_status.get("warning"):
+            result["sync_warning"] = sync_status["warning"]
+        return result
 
     def resolve_safe(self, rel_path):
         """Resolve a relative path and enforce confinement inside self.root."""
@@ -733,15 +784,15 @@ class MemoryStore:
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body}\n")
                 rel_out = target.relative_to(self.root).as_posix()
-                self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_out}")
-                return {
+                sync_status = self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_out}")
+                return self._with_sync_warning({
                     **self._result_metadata(),
                     "ref": self._entry_ref(rel_out),
                     "path": rel_out,
                     "indexed": False,
                     "created_at": cre_at,
                     "updated_at": ts_now,
-                }
+                }, sync_status)
 
             folder = LAYER_DIRS[layer]
             target = self.root / folder / f"{name}.md"
@@ -803,7 +854,7 @@ class MemoryStore:
                 stale_path.unlink(missing_ok=True)
                 migrated_from.append(stale_rel)
 
-            self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_path}")
+            sync_status = self._maybe_auto_commit(f"memory({self.library_id}): upsert {rel_path}")
             res = {
                 **self._result_metadata(),
                 "ref": self._entry_ref(rel_path),
@@ -814,7 +865,7 @@ class MemoryStore:
             }
             if migrated_from:
                 res["migrated_from"] = migrated_from
-            return res
+            return self._with_sync_warning(res, sync_status)
 
     def _remove_index_line(self, rel_path):
         """Remove any index line referencing rel_path from MEMORY.md."""
@@ -899,13 +950,13 @@ class MemoryStore:
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
                 rel_out = target.relative_to(self.root).as_posix()
-                self._maybe_auto_commit(f"memory({self.library_id}): archive {rel_out}")
-                return {
+                sync_status = self._maybe_auto_commit(f"memory({self.library_id}): archive {rel_out}")
+                return self._with_sync_warning({
                     **self._result_metadata(),
                     "path": rel_out,
                     "status": "archived",
                     "updated_at": ts_now,
-                }
+                }, sync_status)
 
             indexed = self.parse_index()
             for layer, folder in LAYER_DIRS.items():
@@ -953,14 +1004,14 @@ class MemoryStore:
                             pass
                         raise
                     candidate.unlink(missing_ok=True)
-                    self._maybe_auto_commit(f"memory({self.library_id}): archive {old_rel} -> {new_rel}")
-                    return {
+                    sync_status = self._maybe_auto_commit(f"memory({self.library_id}): archive {old_rel} -> {new_rel}")
+                    return self._with_sync_warning({
                         **self._result_metadata(),
                         "from": old_rel,
                         "to": new_rel,
                         "layer": "L4",
                         "updated_at": ts_now,
-                    }
+                    }, sync_status)
 
         raise ValueError(f"Active entry not found: {name}")
 
