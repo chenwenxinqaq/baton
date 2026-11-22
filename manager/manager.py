@@ -547,12 +547,33 @@ class Library:
         meta_sig = f"\n{topic.layer}\n{topic.title}\n{topic.description}".encode("utf-8")
         return sha256(raw_bytes + meta_sig).hexdigest()
 
+    @staticmethod
+    def _canonical_topic_path(topic_path, topics):
+        """Resolve a topic URL against the current library's indexed paths only."""
+        if not isinstance(topic_path, str):
+            raise InvalidEntry("条目路径无效。")
+        topic_path = topic_path.strip()
+        if (
+            not topic_path
+            or "\x00" in topic_path
+            or "\\" in topic_path
+            or topic_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in topic_path.split("/"))
+        ):
+            raise InvalidEntry("条目路径无效。")
+        if topic_path in topics:
+            return topic_path
+        if not topic_path.endswith(".md"):
+            with_suffix = f"{topic_path}.md"
+            if with_suffix in topics:
+                return with_suffix
+        raise InvalidEntry("条目不在索引中。")
+
     def read_topic(self, topic_path, topics=None):
         if topics is None:
             _, topics = self.read_index()
-        topic = topics.get(topic_path)
-        if topic is None:
-            raise InvalidEntry("条目不在索引中。")
+        canonical_path = self._canonical_topic_path(topic_path, topics)
+        topic = topics[canonical_path]
         detail_path = (self.root / topic.path).resolve(strict=True)
         if not detail_path.is_relative_to(self.root) or not detail_path.is_file():
             raise InvalidEntry("找不到对应的记忆 Markdown 文件。")
@@ -611,6 +632,7 @@ class Library:
                     cur = self.read_topic(orig_path, current_topics)
                 except (FileNotFoundError, InvalidEntry) as exc:
                     raise StaleEntry from exc
+                orig_path = cur.path
                 if cur.revision != expected_revision:
                     raise StaleEntry
 
@@ -710,6 +732,7 @@ class Library:
                 raise StaleEntry from exc
             if cur.revision != expected_revision:
                 raise StaleEntry
+            topic_path = cur.path
             if cur.layer == "L4":
                 return cur.path
 
@@ -758,6 +781,7 @@ class Library:
                 raise StaleEntry from exc
             if cur.revision != expected_revision:
                 raise StaleEntry
+            topic_path = cur.path
             target = self.root / topic_path
             self._backup_to_trash(target, cur.slug)
             target.unlink()
@@ -860,6 +884,31 @@ def hidden(name, value):
 def query(**fields):
     clean = {k: v for k, v in fields.items() if v != ""}
     return "/?" + urlencode(clean) if clean else "/"
+
+
+def topic_read_error(library, topic_path, exc):
+    """Return a user-facing diagnosis without exposing local filesystem paths."""
+    display_path = topic_path or "（空）"
+    reason = str(exc)
+    if reason == "条目不在索引中。":
+        return (
+            f'当前记忆库「{library.label}」的索引中没有条目「{display_path}」。'
+            "该链接可能来自其他记忆库，或索引已更新；请切换到包含它的记忆库，"
+            "或返回当前库概览。"
+        )
+    if reason == "找不到对应的记忆 Markdown 文件。":
+        return (
+            f'当前记忆库「{library.label}」的索引包含「{display_path}」，'
+            "但对应 Markdown 文件不存在；请刷新索引或从列表重新打开。"
+        )
+    if reason == "条目路径无效。":
+        return f'条目路径「{display_path}」无效，请从当前记忆库列表重新打开。'
+    if isinstance(exc, OSError):
+        return (
+            f'无法读取当前记忆库「{library.label}」中的「{display_path}」对应文件，'
+            "请检查索引与记忆目录是否一致。"
+        )
+    return f'无法读取当前记忆库「{library.label}」中的「{display_path}」，请检查条目格式。'
 
 
 def display_remote_url(remote_url):
@@ -2739,6 +2788,15 @@ def render(
         markdown, topics = "", {}
         unreadable.append("MEMORY.md")
 
+    requested_topic_path = topic_path
+    if topic_path:
+        try:
+            topic_path = library._canonical_topic_path(topic_path, topics)
+        except InvalidEntry:
+            # Keep the original value for a diagnostic error page.  A topic
+            # from another library must not be silently redirected.
+            pass
+
     if tab == "skills":
         return render_skills_tab(
             libraries,
@@ -2946,9 +3004,17 @@ def render(
                 cancel_link=query(**link_params, topic=t_entry.path) + "#detail-title",
                 file_meta_note=meta_note,
             )
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
             heading = "无法编辑条目"
-            error = error or "找不到该记忆条目或索引已变更，请从左侧列表重新打开。"
+            error = error or topic_read_error(
+                library,
+                requested_topic_path or topic_path,
+                exc,
+            )
+            detail_toolbar = (
+                f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">'
+                "返回当前库概览</a>"
+            )
     elif view == "edit_index":
         heading = "编辑 MEMORY.md · 记忆维护规则与总索引"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
@@ -3139,9 +3205,17 @@ def render(
                 )
             )
             reader = summary_html + body_html
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
             heading = "无法读取条目"
-            error = error or "无法读取该条目，请检查它是否仍在索引和记忆目录中。"
+            error = error or topic_read_error(
+                library,
+                requested_topic_path or topic_path,
+                exc,
+            )
+            detail_toolbar = (
+                f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">'
+                "返回当前库概览</a>"
+            )
     else:
         heading = "记忆库概览"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'

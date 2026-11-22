@@ -1179,6 +1179,17 @@ os.execv(git, [git, *args])
                 )
                 self.assertIn("前端团队库", after_mount)
 
+                # A legacy URL without ".md" remains readable, while a topic
+                # from the personal library is diagnosed instead of silently
+                # opening under the selected shared library.
+                legacy_topic_html = get_html("/?topic=methods/deploy-tip")
+                self.assertIn("发布经验", legacy_topic_html)
+                self.assertIn("topic=methods%2Fdeploy-tip.md", legacy_topic_html)
+                cross_library_html = get_html("/?library=team-ui&topic=methods/deploy-tip.md")
+                self.assertIn("当前记忆库「前端团队库」的索引中没有条目", cross_library_html)
+                self.assertIn("返回当前库概览", cross_library_html)
+                self.assertIn('href="/?library=team-ui"', cross_library_html)
+
                 # 2. Share a personal topic to the mounted team library via web action.
                 topic_html = get_html("/?topic=methods/deploy-tip.md")
                 self.assertIn("分享到共享库", topic_html)
