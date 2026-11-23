@@ -876,6 +876,19 @@ def _git_path_list(root, *args):
     return [item for item in proc.stdout.split("\0") if item]
 
 
+def _merge_in_progress(root):
+    """True while a merge is unfinished (MERGE_HEAD present or unmerged index entries)."""
+    if _run_git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0:
+        return True
+    return bool(_git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z"))
+
+
+MERGE_IN_PROGRESS_MESSAGE = (
+    "记忆库有未完成的 Git 合并，已停止自动提交和同步。"
+    "请在库目录运行 git merge --abort，或解决冲突后手动提交。"
+)
+
+
 def _stage_allowed_paths(root):
     """Stage only memory Markdown and framework seed files.
 
@@ -975,6 +988,9 @@ def auto_commit(root, message):
     root = Path(root).expanduser().resolve()
     if not is_git_repo(root):
         return {"committed": False, "reason": "not_a_repo"}
+    if _merge_in_progress(root):
+        # Committing now would conclude the merge with conflict markers staged as resolved.
+        return {"committed": False, "reason": "merge_in_progress", "error": MERGE_IN_PROGRESS_MESSAGE}
     changes = _porcelain_changes(root)
     if not changes:
         return {"committed": False, "reason": "clean"}
@@ -1066,6 +1082,8 @@ def pull(root, remote="origin", branch="", mode="rw"):
             validate_remote_url(remote_url)
         except ValueError as exc:
             raise GitSyncError(str(exc)) from exc
+        if _merge_in_progress(root):
+            raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
 
         changes = _porcelain_changes(root)
         seeds = _unmodified_seeds(root) if changes else []
@@ -1157,51 +1175,61 @@ def pull(root, remote="origin", branch="", mode="rw"):
         restored_remote = []
         index_conflicted = False
 
-        for rel in unmerged:
-            if rel == "MEMORY.md":
-                index_conflicted = True
-                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
-                if not copy_rel:
-                    raise GitSyncError("无法保存远端 MEMORY.md 冲突副本，已停止自动合并。")
-                saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "index"})
-                _run_git(root, "checkout", "--ours", "MEMORY.md")
-                continue
-            # Keep local file at original path and preserve remote copy beside it
-            has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
-            has_theirs = _run_git(root, "show", f":3:{rel}", check=False).returncode == 0
-            if has_ours and not has_theirs:
-                # Remote deleted what we edited: keep our copy and ask, instead of silently resurrecting it.
-                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp, text=REMOTE_DELETED_TEXT)
-                saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "remote_deleted"})
-                _run_git(root, "checkout", "--ours", rel)
-            elif has_theirs and not has_ours:
-                # We deleted what the remote edited: never drop their edit; restore it and report.
-                _run_git(root, "checkout", "--theirs", rel)
-                restored_remote.append(rel)
-            else:
-                copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
-                if copy_rel:
-                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "both_modified"})
-                _run_git(root, "checkout", "--ours", rel)
+        try:
+            for rel in unmerged:
+                if rel == "MEMORY.md":
+                    index_conflicted = True
+                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                    if not copy_rel:
+                        raise GitSyncError("无法保存远端 MEMORY.md 冲突副本，已停止自动合并。")
+                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "index"})
+                    _run_git(root, "checkout", "--ours", "MEMORY.md")
+                    continue
+                # Keep local file at original path and preserve remote copy beside it
+                has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
+                has_theirs = _run_git(root, "show", f":3:{rel}", check=False).returncode == 0
+                if has_ours and not has_theirs:
+                    # Remote deleted what we edited: keep our copy and ask, instead of silently resurrecting it.
+                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp, text=REMOTE_DELETED_TEXT)
+                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "remote_deleted"})
+                    _run_git(root, "checkout", "--ours", rel)
+                elif has_theirs and not has_ours:
+                    # We deleted what the remote edited: never drop their edit; restore it and report.
+                    _run_git(root, "checkout", "--theirs", rel)
+                    restored_remote.append(rel)
+                else:
+                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                    if copy_rel:
+                        saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "both_modified"})
+                    _run_git(root, "checkout", "--ours", rel)
 
-        # Deterministically rebuild MEMORY.md so additions from both sides are indexed cleanly
-        if index_conflicted or saved_conflicts or restored_remote:
-            rebuild_index(root, lock=False)
+            # Deterministically rebuild MEMORY.md so additions from both sides are indexed cleanly
+            if index_conflicted or saved_conflicts or restored_remote:
+                rebuild_index(root, lock=False)
 
-        _ensure_git_identity(root)
-        _ensure_gitignore(root)
-        _stage_allowed_paths(root)
-        still_unmerged = _git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z")
-        if still_unmerged:
-            raise GitSyncError(
-                "合并后仍有未解决冲突，已阻止自动提交：" + ", ".join(still_unmerged[:5])
+            _ensure_git_identity(root)
+            _ensure_gitignore(root)
+            _stage_allowed_paths(root)
+            still_unmerged = _git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z")
+            if still_unmerged:
+                raise GitSyncError(
+                    "合并后仍有未解决冲突，已阻止自动提交：" + ", ".join(still_unmerged[:5])
+                )
+            msg = (
+                "sync: merge remote (auto-rebuilt MEMORY.md)"
+                if not saved_conflicts
+                else f"sync: merge remote ({len(saved_conflicts)} conflict copies preserved)"
             )
-        msg = (
-            "sync: merge remote (auto-rebuilt MEMORY.md)"
-            if not saved_conflicts
-            else f"sync: merge remote ({len(saved_conflicts)} conflict copies preserved)"
-        )
-        _run_git(root, "commit", "--no-edit", "-m", msg)
+            _run_git(root, "commit", "--no-edit", "-m", msg)
+        except BaseException:
+            # Never leave the library MERGING: a later auto-commit would conclude the merge
+            # with conflict markers staged as resolved and push them.
+            _run_git(root, "merge", "--abort", check=False)
+            for conflict in saved_conflicts:
+                copy = _safe_library_path(root, conflict.get("remote_copy") or "", allow_missing=True)
+                if copy is not None and copy.is_file() and is_conflict_filename(copy.name):
+                    copy.unlink()
+            raise
         blocking_conflicts = [
             conflict for conflict in saved_conflicts
             if conflict.get("kind") != "index"
@@ -1239,6 +1267,8 @@ def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
             validate_remote_url(remote_url)
         except ValueError as exc:
             raise GitSyncError(str(exc)) from exc
+        if _merge_in_progress(root):
+            raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
 
         existing_conflicts = find_conflict_files(root)
         blocking_conflicts = [rel for rel in existing_conflicts if not _is_index_conflict_path(rel)]

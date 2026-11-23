@@ -60,6 +60,73 @@ class SyncSecurityTests(unittest.TestCase):
             ],
         )
 
+    def _two_clones_with_conflict(self, base):
+        bare = base / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        a, b = base / "a", base / "b"
+        memoryctl.initialize_library(a)
+        sync_git.ensure_repo(a, remote_url=str(bare), branch="main")
+        (a / "methods/x.md").write_text("# x\n\nbase\n", encoding="utf-8")
+        sync_git.auto_commit(a, "seed")
+        sync_git.push(a, branch="main")
+        sync_git.clone_repo(str(bare), b, branch="main")
+        (b / "methods/x.md").write_text("# x\n\nremote\n", encoding="utf-8")
+        sync_git.auto_commit(b, "remote edit")
+        sync_git.push(b, branch="main")
+        (a / "methods/x.md").write_text("# x\n\nlocal\n", encoding="utf-8")
+        sync_git.auto_commit(a, "local edit")
+        return a
+
+    def _isolated_git_env(self, base):
+        return mock.patch.dict(os.environ, {
+            "HOME": str(base / "home"),
+            "UNIFIED_MEMORY_STATE_DIR": str(base / "state"),
+            "UNIFIED_MEMORY_CONFIG_DIR": str(base / "config"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        })
+
+    def test_failed_conflict_resolution_aborts_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with self._isolated_git_env(base):
+                a = self._two_clones_with_conflict(base)
+                with mock.patch.object(sync_git, "rebuild_index", side_effect=OSError("disk full")):
+                    with self.assertRaises(OSError):
+                        sync_git.pull(a, branch="main")
+                self.assertFalse((a / ".git/MERGE_HEAD").exists())
+                self.assertEqual((a / "methods/x.md").read_text(encoding="utf-8"), "# x\n\nlocal\n")
+                self.assertEqual(sync_git.find_conflict_files(a), [])
+
+                # A normal retry still preserves both sides.
+                result = sync_git.pull(a, branch="main")
+                self.assertEqual(result["status"], "merged_with_conflicts")
+
+    def test_auto_commit_and_sync_refuse_unfinished_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with self._isolated_git_env(base):
+                a = self._two_clones_with_conflict(base)
+                subprocess.run(["git", "-C", str(a), "fetch", "-q", "origin"], check=True)
+                merge = subprocess.run(
+                    ["git", "-C", str(a), "merge", "--no-edit", "origin/main"],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(merge.returncode, 0)
+                head = subprocess.check_output(["git", "-C", str(a), "rev-parse", "HEAD"], text=True)
+
+                result = sync_git.auto_commit(a, "memory: upsert")
+                self.assertFalse(result["committed"])
+                self.assertEqual(result["reason"], "merge_in_progress")
+                with self.assertRaisesRegex(sync_git.GitSyncError, "未完成的 Git 合并"):
+                    sync_git.push(a, branch="main")
+                with self.assertRaisesRegex(sync_git.GitSyncError, "未完成的 Git 合并"):
+                    sync_git.pull(a, branch="main")
+                self.assertEqual(
+                    subprocess.check_output(["git", "-C", str(a), "rev-parse", "HEAD"], text=True),
+                    head,
+                )
+
     def test_mcp_auto_commit_failure_is_a_sync_event_and_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
