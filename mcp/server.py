@@ -225,6 +225,27 @@ def parse_frontmatter(text):
     return fields, body.lstrip("\n")
 
 
+def strip_generated_header(body):
+    """Drop frontmatter and the H1 that the server writes itself.
+
+    memory_read returns the whole file, so agents that edit it and pass it back to
+    memory_upsert would otherwise nest a second frontmatter block and title.
+    """
+    text = body.replace("\r\n", "\n").strip()
+    while True:
+        meta, rest = parse_frontmatter(text + "\n")
+        if meta:
+            text = rest.strip()
+            continue
+        first, _, remainder = text.partition("\n")
+        if first.startswith("# ") and remainder.lstrip().startswith("---\n"):
+            meta, rest = parse_frontmatter(remainder.lstrip() + "\n")
+            if meta:
+                text = rest.strip()
+                continue
+        return text
+
+
 def extract_title(body, fallback):
     """Extract first Markdown H1 heading if present."""
     for line in body.splitlines():
@@ -803,7 +824,7 @@ class MemoryStore:
             raise ValueError("name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ and not be 'readme'.")
         title = title.strip()
         description = description.strip()
-        body = body.strip()
+        body = body.strip() if user_managed else strip_generated_header(body)
         if not title or "\n" in title:
             raise ValueError("title must be a single non-empty line.")
         if "\n" in description:
@@ -1381,7 +1402,7 @@ TOOLS = [
                 "name": {"type": "string", "description": "Kebab-case slug matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$."},
                 "title": {"type": "string", "description": "Single-line human-readable title."},
                 "description": {"type": "string", "description": "Concise single-line retrieval cue."},
-                "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates."},
+                "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates. Do not include frontmatter or the H1 title; the server writes both (a leading frontmatter block is stripped)."},
                 "topic_type": {"type": "string", "enum": ["", "user", "feedback", "project", "reference"], "default": ""},
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
