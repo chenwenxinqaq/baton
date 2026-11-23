@@ -566,7 +566,8 @@ class MemoryStore:
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
-                raw = md.read_text(encoding="utf-8")
+                # Match the Web manager: a stray non-UTF-8 file must not break every query.
+                raw = md.read_text(encoding="utf-8", errors="replace")
                 meta, body = parse_frontmatter(raw)
                 cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
                 idx = indexed.get(rel, {})
@@ -597,7 +598,8 @@ class MemoryStore:
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
-                raw = md.read_text(encoding="utf-8")
+                # Match the Web manager: a stray non-UTF-8 file must not break every query.
+                raw = md.read_text(encoding="utf-8", errors="replace")
                 meta, body = parse_frontmatter(raw)
                 status = meta.get("status", "active")
                 if status == "archived" and not include_archived:
@@ -1261,6 +1263,20 @@ class WorkspaceStore:
             )
         return out
 
+    @staticmethod
+    def _per_store(stores, call):
+        """Run call on each store; one broken library must not take every library down."""
+        results, errors = [], []
+        for st in stores:
+            try:
+                results.append((st, call(st)))
+            except (ValueError, OSError) as exc:
+                errors.append(f"{st.library_id}: {exc}")
+                print(f"unified-memory: skipped library {st.library_id}: {exc}", file=sys.stderr)
+        if errors and not results:
+            raise ValueError("; ".join(errors))
+        return results
+
     def search(self, query, layer="", include_archived=False, limit=10, library="personal"):
         capped_limit = max(1, min(int(limit), 50))
         stores = self._target_stores(library)
@@ -1268,8 +1284,9 @@ class WorkspaceStore:
             return stores[0].search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
 
         merged = []
-        for st in stores:
-            hits = st.search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+        for st, hits in self._per_store(
+            stores, lambda st: st.search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+        ):
             for hit in hits:
                 try:
                     dt, _ = parse_timestamp(hit.get("updated_at", ""))
@@ -1294,8 +1311,10 @@ class WorkspaceStore:
             return stores[0].list_entries(layer=layer, include_archived=include_archived, sort=sort)
 
         merged = []
-        for st in stores:
-            for item in st.list_entries(layer=layer, include_archived=include_archived, sort=sort):
+        for st, items in self._per_store(
+            stores, lambda st: st.list_entries(layer=layer, include_archived=include_archived, sort=sort)
+        ):
+            for item in items:
                 try:
                     upd_ep = parse_timestamp(item.get("updated_at", ""))[0].timestamp()
                 except ValueError:
