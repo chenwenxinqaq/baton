@@ -61,6 +61,24 @@ def redact_remote_url(remote_url):
     return _redact_remote_urls(remote_url)
 
 
+_TOKEN_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "gloas-", "x-access-token", "oauth2")
+
+
+def _looks_like_token(username):
+    """True when a URL username is really an access token (``https://<token>@host``).
+
+    Git sends such a username as the credential, so it would otherwise be stored
+    in plain text in .git/config and mounts.json.
+    """
+    name = str(username or "").strip()
+    lowered = name.casefold()
+    if lowered.startswith(_TOKEN_PREFIXES):
+        return True
+    if len(name) >= 32 and re.fullmatch(r"[A-Za-z0-9_\-]+", name):
+        return True
+    return bool(len(name) >= 20 and re.fullmatch(r"[0-9a-fA-F]+", name))
+
+
 def validate_remote_url(remote_url):
     """Reject HTTP(S)/SSH URLs that embed a password or access token in userinfo.
 
@@ -78,7 +96,7 @@ def validate_remote_url(remote_url):
         raise ValueError("远端仓库地址格式无效。") from exc
     if parsed.scheme.lower() in {"http", "https", "ssh"} and parsed.netloc:
         userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
-        if userinfo and ":" in unquote(userinfo):
+        if userinfo and (":" in unquote(userinfo) or _looks_like_token(unquote(userinfo))):
             raise ValueError("远端地址不能包含内嵌密码或访问令牌，请改用钥匙串、凭据助手或 SSH 密钥。")
     if REMOTE_SCP_WITH_PASSWORD_RE.match(raw):
         raise ValueError("远端地址不能包含内嵌密码或访问令牌，请改用钥匙串、凭据助手或 SSH 密钥。")

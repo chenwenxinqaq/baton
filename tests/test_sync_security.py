@@ -234,6 +234,25 @@ class SyncSecurityTests(unittest.TestCase):
             self.assertIn("- [new](methods/new.md) — new", text)
             self.assertTrue(text.startswith("# §0\n"))
 
+    def test_remote_url_rejects_tokens_in_the_username_slot(self):
+        for url in (
+            "https://ghp_abcdefghijklmnop0123456789@github.com/o/r.git",
+            "https://github_pat_11ABCDEFG@github.com/o/r.git",
+            "https://glpat-abcdefghij@gitlab.com/o/r.git",
+            "https://x-access-token@github.com/o/r.git",
+            "https://0123456789abcdef0123@gitee.com/o/r.git",
+            "https://alice:secret@gitee.com/o/r.git",
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                sync_git.validate_remote_url(url)
+        for url in (
+            "https://alice@gitee.com/o/r.git",
+            "https://chenwenxin01@dev.kunlunxin.com/klx/x.git",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+        ):
+            self.assertEqual(sync_git.validate_remote_url(url), url)
+
     def test_index_rebuild_ignores_symlink_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
