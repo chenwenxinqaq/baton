@@ -368,34 +368,148 @@ def strip_block(before, after):
     return ""
 
 
-def extract_toml_section(text, section_header=TOML_SECTION_HEADER):
-    """Locate [mcp_servers.unified_memory] with or without wrapper comments."""
-    marked = extract_block(text, TOML_START, TOML_END)
-    if marked is not None:
-        return marked
+def extract_managed_md(text, path):
+    """Return (before, block, after) for exactly one ordered managed Markdown block.
 
+    Unbalanced markers (an orphan start or end left behind by an editor or an
+    interrupted write) would otherwise make the block span user text, so refuse.
+    """
+    starts, ends = text.count(MD_START), text.count(MD_END)
+    if starts == 0 and ends == 0:
+        return None
+    if starts == 1 and ends == 1 and text.find(MD_START) < text.find(MD_END):
+        return extract_block(text, MD_START, MD_END)
+    raise RuntimeError(
+        f"{path} 里的 Unified Memory 受管标记不成对（开始 {starts} 个，结束 {ends} 个）。"
+        "请手工删掉多余的标记后重试，以免误删你的内容。"
+    )
+
+
+_TOML_KEY = r"""(?:unified_memory|"unified_memory"|'unified_memory')"""
+TOML_OUR_TABLE_RE = re.compile(rf"^\s*\[\s*mcp_servers\s*\.\s*{_TOML_KEY}\s*(\.[^\]]*)?\]\s*(?:#.*)?$")
+TOML_MCP_PARENT_RE = re.compile(r"^\s*\[\s*mcp_servers\s*\]\s*(?:#.*)?$")
+TOML_TOP_DOTTED_RE = re.compile(rf"^\s*mcp_servers\s*\.\s*{_TOML_KEY}\s*[.=]")
+TOML_PARENT_KEY_RE = re.compile(rf"^\s*{_TOML_KEY}\s*[.=]")
+TOML_ASSIGN_KEY_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
+
+
+def without_toml_markers(text):
+    """Drop legacy wrapper comments; they are cosmetic and unstable under Codex rewrites."""
     lines = text.splitlines(keepends=True)
-    start_line = None
-    end_line = len(lines)
-    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(?:#.*)?$")
+    kept = [line for line in lines if line.strip() not in (TOML_START, TOML_END)]
+    return "".join(kept)
+
+
+def locate_toml_mcp(text, path="config.toml"):
+    """Find our own [mcp_servers.unified_memory] table and its subtables by line range.
+
+    Only these tables belong to Unified Memory. Anything else, including tables
+    Codex inserts next to ours, is left alone.
+    """
+    lines = text.splitlines(keepends=True)
+    main, subs = None, []
+    current, kind = None, "top"
+
+    def close(idx):
+        start, _ = current
+        end = idx
+        while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+            end -= 1
+        return start, end
 
     for idx, raw in enumerate(lines):
-        stripped = raw.strip()
-        if start_line is None:
-            if stripped == section_header:
-                start_line = idx
+        if raw.lstrip().startswith("["):
+            if current is not None:
+                rng = close(idx)
+                if current[1] == "main":
+                    main = rng
+                else:
+                    subs.append(rng)
+                current = None
+            m = TOML_OUR_TABLE_RE.match(raw)
+            if m:
+                kind = "sub" if m.group(1) else "main"
+                if kind == "main" and main is not None:
+                    raise RuntimeError(f"{path} 里有多个 {TOML_SECTION_HEADER} 表，请先手工合并成一个再重试。")
+                current = (idx, kind)
+            elif TOML_MCP_PARENT_RE.match(raw):
+                kind = "parent"
+            else:
+                kind = "other"
+            continue
+        if (kind == "top" and TOML_TOP_DOTTED_RE.match(raw)) or (kind == "parent" and TOML_PARENT_KEY_RE.match(raw)):
+            raise RuntimeError(
+                f"{path} 用行内表或点号键写了 unified_memory，Unified Memory 不会改写这种写法。"
+                f"请改成独立的 {TOML_SECTION_HEADER} 表或删掉它后重试。"
+            )
+    if current is not None:
+        rng = close(len(lines))
+        if current[1] == "main":
+            main = rng
         else:
-            if header_re.match(stripped):
-                end_line = idx
-                break
-
-    if start_line is None:
+            subs.append(rng)
+    if main is None and not subs:
         return None
+    return {"lines": lines, "main": main, "subs": subs}
 
-    before = "".join(lines[:start_line])
-    section = "".join(lines[start_line:end_line]).rstrip("\n")
-    after = "".join(lines[end_line:])
-    return before, section, after
+
+def toml_range_text(loc, rng):
+    return "".join(line if line.endswith("\n") else line + "\n" for line in loc["lines"][rng[0]:rng[1]])
+
+
+def remove_toml_ranges(loc, ranges):
+    """Remove line ranges, joining the remaining text the same way strip_block does."""
+    text = "".join(loc["lines"])
+    lines = loc["lines"]
+    for start, end in sorted(ranges, reverse=True):
+        before = "".join(lines[:start])
+        after = "".join(lines[end:])
+        text = strip_block(before, after)
+        lines = text.splitlines(keepends=True)
+    return text
+
+
+def replace_toml_main(loc, new_main):
+    """Replace only our main table, keeping its unknown keys and every other table."""
+    start, end = loc["main"]
+    lines = loc["lines"]
+    before = "".join(lines[:start])
+    after = "".join(lines[end:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    tail = after if not after or after.startswith("\n") else "\n" + after
+    return before + new_main.rstrip("\n") + "\n" + tail
+
+
+def updated_toml_main(main_text, command, args):
+    """Rewrite command/args in our table while keeping other keys (env, timeouts...)."""
+    body = main_text.splitlines()[1:]
+    extra = []
+    for line in body:
+        key = TOML_ASSIGN_KEY_RE.match(line)
+        if line.strip() in (TOML_START, TOML_END) or (key and key.group(1) in ("command", "args")):
+            continue
+        extra.append(line)
+    while extra and not extra[-1].strip():
+        extra.pop()
+    head = desired_toml_block(command, args)
+    return head + ("\n" + "\n".join(extra) if extra else "")
+
+
+def validate_toml_change(old_text, new_text, path):
+    """Refuse to write a config Codex could no longer parse (when tomllib is available)."""
+    try:
+        import tomllib
+    except ImportError:
+        return
+    try:
+        tomllib.loads(old_text)
+    except tomllib.TOMLDecodeError:
+        return
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise RuntimeError(f"改写后 {path} 将无法解析（{exc}），已停止修改。") from exc
 
 
 def parse_toml_mcp_section(section_text):
@@ -680,17 +794,16 @@ def desired_json_mcp(spec):
     return entry
 
 
-def desired_toml_block():
-    """Build expected Codex TOML managed block."""
-    py_cmd, args = desired_mcp_args()
+def desired_toml_block(command=None, args=None):
+    """Build Codex's [mcp_servers.unified_memory] table.
+
+    No wrapper comments: Codex inserts its own tables before a trailing comment
+    and may drop the leading one, so comment markers cannot delimit ownership.
+    """
+    if command is None:
+        command, args = desired_mcp_args()
     args_json = json.dumps(args, ensure_ascii=False)
-    return (
-        f"{TOML_START}\n"
-        f"{TOML_SECTION_HEADER}\n"
-        f"command = {json.dumps(py_cmd)}\n"
-        f"args = {args_json}\n"
-        f"{TOML_END}"
-    )
+    return f"{TOML_SECTION_HEADER}\ncommand = {json.dumps(command)}\nargs = {args_json}"
 
 
 def desired_agy_plugin_files():
@@ -1032,8 +1145,15 @@ def inspect_agent(agent_id, spec):
         issues.append(f"instructions is a symlink ({inst_path})")
     elif inst_path.is_file():
         text = inst_path.read_text(encoding="utf-8")
-        parsed = extract_block(text, MD_START, MD_END)
-        if parsed is None:
+        try:
+            parsed = extract_managed_md(text, inst_path)
+        except RuntimeError as exc:
+            parsed = False
+            inst_state = "drifted"
+            issues.append(str(exc))
+        if parsed is False:
+            pass
+        elif parsed is None:
             inst_state = "unmanaged"
         else:
             block = parsed[1]
@@ -1078,11 +1198,17 @@ def inspect_agent(agent_id, spec):
     else:
         if mcp_path.is_file():
             text = mcp_path.read_text(encoding="utf-8")
-            sec = extract_toml_section(text)
-            if sec is None:
+            try:
+                loc = locate_toml_mcp(without_toml_markers(text), mcp_path)
+            except RuntimeError as exc:
+                loc = {"main": None, "error": str(exc)}
+            if loc is None or (loc["main"] is None and "error" not in loc):
                 mcp_state = "unmanaged"
+            elif "error" in loc:
+                mcp_state = "drifted"
+                issues.append(loc["error"])
             else:
-                cmd, args = parse_toml_mcp_section(sec[1])
+                cmd, args = parse_toml_mcp_section(toml_range_text(loc, loc["main"]))
                 if cmd == exp_cmd and args == exp_args:
                     mcp_state = "managed"
                 else:
@@ -1132,7 +1258,7 @@ def _cleanup_legacy_agy_loose_files(spec, changes):
     gem_md = spec["legacy_gemini_md"]
     if gem_md.is_file() and not gem_md.is_symlink():
         txt = gem_md.read_text(encoding="utf-8")
-        parsed = extract_block(txt, MD_START, MD_END)
+        parsed = extract_managed_md(txt, gem_md)
         if parsed is not None:
             cleaned = strip_block(parsed[0], parsed[2])
             if cleaned:
@@ -1208,7 +1334,7 @@ def connect_agent(agent_id, spec, dry_run=False):
                     restore["instructions_backup"] = orig_text
 
             working_text = orig_text
-            parsed = extract_block(working_text, MD_START, MD_END)
+            parsed = extract_managed_md(working_text, inst_path)
             if parsed is None:
                 prefix = working_text.rstrip("\n")
                 new_text = f"{prefix}\n\n{MANAGED_MD_BODY}\n" if prefix else f"{MANAGED_MD_BODY}\n"
@@ -1251,21 +1377,23 @@ def connect_agent(agent_id, spec, dry_run=False):
 
             block = desired_toml_block()
             exp_cmd, exp_args = desired_mcp_args()
-            sec = extract_toml_section(toml_text)
-            if sec is None:
+            toml_text = without_toml_markers(toml_text)
+            loc = locate_toml_mcp(toml_text, mcp_path)
+            if loc is None or loc["main"] is None:
                 prefix = toml_text.rstrip("\n")
                 toml_text = f"{prefix}\n\n{block}\n" if prefix else f"{block}\n"
                 changes.append(f"added {TOML_SECTION_HEADER} to {mcp_path}")
             else:
-                cur_cmd, cur_args = parse_toml_mcp_section(sec[1])
+                main_text = toml_range_text(loc, loc["main"])
+                cur_cmd, cur_args = parse_toml_mcp_section(main_text)
                 if "toml_had_previous" not in restore and cur_cmd and not is_our_mcp_entry(cur_cmd, cur_args):
                     restore["toml_had_previous"] = True
-                    restore["previous_toml_section"] = sec[1]
+                    restore["previous_toml_section"] = main_text.rstrip("\n")
                 if cur_cmd != exp_cmd or cur_args != exp_args:
-                    rebuilt_toml = strip_block(sec[0], sec[2]).rstrip("\n")
-                    toml_text = f"{rebuilt_toml}\n\n{block}\n" if rebuilt_toml else f"{block}\n"
+                    toml_text = replace_toml_main(loc, updated_toml_main(main_text, exp_cmd, exp_args))
                     changes.append(f"updated {TOML_SECTION_HEADER} in {mcp_path}")
             if toml_text != orig_toml:
+                validate_toml_change(orig_toml, toml_text, mcp_path)
                 atomic_write(mcp_path, toml_text)
             restore["expected_mcp_cmd"] = exp_cmd
             restore["expected_mcp_args"] = exp_args
@@ -1319,7 +1447,7 @@ def disconnect_agent(agent_id, spec, force=False):
 
         if inst_path is not None and inst_path.is_file() and not inst_path.is_symlink():
             text = inst_path.read_text(encoding="utf-8")
-            parsed = extract_block(text, MD_START, MD_END)
+            parsed = extract_managed_md(text, inst_path)
             if parsed is not None:
                 saved_hash = restore.get("instructions_block_hash")
                 if saved_hash and sha256_text(parsed[1]) != saved_hash and not force:
@@ -1355,30 +1483,31 @@ def disconnect_agent(agent_id, spec, force=False):
                 else:
                     atomic_write(mcp_path.resolve(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         elif spec["mcp_type"] == "toml" and mcp_path.is_file():
-            text = mcp_path.read_text(encoding="utf-8")
-            orig_toml = text
-            sec = extract_toml_section(text)
-            if sec is not None:
-                cur_cmd, cur_args = parse_toml_mcp_section(sec[1])
+            orig_toml = mcp_path.read_text(encoding="utf-8")
+            text = without_toml_markers(orig_toml)
+            loc = locate_toml_mcp(text, mcp_path)
+            if loc is not None and loc["main"] is not None:
+                cur_cmd, cur_args = parse_toml_mcp_section(toml_range_text(loc, loc["main"]))
                 exp_cmd = restore.get("expected_mcp_cmd")
                 exp_args = restore.get("expected_mcp_args")
                 if exp_cmd and (cur_cmd != exp_cmd or cur_args != exp_args) and not force:
                     raise RuntimeError(
                         f"TOML section {TOML_SECTION_HEADER} in {mcp_path} was edited manually; reconcile or re-run with --force."
                     )
-                base = strip_block(sec[0], sec[2])
                 if restore.get("toml_had_previous") and restore.get("previous_toml_section"):
-                    prev_sec = restore["previous_toml_section"].strip()
-                    text = f"{base.rstrip()}\n\n{prev_sec}\n" if base.strip() else f"{prev_sec}\n"
+                    prev_sec = without_toml_markers(restore["previous_toml_section"]).strip()
+                    text = replace_toml_main(loc, prev_sec)
                     changes.append(f"restored previous {TOML_SECTION_HEADER} in {mcp_path}")
                 else:
-                    text = base
+                    # Our table plus the subtables Codex added for it (tool approvals); nothing else.
+                    text = remove_toml_ranges(loc, [loc["main"], *loc["subs"]])
                     changes.append(f"removed {TOML_SECTION_HEADER} from {mcp_path}")
             restored_text = restore_legacy_codex_memories(text, restore)
             if restored_text != text:
                 changes.append(f"restored the previous Codex memory setting in {mcp_path}")
             text = restored_text
             if text != orig_toml:
+                validate_toml_change(orig_toml, text, mcp_path)
                 atomic_write(mcp_path, text)
 
         if spec.get("hooks_path") is not None:

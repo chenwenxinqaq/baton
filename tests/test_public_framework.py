@@ -123,6 +123,51 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("disconnect", "codex")
         self.assertIn("memories = true", config.read_text())
 
+    def test_codex_disconnect_keeps_tables_codex_added(self):
+        config = self.home / ".codex/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('model = "gpt-5"\n\n[projects."/tmp/a"]\ntrust_level = "trusted"\n', encoding="utf-8")
+        self.cli("connect", "codex")
+        # Codex inserts new tables before the trailing comment of the file, so
+        # anything it adds can land between the legacy BEGIN/END markers.
+        text = config.read_text(encoding="utf-8").replace(
+            "[mcp_servers.unified_memory]", "# BEGIN unified-memory managed\n[mcp_servers.unified_memory]")
+        text += ('\n[mcp_servers.unified_memory.tools.memory_search]\napproval_mode = "approve"\n'
+                 '\n[features]\nasync_compaction = true\n# END unified-memory managed\n')
+        config.write_text(text, encoding="utf-8")
+        self.cli("connect", "codex")
+        self.assertIn("async_compaction = true", config.read_text(encoding="utf-8"))
+        self.cli("disconnect", "codex")
+        result = config.read_text(encoding="utf-8")
+        self.assertIn('[projects."/tmp/a"]', result)
+        self.assertIn("[features]\nasync_compaction = true", result)
+        self.assertNotIn("unified_memory", result)
+        self.assertNotIn("unified-memory managed", result)
+
+    def test_codex_hand_written_header_is_reused_and_restored(self):
+        config = self.home / ".codex/config.toml"
+        config.parent.mkdir(parents=True)
+        original = ('model = "x"\n\n[mcp_servers."unified_memory"] # hand written\n'
+                    'command = "/bin/old"\nargs = []\n\n[other]\nk = 1\n')
+        config.write_text(original, encoding="utf-8")
+        self.cli("connect", "codex")
+        connected = config.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"^\[mcp_servers\.", connected, re.M)), 1, connected)
+        self.assertNotIn("/bin/old", connected)
+        self.assertIn("[other]\nk = 1", connected)
+        self.cli("disconnect", "codex")
+        self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_connect_refuses_unbalanced_instruction_markers(self):
+        agents = self.home / ".codex/AGENTS.md"
+        agents.parent.mkdir(parents=True)
+        original = "USER_A\n<!-- unified-memory:managed:start -->\nUSER_B\n"
+        agents.write_text(original, encoding="utf-8")
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.run([sys.executable, str(CODE / "scripts/memoryctl.py"), "connect", "codex"],
+                           env=self.environment(), cwd=self.home, text=True, capture_output=True, check=True)
+        self.assertEqual(agents.read_text(encoding="utf-8"), original)
+
     def test_workbuddy_one_click_connect_and_disconnect(self):
         from urllib.error import HTTPError
 
