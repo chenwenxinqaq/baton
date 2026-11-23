@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,11 +12,54 @@ sys.path.insert(0, str(CODE / "scripts"))
 sys.path.insert(0, str(CODE / "mcp"))
 
 import audit_log  # noqa: E402
+import memoryctl  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
 
 
 class SyncSecurityTests(unittest.TestCase):
+    def test_sync_tolerates_leftover_index_conflict_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            env = {
+                "HOME": str(base / "home"),
+                "UNIFIED_MEMORY_STATE_DIR": str(base / "state"),
+                "UNIFIED_MEMORY_CONFIG_DIR": str(base / "config"),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+            with mock.patch.dict(os.environ, env):
+                bare = base / "remote.git"
+                subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+                lib = base / "lib"
+                memoryctl.initialize_library(lib)
+                sync_git.ensure_repo(lib, remote_url=str(bare), branch="main")
+                sync_git.auto_commit(lib, "seed")
+                sync_git.push(lib, branch="main")
+                (lib / "MEMORY.conflict-20261122-130000.md").write_text("# old index\n", encoding="utf-8")
+                (lib / "methods").mkdir(exist_ok=True)
+                (lib / "methods/new.md").write_text("# new\n", encoding="utf-8")
+
+                result = sync_git.sync(lib, branch="main", browser_login=False)
+
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["push"]["status"], "pushed")
+                self.assertIn("MEMORY.conflict-20261122-130000.md", result["pull"]["conflicts"])
+
+    def test_blocking_conflicts_accepts_paths_and_dicts(self):
+        self.assertEqual(
+            sync_git._blocking_conflicts([
+                "MEMORY.conflict-20261122-130000.md",
+                "methods/a.conflict-20261122-130000.md",
+                {"kind": "index", "conflict_copy": "MEMORY.conflict-20261122-130001.md"},
+                {"kind": "both_modified", "conflict_copy": "methods/b.conflict-20261122-130000.md"},
+            ]),
+            [
+                "methods/a.conflict-20261122-130000.md",
+                {"kind": "both_modified", "conflict_copy": "methods/b.conflict-20261122-130000.md"},
+            ],
+        )
+
     def test_mcp_auto_commit_failure_is_a_sync_event_and_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

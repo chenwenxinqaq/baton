@@ -1263,6 +1263,24 @@ def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
         }
 
 
+def _blocking_conflicts(conflicts):
+    """Return conflicts that must stop a push.
+
+    pull() reports conflict copies either as dicts (conflict branch, with a
+    ``kind``) or as relative path strings (clean merge / fast-forward, from
+    find_conflict_files). Root ``MEMORY.conflict-*.md`` copies never block:
+    the index is rebuilt from entries, matching push().
+    """
+    blocking = []
+    for conflict in conflicts or []:
+        if isinstance(conflict, dict):
+            if conflict.get("kind") != "index":
+                blocking.append(conflict)
+        elif not _is_index_conflict_path(Path(str(conflict))):
+            blocking.append(conflict)
+    return blocking
+
+
 def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only=False, browser_login=True):
     """Run bidirectional (or one-way) Git synchronization for a library."""
     result = {"path": str(Path(root).expanduser().resolve()), "mode": mode, "pull": None, "push": None}
@@ -1280,10 +1298,7 @@ def sync(root, remote="origin", branch="", mode="rw", pull_only=False, push_only
     if not push_only:
         pull_res = pull(root, remote=remote, branch=branch, mode=mode)
         result["pull"] = pull_res
-        blocking_conflicts = [
-            conflict for conflict in pull_res.get("conflicts") or []
-            if conflict.get("kind") != "index"
-        ]
+        blocking_conflicts = _blocking_conflicts(pull_res.get("conflicts"))
         if blocking_conflicts:
             result["status"] = "needs_manual_merge"
             return result
