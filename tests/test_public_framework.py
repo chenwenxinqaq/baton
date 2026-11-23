@@ -168,6 +168,23 @@ class PublicFrameworkTests(unittest.TestCase):
                            env=self.environment(), cwd=self.home, text=True, capture_output=True, check=True)
         self.assertEqual(agents.read_text(encoding="utf-8"), original)
 
+    def test_disconnect_keeps_users_own_same_name_servers(self):
+        claude = self.home / ".claude.json"
+        cursor = self.home / ".cursor/mcp.json"
+        codex = self.home / ".codex/config.toml"
+        cursor.parent.mkdir(parents=True)
+        codex.parent.mkdir(parents=True)
+        own = {"command": "my-own-server", "args": []}
+        claude.write_text(json.dumps({"mcpServers": {"unified-memory": own}}), encoding="utf-8")
+        cursor.write_text(json.dumps({"mcpServers": {"unified_memory": own}}), encoding="utf-8")
+        toml = '[mcp_servers.unified_memory]\ncommand = "my-own-server"\nargs = []\n'
+        codex.write_text(toml, encoding="utf-8")
+        for target in ("claude", "cursor", "codex"):
+            self.cli("disconnect", target)
+        self.assertEqual(json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]["unified-memory"], own)
+        self.assertEqual(json.loads(cursor.read_text(encoding="utf-8"))["mcpServers"]["unified_memory"], own)
+        self.assertEqual(codex.read_text(encoding="utf-8"), toml)
+
     def test_workbuddy_one_click_connect_and_disconnect(self):
         from urllib.error import HTTPError
 

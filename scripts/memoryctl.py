@@ -1466,10 +1466,16 @@ def disconnect_agent(agent_id, spec, force=False):
             data = read_json_mcp(mcp_path)
             servers = data.get("mcpServers") or {}
             if spec["mcp_key"] in servers:
-                if agent_id == "workbuddy" and servers[spec["mcp_key"]] != desired_json_mcp(spec) and not force:
+                current = servers[spec["mcp_key"]]
+                if agent_id == "workbuddy":
+                    ours = current == desired_json_mcp(spec)
+                else:
+                    ours = current == desired_json_mcp(spec) or (
+                        isinstance(current, dict) and is_our_mcp_entry(current.get("command"), current.get("args")))
+                if not ours and not force:
                     if not restore:
                         return {"id": agent_id, "state": "unmanaged", "changes": ["nothing to remove"]}
-                    raise RuntimeError(f"WorkBuddy 的同名服务配置已更改，请先核对 {mcp_path}")
+                    raise RuntimeError(f"{spec['name']} 的同名服务配置已更改，请先核对 {mcp_path}，或加 --force 移除")
                 if restore.get("mcp_had_previous"):
                     servers[spec["mcp_key"]] = restore["previous_mcp"]
                     changes.append(f"restored previous mcpServers.{spec['mcp_key']} in {mcp_path}")
@@ -1494,7 +1500,10 @@ def disconnect_agent(agent_id, spec, force=False):
                     raise RuntimeError(
                         f"TOML section {TOML_SECTION_HEADER} in {mcp_path} was edited manually; reconcile or re-run with --force."
                     )
-                if restore.get("toml_had_previous") and restore.get("previous_toml_section"):
+                if not exp_cmd and not is_our_mcp_entry(cur_cmd, cur_args) and not force:
+                    # Never connected here (or the restore record is gone): the table is the user's own.
+                    changes.append(f"kept {TOML_SECTION_HEADER} in {mcp_path}: not written by Unified Memory")
+                elif restore.get("toml_had_previous") and restore.get("previous_toml_section"):
                     prev_sec = without_toml_markers(restore["previous_toml_section"]).strip()
                     text = replace_toml_main(loc, prev_sec)
                     changes.append(f"restored previous {TOML_SECTION_HEADER} in {mcp_path}")
