@@ -212,6 +212,28 @@ class SyncSecurityTests(unittest.TestCase):
             lock.assert_called_once_with(root.resolve())
             self.assertTrue((root / ".git").is_dir())
 
+    def test_index_rebuild_keeps_titles_that_live_only_in_the_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "methods").mkdir()
+            fm = "---\nname: {n}\ndescription: \"{d}\"\ntype: reference\n---\n\n"
+            # Written by the Web editor: no H1, title only in the index.
+            (root / "methods/mem-20261122.md").write_text(fm.format(n="mem-20261122", d="网页摘要") + "正文\n", encoding="utf-8")
+            (root / "methods/h1.md").write_text(fm.format(n="h1", d="d") + "# 文件标题\n\n正文\n", encoding="utf-8")
+            (root / "methods/new.md").write_text(fm.format(n="new", d="") + "正文\n", encoding="utf-8")
+            (root / "MEMORY.md").write_text(
+                "# §0\n\n## L0 操作约束\n\n## L1 可复用方法\n"
+                "- [网页标题](methods/mem-20261122.md) — 旧摘要\n"
+                "- [旧标题](methods/h1.md) — d\n",
+                encoding="utf-8",
+            )
+            sync_git.rebuild_index(root, lock=False)
+            text = (root / "MEMORY.md").read_text(encoding="utf-8")
+            self.assertIn("- [网页标题](methods/mem-20261122.md) — 网页摘要", text)
+            self.assertIn("- [文件标题](methods/h1.md) — d", text)
+            self.assertIn("- [new](methods/new.md) — new", text)
+            self.assertTrue(text.startswith("# §0\n"))
+
     def test_index_rebuild_ignores_symlink_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

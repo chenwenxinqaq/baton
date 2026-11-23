@@ -380,6 +380,28 @@ def _is_index_conflict_path(rel_path):
     return len(path.parts) == 1 and path.name.startswith("MEMORY.conflict-") and path.suffix == ".md"
 
 
+_INDEX_LINK_RE = re.compile(r"^\s*[-*+]\s+\[(.+?)\]\((?:<([^>]+)>|([^\s()]+))\)(?:\s+[\u2014\u2013-]\s+(.+))?$")
+
+
+def _existing_index_entries(text):
+    """Map entry paths to (title, description) from current MEMORY.md link lines.
+
+    Lines inside an unresolved conflict are ignored so a half-merged index never
+    becomes the source of titles.
+    """
+    if "<<<<<<<" in text or ">>>>>>>" in text:
+        return {}
+    entries = {}
+    for line in text.splitlines():
+        m = _INDEX_LINK_RE.match(line)
+        if not m:
+            continue
+        rel = (m.group(2) or m.group(3) or "").strip()
+        if rel and rel not in entries:
+            entries[rel] = (m.group(1).strip(), (m.group(4) or "").strip())
+    return entries
+
+
 def rebuild_index(memory_root, policy_template=None, lock=True):
     """Deterministically rebuild L0-L4 index sections in MEMORY.md from disk entries.
 
@@ -392,11 +414,13 @@ def rebuild_index(memory_root, policy_template=None, lock=True):
 
     def _do_rebuild():
         preamble = ""
+        known = {}
         if index_path.is_file():
             existing = index_path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
             head, sep, _ = existing.partition("\n## L0 ")
             if sep and "<<<<<<" not in head and "======" not in head and ">>>>>>" not in head:
                 preamble = head.rstrip()
+            known = _existing_index_entries(existing)
         if not preamble:
             tpl_text = template_path.read_text(encoding="utf-8").replace("\r\n", "\n")
             head, _, _ = tpl_text.partition("\n## L0 ")
@@ -414,11 +438,16 @@ def rebuild_index(memory_root, policy_template=None, lock=True):
                     continue
                 raw = md.read_text(encoding="utf-8", errors="replace")
                 meta, body = _parse_frontmatter(raw)
-                title = str(meta.get("title") or "").strip() or _extract_title(body, md.stem)
-                desc = str(meta.get("description") or "").strip() or title
+                rel = f"{folder}/{md.name}"
+                # Files written by the Web editor have no H1: their title lives only
+                # in the index line, so keep it instead of falling back to the slug.
+                # The file itself still wins when it carries a title, because after
+                # a merge the index may be the older side.
+                old_title, old_desc = known.get(rel, ("", ""))
+                title = str(meta.get("title") or "").strip() or _extract_title(body, "") or old_title or md.stem
+                desc = str(meta.get("description") or "").strip() or old_desc or title
                 title = " ".join(title.splitlines()).strip() or md.stem
                 desc = " ".join(desc.splitlines()).strip() or title
-                rel = f"{folder}/{md.name}"
                 lines.append(f"- [{title}]({rel}) — {desc}")
                 count += 1
                 total += 1
