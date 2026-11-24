@@ -2437,9 +2437,9 @@ def _usage_section(today, week):
     ranks = list((week.get("read_ranks") or {}).items())
     top = max((count for _, count in ranks), default=0)
     rank_html = "".join(
-        f'<li><span class="usage-rank">#{escape(rank)}</span>'
+        f'<li><span class="usage-rank">第 {escape(rank)} 条</span>'
         f'<progress class="usage-bar" max="100" value="{max(4, round(count * 100 / top))}">{count}</progress>'
-        f'<span class="usage-count">{count}</span></li>'
+        f'<span class="usage-count">{count} 次</span></li>'
         for rank, count in ranks
     ) if top else ""
     rank_html = (f'<ul class="usage-ranks" role="list">{rank_html}</ul>' if rank_html
@@ -2453,7 +2453,8 @@ def _usage_section(today, week):
           <div class="usage-stats">{stat_html}</div>
           <div class="usage-cols">
             <div><h4>近 7 天按工具</h4>{tool_html}</div>
-            <div><h4>被读结果在搜索中的名次</h4>{rank_html}</div>
+            <div><h4>AI 读的结果排在第几条</h4>
+              <p class="usage-sub">一次搜索会返回多条结果，这里统计 AI 读的是排在第几条的那个。</p>{rank_html}</div>
           </div>
         </section>"""
 
