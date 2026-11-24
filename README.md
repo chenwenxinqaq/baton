@@ -1,6 +1,6 @@
 # Unified Memory
 
-Local Markdown memory for AI coding agents. Claude Code, Codex, Cursor, WorkBuddy, Antigravity and DeepSeek Harness read and write the same library through a local MCP server. Entries are plain Markdown files in five layers (L0 constraints, L1 methods, L2 preferences, L3 project snapshots, L4 archive). You can search them in Chinese or English, edit them in the desktop app, and sync them through your own Git repository. Nothing leaves your machine unless you set up sync.
+Local Markdown memory for AI coding agents. Claude Code, Codex, Cursor, WorkBuddy, Antigravity and DeepSeek Harness read and write the same library through a local MCP server. Entries are plain Markdown files in five layers (L0 constraints, L1 methods, L2 preferences, L3 project snapshots, L4 archive). You can search them in Chinese or English, edit them in the desktop app, and sync them through your own Git repository. Nothing leaves your machine unless you set up sync. The desktop app only asks GitHub for the latest release tag once a day; you can turn this off in the app menu.
 
 ![Unified Memory desktop app](docs/images/demo.gif)
 
@@ -50,7 +50,7 @@ cd unified-memory-cli
 
 ### 本地构建
 
-在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本校验 Python 和 [Dugite Native v2.56.1](https://github.com/desktop/dugite-native/tree/v2.56.1) 发行包的 SHA-256，首次构建需要联网。Dugite 提供 Git 和 [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager/tree/v2.9.1)，许可证位于应用的 `Contents/Resources/licenses`。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。
+在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本校验 Python 和 [Dugite Native v2.56.1](https://github.com/desktop/dugite-native/tree/v2.56.1) 发行包的 SHA-256，首次构建需要联网。Dugite 提供 Git 和 [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager/tree/v2.9.1)，许可证位于应用的 `Contents/Resources/licenses`。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。因此桌面端不做静默自动更新：打包后的应用每天向 GitHub 查询一次最新版本号，发现新版时提示前往发布页下载 ZIP 替换；可在应用菜单关闭「自动检查更新」，或随时点「检查更新…」。
 
 在仓库根目录运行 `python3 scripts/package_release.py --cli` 单独生成 CLI 包。两个发行包都位于 `dist/`。分发内容来自公开文件清单。
 
