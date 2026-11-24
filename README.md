@@ -1,5 +1,27 @@
 # Unified Memory
 
+Local Markdown memory for AI coding agents. Claude Code, Codex, Cursor, WorkBuddy, Antigravity and DeepSeek Harness read and write the same library through a local MCP server. Entries are plain Markdown files in five layers (L0 constraints, L1 methods, L2 preferences, L3 project snapshots, L4 archive). You can search them in Chinese or English, edit them in the desktop app, and sync them through your own Git repository. Nothing leaves your machine unless you set up sync.
+
+![Unified Memory desktop app](docs/images/demo.gif)
+
+### Quick start (macOS, Apple silicon)
+
+1. Download `Unified-Memory-macOS-arm64.zip` from the [latest release](https://github.com/chenwenxinqaq/baton/releases/latest), unzip it and move **Unified Memory.app** to Applications.
+2. Open the app. It creates your personal library at `~/UnifiedMemory`.
+3. Open 客户端接入 (Clients), click 接入 (Connect) for each agent you use, then restart that agent and ask it to "search my memory with Unified Memory".
+
+On Linux, or without the desktop app, use `unified-memory-cli.tar.gz` from the same release (Python 3.9+ and Git, see below). The desktop UI is currently Chinese only.
+
+| Search | Entry detail |
+| --- | --- |
+| ![Search](docs/images/search.png) | ![Detail](docs/images/detail.png) |
+| **Read/write activity** | **Client setup** |
+| ![Activity](docs/images/activity.png) | ![Clients](docs/images/clients.png) |
+
+Screenshots use a demo library with sample entries.
+
+## 中文说明
+
 用一套 Markdown 记忆库为 Claude Code、Codex、Cursor、WorkBuddy、Antigravity 和 DeepSeek Harness 提供上下文。框架包含本地 MCP 服务、中文全文与时间检索、Web 编辑和归档、技能管理、客户端接入与配置恢复。需要 macOS 或 Linux、Python 3.9 以上，仅使用标准库。
 
 ## 桌面版和命令行版
