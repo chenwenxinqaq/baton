@@ -1302,3 +1302,37 @@ os.execv(git, [git, *args])
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackagedFrameworkTests(unittest.TestCase):
+    """The packaged app only ships PUBLIC_FILES, so every runtime import must be in that list."""
+
+    def test_staged_framework_answers_tool_calls(self):
+        sys.path.insert(0, str(CODE / "scripts"))
+        try:
+            from package_release import PUBLIC_FILES
+        finally:
+            sys.path.pop(0)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        staged = Path(tmp.name) / "framework"
+        for name in PUBLIC_FILES:
+            if name.startswith("desktop/") or name.startswith("tests/"):
+                continue
+            target = staged / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((CODE / name).read_bytes())
+        home = Path(tmp.name) / "home"
+        home.mkdir()
+        library = Path(tmp.name) / "library"
+        environment = {**os.environ, "HOME": str(home), "UNIFIED_MEMORY_ROOT": str(library),
+                       "PYTHONDONTWRITEBYTECODE": "1"}
+        subprocess.check_output([sys.executable, str(staged / "scripts/memoryctl.py"), "init"],
+                                env=environment, cwd=home, text=True)
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "memory_lint", "arguments": {}}}
+        output = subprocess.check_output([sys.executable, str(staged / "mcp/server.py")],
+                                         input=json.dumps(request) + "\n", env=environment,
+                                         cwd=home, text=True)
+        payload = json.loads(json.loads(output)["result"]["content"][0]["text"])
+        self.assertIn("findings", payload)

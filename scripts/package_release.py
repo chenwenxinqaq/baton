@@ -33,6 +33,7 @@ PUBLIC_FILES = (
     "mcp/server.py",
     "scripts/library_paths.py",
     "scripts/memory_import.py",
+    "scripts/memory_lint.py",
     "scripts/memoryctl.py",
     "scripts/package_release.py",
     "scripts/sync_git.py",
