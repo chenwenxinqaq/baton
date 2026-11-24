@@ -546,6 +546,10 @@ class PublicFrameworkTests(unittest.TestCase):
         context = hook("sessionStart", {"conversation_id": "c1"})["additional_context"]
         self.assertIn("memory_search", context)
         self.assertIn("周报用 CSV", context)
+        injected = [json.loads(line) for line in
+                    (self.home / ".local/state/unified-memory/global/audit.jsonl").read_text().splitlines()]
+        session = [e for e in injected if e.get("event") == "sessionStart"][-1]
+        self.assertGreater(session["tokens"], 0)  # injected context size is measured
         fast = {"UNIFIED_MEMORY_NUDGE_MIN_SECONDS": "0"}
         hook("beforeSubmitPrompt", {"conversation_id": "c1", "prompt": "做点事"})
         stop = {"conversation_id": "c1", "status": "completed", "loop_count": 0}
@@ -572,7 +576,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 address = process.stdout.readline().strip()
                 with urlopen(address, timeout=5) as response:
                     page = response.read().decode()
-                for expected in ("AI 读写动态", "今日写入 3 次", "不存在的主题", "沉淀提醒 2 次"):
+                for expected in ("AI 读写动态", "今日写入 3 次", "不存在的主题", "沉淀提醒 2 次", "近 7 天约"):
                     self.assertIn(expected, page)
             finally:
                 process.terminate()

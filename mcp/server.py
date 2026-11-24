@@ -1450,7 +1450,7 @@ CLIENT_NAME = audit_log.normalize_client(CONFIGURED_CLIENT)
 AUDIT_HOME = None
 
 
-def _audit_event(name, args, data, ok, ms, error=""):
+def _audit_event(name, args, data, ok, ms, error="", result=None):
     """Build a body-free audit event for one tool call."""
     ev = {
         "source": "mcp",
@@ -1468,9 +1468,14 @@ def _audit_event(name, args, data, ok, ms, error=""):
     if not ok:
         ev["error"] = error[:160]
         return ev
+    text = _result_text(result)
+    if text:
+        # Size of what the client actually received, so token cost can be measured.
+        ev["bytes"] = len(text.encode("utf-8"))
+        ev["tokens"] = audit_log.estimate_tokens(text)
     if name == "memory_search" and isinstance(data, list):
         ev["hits"] = len(data)
-        ev["refs"] = [h.get("ref") for h in data[:5] if isinstance(h, dict) and h.get("ref")]
+        ev["refs"] = [h.get("ref") for h in data[: audit_log.MAX_AUDIT_REFS] if isinstance(h, dict) and h.get("ref")]
     elif name == "memory_list" and isinstance(data, list):
         ev["hits"] = len(data)
     elif isinstance(data, dict):
@@ -1481,6 +1486,14 @@ def _audit_event(name, args, data, ok, ms, error=""):
     return ev
 
 
+def _result_text(result):
+    if not isinstance(result, dict):
+        return ""
+    return "".join(
+        str(item.get("text", "")) for item in result.get("content") or [] if isinstance(item, dict)
+    )
+
+
 def handle_tool_call(store, name, args):
     """Dispatch a tools/call invocation and record a local audit event."""
     started = time.monotonic()
@@ -1489,7 +1502,10 @@ def handle_tool_call(store, name, args):
     except Exception as exc:
         audit_log.record(_audit_event(name, args, None, False, int((time.monotonic() - started) * 1000), str(exc)), home=AUDIT_HOME)
         raise
-    audit_log.record(_audit_event(name, args, data, True, int((time.monotonic() - started) * 1000)), home=AUDIT_HOME)
+    audit_log.record(
+        _audit_event(name, args, data, True, int((time.monotonic() - started) * 1000), result=result),
+        home=AUDIT_HOME,
+    )
     return result
 
 

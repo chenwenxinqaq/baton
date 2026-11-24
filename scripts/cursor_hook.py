@@ -118,8 +118,18 @@ def handle(event, payload, memory_root):
 
     if event == "sessionStart":
         prune_state()
-        audit_log.record({"source": "hook", "client": "Cursor", "event": "sessionStart", "conversation_id": safe_id(conv_id)})
-        return {"additional_context": build_context(memory_root)}
+        context = build_context(memory_root)
+        audit_log.record(
+            {
+                "source": "hook",
+                "client": "Cursor",
+                "event": "sessionStart",
+                "conversation_id": safe_id(conv_id),
+                "bytes": len(context.encode("utf-8")),
+                "tokens": audit_log.estimate_tokens(context),
+            }
+        )
+        return {"additional_context": context}
 
     if event == "beforeSubmitPrompt":
         prompt = str(payload.get("prompt") or "")

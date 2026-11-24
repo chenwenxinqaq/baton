@@ -2234,6 +2234,8 @@ def main():
     p_doc = sub.add_parser("doctor", help="Diagnose index, MCP server, skills, and agent integration drift.")
     p_doc.add_argument("--fix", action="store_true", help="Automatically reconcile drifted/partial integrations.")
     p_doc.add_argument("--json", action="store_true", help="Emit JSON output.")
+    p_usage = sub.add_parser("usage", help="Report how much memory context clients received and used.")
+    p_usage.add_argument("--days", type=float, default=7, help="Look back this many days (default 7).")
 
     args = parser.parse_args()
 
@@ -2380,6 +2382,14 @@ def main():
         print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
     elif args.command == "doctor":
         report = run_doctor(fix=args.fix)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == "usage":
+        import audit_log
+        import time
+
+        since = time.time() - args.days * 86400
+        report = audit_log.usage_stats(audit_log.read_events(since=since))
+        report["days"] = args.days
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

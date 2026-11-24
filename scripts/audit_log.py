@@ -23,6 +23,8 @@ MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
 READ_TOOLS = {"memory_search", "memory_list", "memory_read"}
 WRITE_TOOLS = {"memory_upsert", "memory_archive"}
+MAX_AUDIT_REFS = 20
+CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
 REMOTE_URL_WITH_USERINFO_RE = re.compile(
     r"(?P<prefix>(?:https?|ssh)://)(?P<userinfo>[^/\s@]+)@",
     re.IGNORECASE,
@@ -36,6 +38,18 @@ REMOTE_SCP_WITH_PASSWORD_RE = re.compile(
 
 def audit_path(home=None):
     return global_state_dir(home=home) / "audit.jsonl"
+
+
+def estimate_tokens(text):
+    """Rough, tokenizer-free token estimate: one per CJK character, one per four other characters.
+
+    It is meant for relative comparisons on the dashboard, not for billing.
+    """
+    text = str(text or "")
+    if not text:
+        return 0
+    cjk = len(CJK_RE.findall(text))
+    return cjk + (len(text) - cjk + 3) // 4
 
 
 def _redact_remote_urls(value):
@@ -210,6 +224,66 @@ def _day_start(now):
     return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
+FOLLOW_WINDOW_SECONDS = 30 * 60
+
+
+def usage_stats(events):
+    """Measure how much memory context clients received and how much of it they used.
+
+    A search result counts as used when the same client reads that ref before
+    its next search and within FOLLOW_WINDOW_SECONDS. Events without a
+    ``tokens`` field (older log lines) are excluded from the token totals.
+    """
+    calls = [e for e in events if e.get("source") == "mcp" and e.get("ok", True)]
+    by_tool = {}
+    for e in calls:
+        if "tokens" not in e:
+            continue
+        item = by_tool.setdefault(e.get("tool") or "unknown", {"calls": 0, "tokens": 0, "bytes": 0})
+        item["calls"] += 1
+        item["tokens"] += int(e.get("tokens") or 0)
+        item["bytes"] += int(e.get("bytes") or 0)
+    for item in by_tool.values():
+        item["avg_tokens"] = round(item["tokens"] / item["calls"]) if item["calls"] else 0
+
+    searches = returned = used = unused_searches = 0
+    rank_counter = Counter()
+    for i, e in enumerate(calls):
+        if e.get("tool") != "memory_search":
+            continue
+        searches += 1
+        refs = [r for r in e.get("refs") or [] if r]
+        returned += int(e.get("hits") or len(refs))
+        client = e.get("client")
+        read = set()
+        for later in calls[i + 1:]:
+            if later.get("client") != client:
+                continue
+            if later.get("t", 0) - e.get("t", 0) > FOLLOW_WINDOW_SECONDS or later.get("tool") == "memory_search":
+                break
+            if later.get("tool") == "memory_read" and later.get("ref") in refs:
+                read.add(later["ref"])
+        used += len(read)
+        if not read:
+            unused_searches += 1
+        for ref in read:
+            rank_counter[refs.index(ref) + 1] += 1
+
+    sessions = [e for e in events if e.get("source") == "hook" and e.get("event") == "sessionStart" and "tokens" in e]
+    return {
+        "tokens_total": sum(item["tokens"] for item in by_tool.values()),
+        "by_tool": by_tool,
+        "searches": searches,
+        "results_returned": returned,
+        "results_read": used,
+        "read_rate": round(used / returned, 3) if returned else None,
+        "searches_without_read": unused_searches,
+        "read_ranks": {str(rank): count for rank, count in sorted(rank_counter.items())},
+        "session_injections": len(sessions),
+        "session_injection_tokens": sum(int(e.get("tokens") or 0) for e in sessions),
+    }
+
+
 def _ref_library(event, ref):
     """Return the logical library for an audit ref.
 
@@ -291,4 +365,6 @@ def summarize(now=None, home=None, days=7):
         "nudges_today": nudges_today,
         "sessions_today": sessions_today,
         "total_events": len(events),
+        "usage_today": usage_stats([e for e in events if e.get("t", 0) >= today0]),
+        "usage_7d": usage_stats(events),
     }
