@@ -67,9 +67,12 @@ BM25F_FIELDS = (("name", 3.0), ("title", 3.0), ("description", 2.0), ("body", 1.
 BM25_K1 = 1.2
 HYBRID_BM25_WEIGHT = 3.0
 BM25_B = 0.75
-# "hybrid" adds weighted BM25F to the older fixed field points; on the audit-log
-# eval set (scripts/search_eval.py, 30 cases, 2026-11-24) it beat both alone.
-SEARCH_RANKERS = ("hybrid", "bm25f", "legacy")
+# "legacy" (fixed field points) is the default. On a 40-query hand-labeled set
+# (2026-11-24) it ranks the right entry first in 39 cases; BM25F adds nothing
+# there and demotes the right entry on vague queries, because IDF rewards a
+# single rare term and length normalization favors very short entries.
+# "hybrid"/"bm25f" stay available for experiments via UNIFIED_MEMORY_SEARCH_RANKER.
+SEARCH_RANKERS = ("legacy", "hybrid", "bm25f")
 TEMPORAL_CUE_RE = re.compile(
     r"(刚刚|刚才|最近|最新|近期|今天|今日|昨天|本周|这周|近期工作|最近工作|最近进展|recent|latest|today)",
     re.IGNORECASE,
@@ -749,8 +752,9 @@ class MemoryStore:
         """Search entries by query terms, CJK bigrams, and temporal recency cues.
 
         ``score_fields`` decides which entries match. ``ranker`` decides their
-        order: "hybrid" (default, fixed field points + weighted BM25F),
-        "bm25f", or "legacy"; overridable with UNIFIED_MEMORY_SEARCH_RANKER.
+        order: "legacy" (default, fixed field points), "hybrid" (field points
+        plus weighted BM25F), or "bm25f"; overridable with
+        UNIFIED_MEMORY_SEARCH_RANKER.
         """
         capped_limit = max(1, min(int(limit), 50))
         ranker = search_ranker(ranker)

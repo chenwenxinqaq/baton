@@ -59,9 +59,9 @@ class RankerSelectionTests(unittest.TestCase):
     def test_default_env_and_unknown(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("UNIFIED_MEMORY_SEARCH_RANKER", None)
-            self.assertEqual(mcp_server.search_ranker(), "hybrid")
-            self.assertEqual(mcp_server.search_ranker("LEGACY"), "legacy")
-            self.assertEqual(mcp_server.search_ranker("nope"), "hybrid")
+            self.assertEqual(mcp_server.search_ranker(), "legacy")
+            self.assertEqual(mcp_server.search_ranker("HYBRID"), "hybrid")
+            self.assertEqual(mcp_server.search_ranker("nope"), "legacy")
         with mock.patch.dict(os.environ, {"UNIFIED_MEMORY_SEARCH_RANKER": "bm25f"}):
             self.assertEqual(mcp_server.search_ranker(), "bm25f")
 
