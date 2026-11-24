@@ -27,6 +27,7 @@ from library_paths import (
     resolve_libraries,
 )
 import audit_log
+import memory_lint
 import sync_git
 from async_sync import AsyncSyncScheduler
 
@@ -1315,6 +1316,26 @@ class MemoryStore:
             return f"user-managed/{name}.md", "", True
         return "", "", False
 
+    def lint(self, stale_days=memory_lint.STALE_DAYS, include_archived=True):
+        """Report consolidation problems: index drift, stale snapshots, duplicate topics."""
+        entries = self.collect_entries(include_archived=include_archived)
+        # A mount that only allows some layers still indexes the rest; those
+        # files exist on disk and must not be reported as missing.
+        index = {path: meta for path, meta in self.parse_index().items()
+                 if meta.get("layer", "") in self.allowed_layers}
+        findings = memory_lint.lint_entries(entries, index=index, stale_days=stale_days)
+        result = {
+            "library": self.library_id,
+            "entries": len(entries),
+            "stale_days": stale_days,
+            "summary": memory_lint.summarize(findings),
+            "findings": findings,
+        }
+        result.update(self._result_metadata())
+        if not findings:
+            result["notice"] = "No consolidation problems found."
+        return result
+
     def entry_history(self, name, limit=10):
         """List the saved previous versions of an entry kept in local trash backups."""
         if not NAME_RE.fullmatch(name):
@@ -1792,6 +1813,25 @@ class WorkspaceStore:
         store = self._resolve_single_store(library or "personal")
         return store.restore_entry(version=version, name=name, layer=layer, dry_run=dry_run)
 
+    def lint(self, stale_days=memory_lint.STALE_DAYS, library="personal"):
+        stores = self._target_stores(library)
+        results = self._per_store(stores, lambda st: st.lint(stale_days=stale_days))
+        if len(results) == 1:
+            return results[0][1]
+        reports = [report for _, report in results]
+        merged = []
+        for report in reports:
+            for item in report["findings"]:
+                merged.append(dict(item, library=report["library"]))
+        return {
+            "libraries": [report["library"] for report in reports],
+            "entries": sum(report["entries"] for report in reports),
+            "stale_days": stale_days,
+            "summary": memory_lint.summarize(merged),
+            "findings": merged,
+            "reports": reports,
+        }
+
 
 TOOLS = [
     {
@@ -1889,6 +1929,17 @@ TOOLS = [
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal')."},
             },
             "required": ["version"],
+        },
+    },
+    {
+        "name": "memory_lint",
+        "description": "Check a library for consolidation problems before or after a curation pass: entries missing from the index, index lines without a file, leftover frontmatter in a body, missing summaries or verification dates, L3 snapshots nobody refreshed, oversized entries, and pairs of entries that cover one topic. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for every mounted library)."},
+                "stale_days": {"type": "integer", "default": memory_lint.STALE_DAYS, "description": "Flag L3 snapshots older than this many days."},
+            },
         },
     },
     {
@@ -2031,6 +2082,11 @@ def _handle_tool_call(store, name, args):
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.restore_entry(**kwargs)
+    elif name == "memory_lint":
+        kwargs = dict(stale_days=int(args.get("stale_days", memory_lint.STALE_DAYS)))
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "personal")
+        data = store.lint(**kwargs)
     elif name == "memory_archive":
         kwargs = dict(
             name=args["name"],

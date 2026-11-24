@@ -21,7 +21,7 @@ from library_paths import global_state_dir
 
 MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
-READ_TOOLS = {"memory_search", "memory_list", "memory_read", "memory_history"}
+READ_TOOLS = {"memory_search", "memory_list", "memory_read", "memory_history", "memory_lint"}
 WRITE_TOOLS = {"memory_upsert", "memory_archive", "memory_restore"}
 MAX_AUDIT_REFS = 20
 CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")

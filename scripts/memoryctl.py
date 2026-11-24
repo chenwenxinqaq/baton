@@ -2237,9 +2237,13 @@ def main():
     p_usage = sub.add_parser("usage", help="Report how much memory context clients received and used.")
     p_usage.add_argument("--days", type=float, default=7, help="Look back this many days (default 7).")
 
+    p_lint = sub.add_parser("lint", help="Report consolidation problems: index drift, stale snapshots, duplicate topics.")
+    p_lint.add_argument("--library", default="personal", help="Library id, or '*' for every mounted library.")
+    p_lint.add_argument("--stale-days", type=int, default=90, help="Flag L3 snapshots older than this (default 90).")
+
     args = parser.parse_args()
 
-    if args.command in {"list", "search", "read", "write"}:
+    if args.command in {"list", "search", "read", "write", "lint"}:
         sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
         from server import WorkspaceStore
         try:
@@ -2249,6 +2253,8 @@ def main():
             elif args.command == "search":
                 result = store.search(args.query, library=args.library or "*", layer=args.layer,
                                       include_archived=args.archived, limit=args.limit)
+            elif args.command == "lint":
+                result = store.lint(stale_days=args.stale_days, library=args.library or "personal")
             elif args.command == "read":
                 result = store.read_entry(args.path, library=args.library or "")
             else:

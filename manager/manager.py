@@ -2400,6 +2400,7 @@ def _ref_link(ref, key, event_library=""):
 
 _TOOL_LABELS = {"memory_search": "搜索", "memory_read": "读取", "memory_list": "列表", "memory_upsert": "写入",
                 "memory_archive": "归档", "memory_libraries": "库列表", "memory_history": "历史版本",
+    "memory_lint": "体检",
                 "memory_restore": "恢复版本"}
 
 
