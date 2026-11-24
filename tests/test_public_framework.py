@@ -576,7 +576,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 address = process.stdout.readline().strip()
                 with urlopen(address, timeout=5) as response:
                     page = response.read().decode()
-                for expected in ("AI 读写动态", "今日写入 3 次", "不存在的主题", "沉淀提醒 2 次", "近 7 天约"):
+                for expected in ("AI 读写动态", "今日写入 3 次", "不存在的主题", "沉淀提醒 2 次", "上下文用量", "搜了没读"):
                     self.assertIn(expected, page)
             finally:
                 process.terminate()

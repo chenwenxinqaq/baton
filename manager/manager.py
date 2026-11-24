@@ -2398,23 +2398,51 @@ def _ref_link(ref, key, event_library=""):
     return f'<a href="{escape(href)}">{escape(ref)}</a>'
 
 
-def _usage_line(today, week):
-    """One line of context-cost metrics: tokens returned to AI clients and how much was read."""
+_TOOL_LABELS = {"memory_search": "搜索", "memory_read": "读取", "memory_list": "列表", "memory_upsert": "写入",
+                "memory_archive": "归档", "memory_libraries": "库列表"}
+
+
+def _usage_section(today, week):
+    """Context-cost block on the activity page: tokens returned to AI clients and how much was read."""
     if not week.get("tokens_total") and not week.get("searches"):
         return ""
-    parts = [f'今日返回约 {today.get("tokens_total", 0):,} token', f'近 7 天约 {week.get("tokens_total", 0):,} token']
-    if week.get("read_rate") is not None:
-        parts.append(
-            f'搜索结果被读取 {week["read_rate"] * 100:.0f}%'
-            f'（{week.get("results_read", 0)}/{week.get("results_returned", 0)}）'
-        )
-    if week.get("searches"):
-        parts.append(f'搜了没读 {week.get("searches_without_read", 0)}/{week["searches"]} 次')
+    rate = week.get("read_rate")
+    cards = (
+        ("今日返回", f'{today.get("tokens_total", 0):,}', "token（估算）"),
+        ("近 7 天返回", f'{week.get("tokens_total", 0):,}', "token（估算）"),
+        ("搜索结果被读取", "—" if rate is None else f"{rate * 100:.0f}%",
+         f'{week.get("results_read", 0)} / {week.get("results_returned", 0)} 条'),
+        ("搜了没读", f'{week.get("searches_without_read", 0)}', f'共 {week.get("searches", 0)} 次搜索'),
+    )
+    card_html = "".join(
+        f'<div class="desk-stat"><span>{escape(label)}</span><strong>{escape(value)}</strong>'
+        f'<em class="act-meta">{escape(note)}</em></div>'
+        for label, value, note in cards
+    )
+    tool_rows = "".join(
+        f'<li>{escape(_TOOL_LABELS.get(tool, tool))} <span class="act-meta">{item["calls"]} 次 · '
+        f'共 {item["tokens"]:,} token · 平均 {item["avg_tokens"]:,}</span></li>'
+        for tool, item in sorted((week.get("by_tool") or {}).items(), key=lambda kv: -kv[1]["tokens"])
+    ) or '<li class="act-meta">还没有带大小的记录：重启客户端后的新调用才会记录 token</li>'
     if week.get("session_injections"):
         avg = round(week["session_injection_tokens"] / week["session_injections"])
-        parts.append(f'会话注入 {week["session_injections"]} 次 · 平均 {avg:,} token')
-    title = "token 为估算值：中文 1 字约 1 token，其他约 4 字符 1 token。被读取＝同一客户端在下一次搜索前读了该结果。"
-    return f'<span class="recent-stats" title="{escape(title)}">{escape(" · ".join(parts))}</span>'
+        tool_rows += (f'<li>会话开头注入 <span class="act-meta">{week["session_injections"]} 次 · '
+                      f'平均 {avg:,} token</span></li>')
+    rank_rows = "".join(
+        f'<li>第 {escape(rank)} 名 <span class="act-meta">被读 {count} 次</span></li>'
+        for rank, count in (week.get("read_ranks") or {}).items()
+    ) or '<li class="act-meta">近 7 天没有读取过搜索结果</li>'
+    note = ("token 为估算值：中文 1 字约 1 token，其他约 4 字符 1 token。"
+            "「被读取」指同一客户端在下一次搜索前、30 分钟内读了这条结果。")
+    return f"""
+        <section class="activity-usage" aria-labelledby="usage-heading">
+          <h3 id="usage-heading">上下文用量 <span class="act-meta">{escape(note)}</span></h3>
+          <div class="desk-stats usage-stats">{card_html}</div>
+          <div class="activity-cols usage-cols">
+            <div><h3>近 7 天按工具</h3><ul role="list">{tool_rows}</ul></div>
+            <div><h3>被读结果的名次</h3><ul role="list">{rank_rows}</ul></div>
+          </div>
+        </section>"""
 
 
 def render_activity_panel(key, agent_home=None):
@@ -2485,7 +2513,7 @@ def render_activity_panel(key, agent_home=None):
     hit_rows = "".join(
         f'<li>{_ref_link(h["ref"], key, h.get("library"))} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
     ) or '<li class="act-meta">暂无高频命中</li>'
-    usage_line = _usage_line(summary.get("usage_today") or {}, summary.get("usage_7d") or {})
+    usage_section = _usage_section(summary.get("usage_today") or {}, summary.get("usage_7d") or {})
 
     return f"""
       <section class="activity-panel" aria-labelledby="activity-heading">
@@ -2493,10 +2521,10 @@ def render_activity_panel(key, agent_home=None):
           <div class="recent-panel-title">
             <h2 id="activity-heading">🤖 AI 读写动态</h2>
             <span class="recent-stats">今日查询 {summary["reads_today"]} 次 · 今日写入 {summary["writes_today"]} 次 · 空结果搜索 {summary["empty_searches_today"]} 次 · 沉淀提醒 {summary["nudges_today"]} 次</span>
-            {usage_line}
           </div>
         </div>
         <ul class="activity-clients" role="list">{"".join(client_rows) or '<li class="act-meta">尚无已接入客户端</li>'}</ul>
+        {usage_section}
         <div class="activity-cols">
           <div><h3>最近写入</h3><ul role="list">{write_rows}</ul></div>
           <div><h3>最近查询</h3><ul role="list">{query_rows}</ul></div>
