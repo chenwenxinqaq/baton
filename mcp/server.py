@@ -240,6 +240,62 @@ def parse_frontmatter(text):
     return fields, body.lstrip("\n")
 
 
+SECTION_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+# Progressive disclosure: large entries get a section outline so an agent can read
+# one section instead of the whole file (MemGPT-style paging over Markdown).
+OUTLINE_MIN_CHARS = 1200
+
+
+def heading_line(preamble):
+    """Return the leading "# Title" line of a body, if present."""
+    for line in preamble.split("\n"):
+        if line.startswith("# "):
+            return line.strip()
+    return ""
+
+
+def split_sections(body):
+    """Split a Markdown body into (preamble, [{"title", "text"}]) on "## " headings."""
+    preamble = []
+    sections = []
+    current = None
+    for line in body.replace("\r\n", "\n").split("\n"):
+        match = SECTION_HEADING_RE.match(line)
+        if match and len(match.group(1)) == 2:
+            if current is not None:
+                sections.append(current)
+            current = {"title": match.group(2).strip(), "lines": [line]}
+        elif current is not None:
+            current["lines"].append(line)
+        else:
+            preamble.append(line)
+    if current is not None:
+        sections.append(current)
+    out = []
+    for sec in sections:
+        text = "\n".join(sec["lines"]).strip("\n")
+        out.append({"title": sec["title"], "text": text})
+    intro = "\n".join(preamble).strip("\n")
+    title_line = heading_line(intro)
+    if out and intro and intro != title_line:
+        # The text before the first "## " heading (for MEMORY.md: the whole §0 rules)
+        # is a readable section too, named after the document title.
+        out.insert(0, {"title": title_line[2:].strip() or "intro", "text": intro})
+    return title_line, out
+
+
+def section_outline(sections):
+    """Describe each section with its size so agents can budget a targeted read."""
+    return [
+        {
+            "section": sec["title"],
+            "chars": len(sec["text"]),
+            "tokens": audit_log.estimate_tokens(sec["text"]),
+        }
+        for sec in sections
+    ]
+
+
 def strip_generated_header(body):
     """Drop frontmatter and the H1 that the server writes itself.
 
@@ -903,8 +959,8 @@ class MemoryStore:
             for item in collected
         ]
 
-    def read_entry(self, rel_path):
-        """Read a Markdown file inside the memory root."""
+    def read_entry(self, rel_path, section="", outline=False):
+        """Read a Markdown file inside the memory root, optionally one section only."""
         target = self.resolve_safe(rel_path)
         if not target.is_file() or target.suffix.lower() != ".md":
             raise ValueError(f"Not a readable markdown file: {rel_path}")
@@ -917,12 +973,49 @@ class MemoryStore:
             raise ValueError(
                 f"Layer {folder_to_layer[top_part]} is not enabled for library '{self.library_id}'."
             )
-        return {
+        text = target.read_text(encoding="utf-8")
+        _meta, body = parse_frontmatter(text)
+        preamble, sections = split_sections(body)
+        base = {
             **self._result_metadata(),
             "ref": self._entry_ref(rel_posix),
             "path": rel_posix,
-            "content": target.read_text(encoding="utf-8"),
+            "chars": len(text),
         }
+        wanted = (section or "").strip()
+        if wanted:
+            if not sections:
+                raise ValueError(f"{rel_posix} has no '## ' sections to read.")
+            folded = wanted.casefold()
+            picked = next((sec for sec in sections if sec["title"].casefold() == folded), None)
+            if picked is None:
+                picked = next((sec for sec in sections if folded in sec["title"].casefold()), None)
+            if picked is None:
+                available = ", ".join(sec["title"] for sec in sections)
+                raise ValueError(f"Section '{wanted}' not found in {rel_posix}. Available: {available}")
+            title_line = preamble if preamble not in picked["text"] else ""
+            parts = [part for part in (title_line, picked["text"]) if part]
+            return {
+                **base,
+                "section": picked["title"],
+                "partial": True,
+                "content": "\n\n".join(parts) + "\n",
+                "sections": section_outline(sections),
+            }
+        if outline:
+            if not sections:
+                return {**base, "partial": False, "content": text}
+            return {
+                **base,
+                "partial": True,
+                "content": (preamble or f"# {rel_posix}") + "\n",
+                "sections": section_outline(sections),
+                "notice": "Outline only. Call memory_read again with section=\"<title>\" for one section, or without outline for the whole entry.",
+            }
+        result = {**base, "partial": False, "content": text}
+        if len(sections) >= 2 and len(text) >= OUTLINE_MIN_CHARS:
+            result["sections"] = section_outline(sections)
+        return result
 
     def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False):
         """Create or update a memory entry under lock, backing up previous versions to trash."""
@@ -1451,7 +1544,7 @@ class WorkspaceStore:
             merged.sort(key=lambda t: (-t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["layer"], t[0]["path"]))
         return [t[0] for t in merged]
 
-    def read_entry(self, rel_path, library=""):
+    def read_entry(self, rel_path, library="", section="", outline=False):
         self._load_stores()
         target_lib = (library or "").strip()
         effective_path = rel_path
@@ -1461,7 +1554,7 @@ class WorkspaceStore:
                 target_lib = prefix
                 effective_path = rest
         store = self._resolve_single_store(target_lib or "personal")
-        return store.read_entry(effective_path)
+        return store.read_entry(effective_path, section=section, outline=outline)
 
     def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal"):
         store = self._resolve_single_store(library or "personal")
@@ -1519,12 +1612,14 @@ TOOLS = [
     },
     {
         "name": "memory_read",
-        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md').",
+        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md'). Large entries also return a section outline; pass outline=true to get only that outline, or section='<title>' to read a single section instead of the whole file.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Relative path inside the memory library, optionally prefixed with '<library>:'."},
                 "library": {"type": "string", "default": "", "description": "Optional library id (defaults to 'personal' unless path has '<library>:' prefix)."},
+                "section": {"type": "string", "default": "", "description": "Read only this '## ' section (exact title, or a substring of it)."},
+                "outline": {"type": "boolean", "default": False, "description": "Return the section outline and the intro only, so you can pick one section to read."},
             },
             "required": ["path"],
         },
@@ -1651,10 +1746,13 @@ def _handle_tool_call(store, name, args):
             kwargs["library"] = args.get("library", "personal")
         data = store.list_entries(**kwargs)
     elif name == "memory_read":
+        kwargs = dict(
+            section=args.get("section", "") or "",
+            outline=bool(args.get("outline", False)),
+        )
         if isinstance(store, WorkspaceStore):
-            data = store.read_entry(args["path"], library=args.get("library", ""))
-        else:
-            data = store.read_entry(args["path"])
+            kwargs["library"] = args.get("library", "")
+        data = store.read_entry(args["path"], **kwargs)
     elif name == "memory_upsert":
         kwargs = dict(
             layer=args["layer"],
