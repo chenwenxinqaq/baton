@@ -1,12 +1,16 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, session } = require('electron');
+const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, net, session, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline');
 
 app.setName('Unified Memory');
+const REPO_URL = 'https://github.com/chenwenxinqaq/baton';
+const RELEASES_URL = REPO_URL + '/releases/latest';
+const LATEST_RELEASE_API = 'https://api.github.com/repos/chenwenxinqaq/baton/releases/latest';
+const UPDATE_INTERVAL = 24 * 60 * 60 * 1000;
 let win;
 let backend;
 let origin;
@@ -21,6 +25,65 @@ function readPrefs() {
 function writePrefs(patch) {
   fs.mkdirSync(app.getPath('userData'), { recursive: true });
   fs.writeFileSync(prefsFile(), JSON.stringify({ ...readPrefs(), ...patch }, null, 2));
+}
+
+function versionParts(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(value || '').trim());
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function isNewerVersion(latest, current) {
+  const a = versionParts(latest), b = versionParts(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+
+function messageBox(options) {
+  return win?.isVisible() ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options);
+}
+
+function autoUpdateCheckEnabled() { return readPrefs().autoUpdateCheck !== false; }
+
+// Only the release tag is requested from GitHub; memory content never leaves the machine here.
+async function checkForUpdates(manual) {
+  let release;
+  try {
+    const response = await net.fetch(LATEST_RELEASE_API, { headers: {
+      Accept: 'application/vnd.github+json', 'User-Agent': `UnifiedMemory/${app.getVersion()}` } });
+    if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
+    release = await response.json();
+  } catch (error) {
+    if (manual) await messageBox({ type: 'warning', message: '暂时无法检查更新', detail: String(error.message || error) });
+    return;
+  }
+  writePrefs({ lastUpdateCheck: Date.now() });
+  const latest = typeof release?.tag_name === 'string' ? release.tag_name.trim() : '';
+  const current = app.getVersion();
+  if (!isNewerVersion(latest, current)) {
+    if (manual) await messageBox({ type: 'info', message: '已是最新版本', detail: `当前版本 ${current}。` });
+    return;
+  }
+  if (!manual && readPrefs().skippedVersion === latest) return;
+  const page = typeof release.html_url === 'string' && release.html_url.startsWith(REPO_URL + '/releases/')
+    ? release.html_url : RELEASES_URL;
+  const { response } = await messageBox({
+    type: 'info', buttons: ['前往下载', '跳过此版本', '稍后'], defaultId: 0, cancelId: 2,
+    message: `Unified Memory ${latest.replace(/^v/, '')} 已发布`,
+    detail: `当前版本 ${current}。下载 ZIP 后替换「应用程序」中的 Unified Memory，记忆库不受影响。`
+  });
+  if (response === 0) shell.openExternal(page);
+  if (response === 1) writePrefs({ skippedVersion: latest });
+}
+
+function scheduleUpdateChecks() {
+  if (!app.isPackaged) return;
+  const run = () => {
+    if (autoUpdateCheckEnabled() && Date.now() - (readPrefs().lastUpdateCheck || 0) >= UPDATE_INTERVAL)
+      checkForUpdates(false).catch(() => {});
+  };
+  setTimeout(run, 15000);
+  setInterval(run, 6 * 60 * 60 * 1000);
 }
 
 function backendSettings() {
@@ -104,8 +167,18 @@ function installMenu() {
     if (dir < 0 && history?.canGoBack()) history.goBack();
     if (dir > 0 && history?.canGoForward()) history.goForward();
   };
+  const appMenu = { label: app.name, submenu: [
+    { role: 'about' },
+    { label: '检查更新…', click: () => checkForUpdates(true).catch(() => {}) },
+    { label: '自动检查更新', type: 'checkbox', checked: autoUpdateCheckEnabled(),
+      click: item => writePrefs({ autoUpdateCheck: item.checked }) },
+    { label: '在 GitHub 上查看', click: () => shell.openExternal(REPO_URL) },
+    { type: 'separator' }, { role: 'services' },
+    { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+    { type: 'separator' }, { role: 'quit' }
+  ] };
   const menu = [
-    ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
+    ...(process.platform === 'darwin' ? [appMenu] : []),
     { role: 'editMenu' },
     { label: '工作空间', submenu: [
       { label: '搜索记忆或技能', accelerator: 'CmdOrCtrl+F', click: () =>
@@ -113,7 +186,12 @@ function installMenu() {
       { label: '后退', accelerator: 'CmdOrCtrl+[', click: () => go(-1) },
       { label: '前进', accelerator: 'CmdOrCtrl+]', click: () => go(1) },
       { type: 'separator' }, { role: 'reload' }, { role: 'togglefullscreen' }
-    ] }, { role: 'windowMenu' }
+    ] }, { role: 'windowMenu' },
+    { role: 'help', submenu: [
+      { label: 'GitHub 仓库', click: () => shell.openExternal(REPO_URL) },
+      { label: '版本发布页', click: () => shell.openExternal(RELEASES_URL) },
+      { label: '反馈问题', click: () => shell.openExternal(REPO_URL + '/issues') }
+    ] }
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(menu));
 }
@@ -143,6 +221,7 @@ function installTray() {
     { label: '读写动态', click: () => showWindow('/?view=activity') },
     { label: '共享与同步', click: () => showWindow('/?view=sync_hub') },
     { type: 'separator' },
+    { label: '检查更新…', click: () => checkForUpdates(true).catch(() => {}) },
     { label: '开机自动启动', type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin,
       click: item => { setLoginItem(item.checked); rebuild(); } },
     { type: 'separator' },
@@ -164,6 +243,8 @@ async function askLoginItemOnce() {
 
 async function launch() {
   openedAtLogin = app.getLoginItemSettings().wasOpenedAtLogin;
+  app.setAboutPanelOptions({ applicationName: 'Unified Memory', applicationVersion: app.getVersion(),
+    credits: REPO_URL, website: REPO_URL });
   const isolated = session.fromPartition('memory-workspace');
   isolated.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
   isolated.setPermissionCheckHandler(() => false);
@@ -176,6 +257,7 @@ async function launch() {
   installTray();
   await createWindow();
   askLoginItemOnce().catch(() => {});
+  scheduleUpdateChecks();
 }
 
 if (!app.requestSingleInstanceLock()) {
