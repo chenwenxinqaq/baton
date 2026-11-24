@@ -2461,7 +2461,60 @@ def _usage_section(today, week):
         </section>"""
 
 
-def render_activity_panel(key, agent_home=None):
+_LINT_CHECK_LABELS = {
+    "duplicate-frontmatter": "正文里混进了 frontmatter",
+    "index-missing": "不在索引里",
+    "index-orphan": "索引指向了不存在的文件",
+    "missing-description": "缺摘要",
+    "missing-date": "缺验证日期",
+    "stale-snapshot": "快照太久没更新",
+    "oversized": "条目过长",
+    "duplicate-topic": "疑似同主题重复",
+}
+
+
+def _lint_section(key, root):
+    """Library health: the problems a curation pass should fix, worst first."""
+    if not root:
+        return ""
+    try:
+        report = mcp_server.MemoryStore(root).lint()
+    except Exception:
+        return ""
+    findings = report.get("findings") or []
+    if not findings:
+        return (
+            '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
+            f'<span class="usage-hint">{report.get("entries", 0)} 条，没发现问题</span></div></section>'
+        )
+    order = {"error": 0, "warning": 1, "info": 2}
+    findings.sort(key=lambda f: (order.get(f["severity"], 3), f["ref"]))
+    counts = report.get("summary", {}).get("by_severity", {})
+    chips = " · ".join(
+        f"{label} {counts[sev]}"
+        for sev, label in (("error", "需要修"), ("warning", "该看一眼"), ("info", "可以优化"))
+        if counts.get(sev)
+    )
+    rows = []
+    for item in findings[:6]:
+        cls = "act-err" if item["severity"] == "error" else "act-meta"
+        label = _LINT_CHECK_LABELS.get(item["check"], item["check"])
+        rows.append(
+            f'<li>{_ref_link(item["ref"], key, report.get("library"))} '
+            f'<span class="{cls}">{escape(label)}</span>'
+            f'<span class="act-meta">{escape(item["detail"])} → {escape(item["hint"])}</span></li>'
+        )
+    more = ""
+    if len(findings) > 6:
+        more = f'<li class="act-meta">还有 {len(findings) - 6} 条，运行 <code>umem lint</code> 看全部</li>'
+    return (
+        '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
+        f'<span class="usage-hint">{escape(chips)}</span></div>'
+        f'<ul class="lint-list" role="list">{"".join(rows)}{more}</ul></section>'
+    )
+
+
+def render_activity_panel(key, agent_home=None, root=None):
     """First-screen dashboard: what AI clients searched/read/wrote locally (from the audit log)."""
     try:
         summary = audit_log.summarize()
@@ -2530,6 +2583,7 @@ def render_activity_panel(key, agent_home=None):
         f'<li>{_ref_link(h["ref"], key, h.get("library"))} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
     ) or '<li class="act-meta">暂无高频命中</li>'
     usage_section = _usage_section(summary.get("usage_today") or {}, summary.get("usage_7d") or {})
+    lint_section = _lint_section(key, root)
 
     return f"""
       <section class="activity-panel" aria-labelledby="activity-heading">
@@ -2541,6 +2595,7 @@ def render_activity_panel(key, agent_home=None):
         </div>
         <ul class="activity-clients" role="list">{"".join(client_rows) or '<li class="act-meta">尚无已接入客户端</li>'}</ul>
         {usage_section}
+        {lint_section}
         <div class="activity-cols">
           <div><h3>最近写入</h3><ul role="list">{write_rows}</ul></div>
           <div><h3>最近查询</h3><ul role="list">{query_rows}</ul></div>
@@ -2549,7 +2604,7 @@ def render_activity_panel(key, agent_home=None):
       </section>"""
 
 
-def render_overview(topics, entries, key):
+def render_overview(topics, entries, key, root=None):
     """Render Recent Work timeline + L0-L4 overview dashboard when no topic is selected."""
     now_dt = datetime.now().astimezone()
     now_ep = now_dt.timestamp()
@@ -2645,7 +2700,7 @@ def render_overview(topics, entries, key):
 
     active_user_cnt = sum(e.status == "active" for e in entries)
     return f"""
-      {render_activity_panel(key)}
+      {render_activity_panel(key, root=root)}
       {recent_panel}
       <p class="overview-section-label">按 L0–L4 记忆性质浏览</p>
       <div class="overview-grid">{"".join(cards)}</div>
@@ -3087,7 +3142,7 @@ def render(
         heading = f"{library.label}（只读共享库）"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">只读共享库</span></div>'
         error = error or f"当前库「{library.label}」为只读挂载，不支持在页面中新建或编辑。"
-        reader = "" if DESKTOP else render_overview(topics, entries, key)
+        reader = "" if DESKTOP else render_overview(topics, entries, key, root=library.root)
     elif view == "new":
         heading = "新建记忆"
         default_scope = draft_scope or ("user" if source == "user" else "index")
@@ -3379,7 +3434,7 @@ def render(
     else:
         heading = "记忆库概览"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'
-        reader = "" if DESKTOP else render_overview(topics, entries, key)
+        reader = "" if DESKTOP else render_overview(topics, entries, key, root=library.root)
 
     feedback = ""
     if error:
@@ -3426,7 +3481,7 @@ def render(
             detail_badges = detail_submeta = ""
             if view == "activity":
                 heading = "读写动态"
-                reader = render_activity_panel(key)
+                reader = render_activity_panel(key, root=library.root)
         elif not view and not topic_path and not entry.name:
             heading = "搜索结果" if q else "记忆库"
             detail_badges = detail_submeta = detail_toolbar = ""
