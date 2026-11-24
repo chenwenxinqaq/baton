@@ -534,6 +534,67 @@ class MemoryStore:
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
+    def _similar_entries(self, query, name, limit=3):
+        """Find existing entries on the same topic so a new write can merge instead of fork."""
+        try:
+            hits = self.search(query, limit=limit + 3)
+        except Exception:
+            return []
+        out = []
+        for hit in hits:
+            if Path(hit.get("path", "")).stem == name:
+                continue
+            if (hit.get("score") or 0) < 8:
+                continue
+            out.append({
+                "ref": hit.get("ref", ""),
+                "layer": hit.get("layer", ""),
+                "title": hit.get("title", ""),
+                "updated_at": hit.get("updated_at", ""),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _check_expected_updated(expected_updated_at, old_meta, target):
+        """Reject a write whose base version is stale (lost-update protection)."""
+        expected = (expected_updated_at or "").strip()
+        if not expected:
+            return
+        actual = str(old_meta.get("updated_at") or "").strip()
+        if not actual:
+            _, actual, _, _ = file_timestamps(target, old_meta)
+        if expected != actual:
+            raise ValueError(
+                "Entry changed since you read it: expected_updated_at="
+                f"{expected} but the entry is at {actual}. Read it again, merge, then write."
+            )
+
+    @staticmethod
+    def _previous_receipt(old_meta, old_body, backup):
+        """Describe the version that a write is about to replace."""
+        return {
+            "updated_at": str(old_meta.get("updated_at") or "").strip(),
+            "chars": len(old_body or ""),
+            "backup": backup or "",
+        }
+
+    @staticmethod
+    def _attach_previous(result, previous, new_body):
+        """Report the replaced version and warn when a write drops most of it."""
+        if not previous:
+            return result
+        result["previous"] = previous
+        old_chars = previous.get("chars") or 0
+        new_chars = len(new_body or "")
+        if old_chars >= 400 and new_chars < old_chars * 0.6:
+            result["content_warning"] = (
+                f"This write replaced {old_chars} chars with {new_chars}. If that was not"
+                " intended, the previous version is in the backup path above."
+            )
+        return result
+
     def _backup_to_trash(self, src_path, slug_hint):
         """Save a safety backup copy into local state trash before overwriting or removing a file."""
         if not src_path.is_file():
@@ -974,7 +1035,7 @@ class MemoryStore:
                 f"Layer {folder_to_layer[top_part]} is not enabled for library '{self.library_id}'."
             )
         text = target.read_text(encoding="utf-8")
-        _meta, body = parse_frontmatter(text)
+        meta, body = parse_frontmatter(text)
         preamble, sections = split_sections(body)
         base = {
             **self._result_metadata(),
@@ -982,6 +1043,10 @@ class MemoryStore:
             "path": rel_posix,
             "chars": len(text),
         }
+        if meta.get("updated_at"):
+            # Agents pass this back as expected_updated_at to avoid clobbering a
+            # parallel session's edit.
+            base["updated_at"] = str(meta["updated_at"]).strip()
         wanted = (section or "").strip()
         if wanted:
             if not sections:
@@ -1017,8 +1082,14 @@ class MemoryStore:
             result["sections"] = section_outline(sections)
         return result
 
-    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False):
-        """Create or update a memory entry under lock, backing up previous versions to trash."""
+    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False,
+                     expected_updated_at=""):
+        """Create or update a memory entry under lock, backing up previous versions to trash.
+
+        ``expected_updated_at`` turns the write into a compare-and-set: if the entry
+        changed since the agent read it, the write is rejected instead of silently
+        dropping the other session's edit.
+        """
         if self.mode == "ro":
             raise ValueError(f"Library '{self.library_id}' is read-only.")
         if layer not in LAYER_DIRS:
@@ -1045,15 +1116,23 @@ class MemoryStore:
         if resolved_type not in allowed_types:
             raise ValueError(f"type '{resolved_type}' is invalid for {layer}.")
 
+        related = []
+        if not user_managed and not (self.root / LAYER_DIRS[layer] / f"{name}.md").is_file():
+            related = self._similar_entries(f"{title} {description}", name)
+
         ts_now = now_iso()
         with self.write_lock():
             if user_managed:
                 target = self.root / "user-managed" / f"{name}.md"
                 status = "active"
                 cre_at = ts_now
+                previous = None
                 if target.is_file():
-                    self._backup_to_trash(target, f"user-{name}")
-                    old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
+                    old_text = target.read_text(encoding="utf-8")
+                    old_meta, old_body = parse_frontmatter(old_text)
+                    self._check_expected_updated(expected_updated_at, old_meta, target)
+                    backup = self._backup_to_trash(target, f"user-{name}")
+                    previous = self._previous_receipt(old_meta, old_body, backup)
                     status = old_meta.get("status", "active")
                     cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
                     if not topic_type and old_meta.get("type") in ALLOWED_LAYER_TYPES[layer]:
@@ -1074,14 +1153,16 @@ class MemoryStore:
                 message = f"memory({self.library_id}): upsert {rel_out}"
                 sync_status = self._maybe_auto_commit(message)
                 self._enqueue_async_sync(message)
-                return self._with_sync_warning({
+                res = {
                     **self._result_metadata(),
                     "ref": self._entry_ref(rel_out),
                     "path": rel_out,
                     "indexed": False,
                     "created_at": cre_at,
                     "updated_at": ts_now,
-                }, sync_status)
+                }
+                self._attach_previous(res, previous, body)
+                return self._with_sync_warning(res, sync_status)
 
             folder = LAYER_DIRS[layer]
             target = self.root / folder / f"{name}.md"
@@ -1090,9 +1171,12 @@ class MemoryStore:
             # Find any existing entry (in target layer or another layer) to preserve created_at
             stale_files = []
             preserved_created = None
+            previous = None
             if target.is_file():
-                self._backup_to_trash(target, name)
-                old_meta, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
+                old_meta, old_body = parse_frontmatter(target.read_text(encoding="utf-8"))
+                self._check_expected_updated(expected_updated_at, old_meta, target)
+                backup = self._backup_to_trash(target, name)
+                previous = self._previous_receipt(old_meta, old_body, backup)
                 preserved_created, _, _, _ = file_timestamps(target, old_meta)
             for other_layer, other_folder in LAYER_DIRS.items():
                 if other_layer == layer or other_layer not in self.allowed_layers:
@@ -1156,6 +1240,14 @@ class MemoryStore:
             }
             if migrated_from:
                 res["migrated_from"] = migrated_from
+            if related and previous is None and not migrated_from:
+                res["related"] = related
+                res["notice"] = (
+                    "New entry created. The entries in 'related' look close to it: if one"
+                    " covers the same topic, fold this content into that entry and archive"
+                    " the duplicate, so the library keeps one current conclusion per topic."
+                )
+            self._attach_previous(res, previous, formatted_body)
             return self._with_sync_warning(res, sync_status)
 
     def _remove_index_line(self, rel_path):
@@ -1556,7 +1648,8 @@ class WorkspaceStore:
         store = self._resolve_single_store(target_lib or "personal")
         return store.read_entry(effective_path, section=section, outline=outline)
 
-    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal"):
+    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal",
+                     expected_updated_at=""):
         store = self._resolve_single_store(library or "personal")
         return store.upsert_entry(
             layer=layer,
@@ -1566,6 +1659,7 @@ class WorkspaceStore:
             body=body,
             topic_type=topic_type,
             user_managed=user_managed,
+            expected_updated_at=expected_updated_at,
         )
 
     def archive_entry(self, name, user_managed=False, library="personal"):
@@ -1638,6 +1732,7 @@ TOOLS = [
                 "topic_type": {"type": "string", "enum": ["", "user", "feedback", "project", "reference"], "default": ""},
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
+                "expected_updated_at": {"type": "string", "default": "", "description": "The updated_at you based your edit on. The write is rejected if the entry changed since then, so a parallel session's edit is not lost."},
             },
             "required": ["layer", "name", "title", "description", "body"],
         },
@@ -1762,6 +1857,7 @@ def _handle_tool_call(store, name, args):
             body=args["body"],
             topic_type=args.get("topic_type", ""),
             user_managed=bool(args.get("user_managed", False)),
+            expected_updated_at=args.get("expected_updated_at", "") or "",
         )
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
