@@ -2407,40 +2407,53 @@ def _usage_section(today, week):
     if not week.get("tokens_total") and not week.get("searches"):
         return ""
     rate = week.get("read_rate")
-    cards = (
-        ("今日返回", f'{today.get("tokens_total", 0):,}', "token（估算）"),
-        ("近 7 天返回", f'{week.get("tokens_total", 0):,}', "token（估算）"),
-        ("搜索结果被读取", "—" if rate is None else f"{rate * 100:.0f}%",
-         f'{week.get("results_read", 0)} / {week.get("results_returned", 0)} 条'),
-        ("搜了没读", f'{week.get("searches_without_read", 0)}', f'共 {week.get("searches", 0)} 次搜索'),
+    stats = (
+        ("今日返回", f'{today.get("tokens_total", 0):,}', "token"),
+        ("近 7 天返回", f'{week.get("tokens_total", 0):,}', "token"),
+        ("结果被读取", "—" if rate is None else f"{rate * 100:.0f}%",
+         f'{week.get("results_read", 0)}/{week.get("results_returned", 0)} 条'),
+        ("搜了没读", f'{week.get("searches_without_read", 0)}', f'/ {week.get("searches", 0)} 次搜索'),
     )
-    card_html = "".join(
-        f'<div class="desk-stat"><span>{escape(label)}</span><strong>{escape(value)}</strong>'
-        f'<em class="act-meta">{escape(note)}</em></div>'
-        for label, value, note in cards
+    stat_html = "".join(
+        f'<div class="usage-stat"><span>{escape(label)}</span>'
+        f'<strong>{escape(value)}<small>{escape(unit)}</small></strong></div>'
+        for label, value, unit in stats
     )
+    tools = sorted((week.get("by_tool") or {}).items(), key=lambda kv: -kv[1]["tokens"])
     tool_rows = "".join(
-        f'<li>{escape(_TOOL_LABELS.get(tool, tool))} <span class="act-meta">{item["calls"]} 次 · '
-        f'共 {item["tokens"]:,} token · 平均 {item["avg_tokens"]:,}</span></li>'
-        for tool, item in sorted((week.get("by_tool") or {}).items(), key=lambda kv: -kv[1]["tokens"])
-    ) or '<li class="act-meta">还没有带大小的记录：重启客户端后的新调用才会记录 token</li>'
+        f'<tr><td>{escape(_TOOL_LABELS.get(tool, tool))}</td><td>{item["calls"]}</td>'
+        f'<td>{item["tokens"]:,}</td><td>{item["avg_tokens"]:,}</td></tr>'
+        for tool, item in tools
+    )
     if week.get("session_injections"):
         avg = round(week["session_injection_tokens"] / week["session_injections"])
-        tool_rows += (f'<li>会话开头注入 <span class="act-meta">{week["session_injections"]} 次 · '
-                      f'平均 {avg:,} token</span></li>')
-    rank_rows = "".join(
-        f'<li>第 {escape(rank)} 名 <span class="act-meta">被读 {count} 次</span></li>'
-        for rank, count in (week.get("read_ranks") or {}).items()
-    ) or '<li class="act-meta">近 7 天没有读取过搜索结果</li>'
+        tool_rows += (f'<tr><td>会话开头注入</td><td>{week["session_injections"]}</td>'
+                      f'<td>{week["session_injection_tokens"]:,}</td><td>{avg:,}</td></tr>')
+    tool_html = (
+        '<table class="usage-table"><thead><tr><th>工具</th><th>次数</th><th>token</th><th>平均</th></tr></thead>'
+        f'<tbody>{tool_rows}</tbody></table>'
+        if tool_rows else '<p class="act-meta">还没有带大小的记录：重启客户端后的新调用才会记录 token。</p>'
+    )
+    ranks = list((week.get("read_ranks") or {}).items())
+    top = max((count for _, count in ranks), default=0)
+    rank_html = "".join(
+        f'<li><span class="usage-rank">#{escape(rank)}</span>'
+        f'<progress class="usage-bar" max="100" value="{max(4, round(count * 100 / top))}">{count}</progress>'
+        f'<span class="usage-count">{count}</span></li>'
+        for rank, count in ranks
+    ) if top else ""
+    rank_html = (f'<ul class="usage-ranks" role="list">{rank_html}</ul>' if rank_html
+                 else '<p class="act-meta">近 7 天没有读取过搜索结果。</p>')
     note = ("token 为估算值：中文 1 字约 1 token，其他约 4 字符 1 token。"
             "「被读取」指同一客户端在下一次搜索前、30 分钟内读了这条结果。")
     return f"""
         <section class="activity-usage" aria-labelledby="usage-heading">
-          <h3 id="usage-heading">上下文用量 <span class="act-meta">{escape(note)}</span></h3>
-          <div class="desk-stats usage-stats">{card_html}</div>
-          <div class="activity-cols usage-cols">
-            <div><h3>近 7 天按工具</h3><ul role="list">{tool_rows}</ul></div>
-            <div><h3>被读结果的名次</h3><ul role="list">{rank_rows}</ul></div>
+          <div class="usage-head"><h3 id="usage-heading">上下文用量</h3>
+            <span class="usage-hint" title="{escape(note)}">估算 ⓘ</span></div>
+          <div class="usage-stats">{stat_html}</div>
+          <div class="usage-cols">
+            <div><h4>近 7 天按工具</h4>{tool_html}</div>
+            <div><h4>被读结果在搜索中的名次</h4>{rank_html}</div>
           </div>
         </section>"""
 
