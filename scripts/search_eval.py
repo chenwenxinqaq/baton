@@ -8,6 +8,11 @@ the current library with each ranker and reports hit@1, hit@3, hit@5 and MRR.
 The set is biased: the AI only read what the old ranker showed it, so a new
 ranker is compared on the old ranker's home ground. Use it to catch
 regressions, not to prove large gains.
+
+With --cases FILE it instead reads a hand-labeled set, a JSON list of
+``[query, [relevant refs]]`` pairs (or objects with "query"/"relevant" and an
+optional "library", default "*"). Keep such a file outside the repository when
+the queries or refs describe private work.
 """
 
 import argparse
@@ -43,6 +48,24 @@ def build_cases(events):
             continue
         seen.add(key)
         cases.append({"query": query, "library": library, "relevant": read})
+    return cases
+
+
+def load_cases(path, library="*"):
+    """Read hand-labeled cases: [query, [refs]] pairs or {"query", "relevant"} objects."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    cases = []
+    for row in raw:
+        if isinstance(row, dict):
+            query, relevant = row.get("query", ""), row.get("relevant") or []
+            lib = row.get("library") or library
+        else:
+            query, relevant = row[0], list(row[1])
+            lib = row[2] if len(row) > 2 else library
+        query = (query or "").strip()
+        if not query or not relevant:
+            continue
+        cases.append({"query": query, "library": lib, "relevant": list(relevant)})
     return cases
 
 
@@ -83,14 +106,20 @@ def main(argv=None):
     parser.add_argument("--days", type=float, default=0, help="Only use searches from the last N days (0 = all).")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--details", action="store_true", help="Include per-query ranks.")
+    parser.add_argument("--cases", help="Hand-labeled JSON case file; skips the audit log.")
+    parser.add_argument("--library", default="*", help="Library for hand-labeled cases without one.")
     args = parser.parse_args(argv)
 
     from server import WorkspaceStore
 
     since = time.time() - args.days * 86400 if args.days else None
+    if args.cases:
+        cases = load_cases(args.cases, library=args.library)
+    else:
+        cases = build_cases(audit_log.read_events(since=since))
     store = WorkspaceStore(args.memory_root)
     try:
-        report = evaluate(store, build_cases(audit_log.read_events(since=since)), limit=args.limit)
+        report = evaluate(store, cases, limit=args.limit)
     finally:
         store.shutdown()
     if not args.details:
