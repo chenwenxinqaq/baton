@@ -2,10 +2,12 @@
 """Zero-dependency MCP stdio server for the unified L0-L4 Markdown memory library."""
 
 import argparse
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -58,6 +60,16 @@ INDEX_LINK_RE = re.compile(
 )
 CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 ALNUM_RUN_RE = re.compile(r"[a-z0-9_.-]{2,}")
+WORD_RUN_RE = re.compile(r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?")
+WORD_PART_RE = re.compile(r"[a-z0-9]+")
+# BM25F field weights: a match in the entry name or title says more than one in the body.
+BM25F_FIELDS = (("name", 3.0), ("title", 3.0), ("description", 2.0), ("body", 1.0))
+BM25_K1 = 1.2
+HYBRID_BM25_WEIGHT = 3.0
+BM25_B = 0.75
+# "hybrid" adds weighted BM25F to the older fixed field points; on the audit-log
+# eval set (scripts/search_eval.py, 30 cases, 2026-11-24) it beat both alone.
+SEARCH_RANKERS = ("hybrid", "bm25f", "legacy")
 TEMPORAL_CUE_RE = re.compile(
     r"(刚刚|刚才|最近|最新|近期|今天|今日|昨天|本周|这周|近期工作|最近工作|最近进展|recent|latest|today)",
     re.IGNORECASE,
@@ -305,6 +317,73 @@ def build_query_features(query):
                         seen.add(bg)
                         subtokens.append(bg)
     return raw_terms, subtokens
+
+
+def search_ranker(ranker=None):
+    """Return the ranker name to use; unknown values fall back to the default."""
+    chosen = (ranker or os.environ.get("UNIFIED_MEMORY_SEARCH_RANKER") or SEARCH_RANKERS[0]).strip().lower()
+    return chosen if chosen in SEARCH_RANKERS else SEARCH_RANKERS[0]
+
+
+def search_tokens(text_cf):
+    """Split casefolded text into BM25 terms: word parts, compound words, and CJK bigrams.
+
+    ``docker-build-cache-fix`` yields the compound plus ``docker``, ``build``...
+    so a query for either form matches. Single-letter parts are dropped.
+    """
+    tokens = []
+    for run in WORD_RUN_RE.findall(text_cf):
+        parts = WORD_PART_RE.findall(run)
+        if len(parts) > 1:
+            tokens.append(run)
+        tokens.extend(part for part in parts if len(part) > 1)
+    for run in CJK_RUN_RE.findall(text_cf):
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return tokens
+
+
+def bm25f_scores(docs, query_terms):
+    """Score docs (dicts of casefolded field text) with BM25F over this collection.
+
+    Field term frequencies are length-normalised per field, weighted by
+    BM25F_FIELDS, summed, then saturated once per term with BM25_K1. IDF uses
+    the documents passed in, so scores are comparable only within one call.
+    """
+    terms = list(dict.fromkeys(query_terms))
+    if not docs or not terms:
+        return [0.0] * len(docs)
+    counted = []
+    totals = {field: 0 for field, _ in BM25F_FIELDS}
+    df = Counter()
+    for doc in docs:
+        fields = {}
+        present = set()
+        for field, _ in BM25F_FIELDS:
+            toks = search_tokens(doc.get(field, ""))
+            totals[field] += len(toks)
+            counts = Counter(toks)
+            fields[field] = (counts, len(toks))
+            present.update(t for t in terms if t in counts)
+        df.update(present)
+        counted.append(fields)
+    n = len(docs)
+    avg = {field: (totals[field] / n) or 1.0 for field in totals}
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in terms}
+    scores = []
+    for fields in counted:
+        score = 0.0
+        for t in terms:
+            if not df[t]:
+                continue
+            tf = 0.0
+            for field, weight in BM25F_FIELDS:
+                counts, length = fields[field]
+                if counts[t]:
+                    tf += weight * counts[t] / (1 - BM25_B + BM25_B * length / avg[field])
+            if tf:
+                score += idf[t] * tf / (BM25_K1 + tf)
+        scores.append(score)
+    return scores
 
 
 def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
@@ -666,9 +745,15 @@ class MemoryStore:
                 raise ValueError(f"Memory path is not a regular file: {md}")
             yield md
 
-    def search(self, query, layer="", include_archived=False, limit=10):
-        """Search entries by query terms, CJK bigrams, and temporal recency cues."""
+    def search(self, query, layer="", include_archived=False, limit=10, ranker=None):
+        """Search entries by query terms, CJK bigrams, and temporal recency cues.
+
+        ``score_fields`` decides which entries match. ``ranker`` decides their
+        order: "hybrid" (default, fixed field points + weighted BM25F),
+        "bm25f", or "legacy"; overridable with UNIFIED_MEMORY_SEARCH_RANKER.
+        """
         capped_limit = max(1, min(int(limit), 50))
+        ranker = search_ranker(ranker)
         q_stripped = query.strip()
         if not q_stripped:
             return self.list_entries(layer=layer, include_archived=include_archived, sort="updated")[:capped_limit]
@@ -711,8 +796,23 @@ class MemoryStore:
         raw_terms, subtokens = build_query_features(effective_q)
         now_ep = datetime.now().astimezone().timestamp()
 
+        bm25 = []
+        if ranker in ("bm25f", "hybrid"):
+            bm25 = bm25f_scores(
+                [
+                    {
+                        "name": it["name"].casefold(),
+                        "title": it["title"].casefold(),
+                        "description": it["description"].casefold(),
+                        "body": it["body"].casefold(),
+                    }
+                    for it in all_items
+                ],
+                search_tokens(effective_q.casefold()),
+            )
+
         results = []
-        for item in all_items:
+        for pos, item in enumerate(all_items):
             score, matched = score_fields(
                 raw_terms,
                 subtokens,
@@ -723,13 +823,20 @@ class MemoryStore:
             )
             if score == 0:
                 continue
+            legacy_score = score
+            if bm25:
+                # Substring-only matches (e.g. "dock") have no BM25 term hit; keep them last.
+                if ranker == "hybrid":
+                    score = round(legacy_score + HYBRID_BM25_WEIGHT * bm25[pos], 3)
+                else:
+                    score = round(bm25[pos], 3) or 0.001
 
             if has_temporal_cue:
                 age_sec = max(0.0, now_ep - item["updated_epoch"])
                 if age_sec <= 86400:
-                    score += 6
+                    score += 1.0 if ranker == "bm25f" else 6
                 elif age_sec <= 7 * 86400:
-                    score += 3
+                    score += 0.5 if ranker == "bm25f" else 3
 
             snippet = ""
             for line in item["body"].splitlines():
@@ -752,13 +859,15 @@ class MemoryStore:
                     "created_at": item["created_at"],
                     "updated_at": item["updated_at"],
                     "_updated_epoch": item["updated_epoch"],
+                    "_legacy_score": legacy_score,
                     "snippet": snippet or first_summary_snippet(item["body"]),
                 }
             )
 
-        results.sort(key=lambda r: (-r["score"], -r["_updated_epoch"], r["layer"], r["path"]))
+        results.sort(key=lambda r: (-r["score"], -r["_legacy_score"], -r["_updated_epoch"], r["layer"], r["path"]))
         for r in results:
             r.pop("_updated_epoch", None)
+            r.pop("_legacy_score", None)
         return results[:capped_limit]
 
     def list_entries(self, layer="", include_archived=False, sort="updated"):
@@ -1277,15 +1386,20 @@ class WorkspaceStore:
             raise ValueError("; ".join(errors))
         return results
 
-    def search(self, query, layer="", include_archived=False, limit=10, library="personal"):
+    def search(self, query, layer="", include_archived=False, limit=10, library="personal", ranker=None):
         capped_limit = max(1, min(int(limit), 50))
         stores = self._target_stores(library)
         if len(stores) == 1:
-            return stores[0].search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+            return stores[0].search(
+                query, layer=layer, include_archived=include_archived, limit=capped_limit, ranker=ranker
+            )
 
         merged = []
         for st, hits in self._per_store(
-            stores, lambda st: st.search(query, layer=layer, include_archived=include_archived, limit=capped_limit)
+            stores,
+            lambda st: st.search(
+                query, layer=layer, include_archived=include_archived, limit=capped_limit, ranker=ranker
+            ),
         ):
             for hit in hits:
                 try:

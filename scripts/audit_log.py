@@ -227,6 +227,29 @@ def _day_start(now):
 FOLLOW_WINDOW_SECONDS = 30 * 60
 
 
+def search_reads(events):
+    """Yield (search event, refs read after it) for every successful MCP search.
+
+    A read follows a search when the same client calls memory_read before its
+    next search and within FOLLOW_WINDOW_SECONDS. The read refs are returned
+    in read order and may include refs the search did not return.
+    """
+    calls = [e for e in events if e.get("source") == "mcp" and e.get("ok", True)]
+    for i, e in enumerate(calls):
+        if e.get("tool") != "memory_search":
+            continue
+        client = e.get("client")
+        read = []
+        for later in calls[i + 1:]:
+            if later.get("client") != client:
+                continue
+            if later.get("t", 0) - e.get("t", 0) > FOLLOW_WINDOW_SECONDS or later.get("tool") == "memory_search":
+                break
+            if later.get("tool") == "memory_read" and later.get("ref") and later["ref"] not in read:
+                read.append(later["ref"])
+        yield e, read
+
+
 def usage_stats(events):
     """Measure how much memory context clients received and how much of it they used.
 
@@ -248,21 +271,11 @@ def usage_stats(events):
 
     searches = returned = used = unused_searches = 0
     rank_counter = Counter()
-    for i, e in enumerate(calls):
-        if e.get("tool") != "memory_search":
-            continue
+    for e, read in search_reads(calls):
         searches += 1
         refs = [r for r in e.get("refs") or [] if r]
         returned += int(e.get("hits") or len(refs))
-        client = e.get("client")
-        read = set()
-        for later in calls[i + 1:]:
-            if later.get("client") != client:
-                continue
-            if later.get("t", 0) - e.get("t", 0) > FOLLOW_WINDOW_SECONDS or later.get("tool") == "memory_search":
-                break
-            if later.get("tool") == "memory_read" and later.get("ref") in refs:
-                read.add(later["ref"])
+        read = {ref for ref in read if ref in refs}
         used += len(read)
         if not read:
             unused_searches += 1
