@@ -54,6 +54,9 @@ ALLOWED_LAYER_TYPES = {
 }
 VALID_TOPIC_TYPES = {"user", "feedback", "project", "reference"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+TRASH_FILE_RE = re.compile(r"^(\d{8}-\d{6})-(.+)-([0-9a-f]{4})\.md$")
+# Why a backup exists, keyed by the slug prefix _backup_to_trash writes.
+TRASH_REASONS = {"": "update", "user": "update", "migrated": "layer-change", "archive": "archive"}
 INDEX_LAYER_RE = re.compile(r"^## (L[0-4])(?:\s|$)")
 INDEX_LINK_RE = re.compile(
     r"^\s*[-*+]\s+\[(.+?)\]\((?:<([^>]+)>|([^\s()]+))\)(?:\s+[—–-]\s+(.+))?$"
@@ -1301,6 +1304,121 @@ class MemoryStore:
 
         atomic_write(self.index_path, "\n".join(cleaned_lines) + "\n")
 
+    def _current_entry_path(self, name):
+        """Return the relative path of the live entry with this slug, if any."""
+        for layer, folder in LAYER_DIRS.items():
+            if layer not in self.allowed_layers:
+                continue
+            if (self.root / folder / f"{name}.md").is_file():
+                return f"{folder}/{name}.md", layer, False
+        if self.allow_user_managed and (self.root / "user-managed" / f"{name}.md").is_file():
+            return f"user-managed/{name}.md", "", True
+        return "", "", False
+
+    def entry_history(self, name, limit=10):
+        """List the saved previous versions of an entry kept in local trash backups."""
+        if not NAME_RE.fullmatch(name):
+            raise ValueError("Invalid entry name.")
+        wanted = {
+            name: "update",
+            f"user-{name}": "update",
+            f"migrated-{name}": "layer-change",
+            f"archive-{name}": "archive",
+            f"archive-user-{name}": "archive",
+        }
+        versions = []
+        if self.trash_dir.is_dir():
+            for path in sorted(self.trash_dir.iterdir()):
+                match = TRASH_FILE_RE.match(path.name)
+                if not match or match.group(2) not in wanted:
+                    continue
+                stamp = match.group(1)
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                meta, body = parse_frontmatter(text)
+                versions.append({
+                    "version": path.name,
+                    "saved_at": (
+                        f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T"
+                        f"{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}"
+                    ),
+                    "reason": wanted[match.group(2)],
+                    "updated_at": str(meta.get("updated_at") or "").strip(),
+                    "title": meta.get("title") or extract_title(body, name),
+                    "chars": len(body),
+                })
+        versions.sort(key=lambda row: row["saved_at"], reverse=True)
+        rel_path, layer, user_managed = self._current_entry_path(name)
+        result = {
+            **self._result_metadata(),
+            "name": name,
+            "current": {"path": rel_path, "layer": layer, "user_managed": user_managed} if rel_path else None,
+            "versions": versions[: max(1, int(limit or 10))],
+            "total_versions": len(versions),
+        }
+        if versions:
+            result["notice"] = (
+                "Read a version with memory_restore(..., dry_run=true) first; restoring"
+                " backs up the current version, so nothing is lost either way."
+            )
+        return result
+
+    def restore_entry(self, version, name="", layer="", dry_run=False):
+        """Put a saved previous version back as the current entry (or just show it)."""
+        if self.mode == "ro" and not dry_run:
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        version = (version or "").strip()
+        match = TRASH_FILE_RE.match(version)
+        if not match or "/" in version or "\\" in version:
+            raise ValueError("version must be a backup file name from memory_history.")
+        backup = self.trash_dir / version
+        if not backup.is_file():
+            raise ValueError(f"No saved version named {version} in this library.")
+        text = backup.read_text(encoding="utf-8", errors="replace")
+        meta, body = parse_frontmatter(text)
+        slug = (name or "").strip() or str(meta.get("name") or "").strip()
+        if not slug:
+            slug = re.sub(r"^(?:user|migrated|archive|archive-user)-", "", match.group(2))
+        if not NAME_RE.fullmatch(slug):
+            raise ValueError("Could not tell which entry this version belongs to; pass name explicitly.")
+        rel_path, cur_layer, user_managed = self._current_entry_path(slug)
+        target_layer = (layer or "").strip() or cur_layer or str(meta.get("layer") or "").strip()
+        if user_managed and not layer:
+            target_layer = target_layer or "L2"
+        if target_layer not in LAYER_DIRS:
+            raise ValueError("Pass layer=L0..L4: this version does not record which layer it came from.")
+        title = meta.get("title") or extract_title(body, slug)
+        description = str(meta.get("description") or "").strip() or title
+        if dry_run:
+            return {
+                **self._result_metadata(),
+                "version": version,
+                "name": slug,
+                "layer": target_layer,
+                "would_replace": rel_path or None,
+                "title": title,
+                "chars": len(body),
+                "content": text,
+                "restored": False,
+            }
+        res = self.upsert_entry(
+            layer=target_layer,
+            name=slug,
+            title=title,
+            description=description,
+            body=body,
+            topic_type=str(meta.get("type") or "").strip(),
+            user_managed=user_managed,
+        )
+        res["restored"] = True
+        res["restored_from"] = version
+        res.pop("related", None)
+        res.pop("notice", None)
+        res.pop("content_warning", None)
+        return res
+
     def archive_entry(self, name, user_managed=False):
         """Archive a user-managed entry or move a standard topic into archive/."""
         if self.mode == "ro":
@@ -1666,6 +1784,14 @@ class WorkspaceStore:
         store = self._resolve_single_store(library or "personal")
         return store.archive_entry(name=name, user_managed=user_managed)
 
+    def entry_history(self, name, limit=10, library="personal"):
+        store = self._resolve_single_store(library or "personal")
+        return store.entry_history(name=name, limit=limit)
+
+    def restore_entry(self, version, name="", layer="", dry_run=False, library="personal"):
+        store = self._resolve_single_store(library or "personal")
+        return store.restore_entry(version=version, name=name, layer=layer, dry_run=dry_run)
+
 
 TOOLS = [
     {
@@ -1738,6 +1864,34 @@ TOOLS = [
         },
     },
     {
+        "name": "memory_history",
+        "description": "List the saved previous versions of an entry, so a wrong or lossy write can be inspected and put back. Defaults to the personal library.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Entry slug name (the file stem, without .md)."},
+                "limit": {"type": "integer", "default": 10},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal')."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "memory_restore",
+        "description": "Put a previous version from memory_history back as the current entry; the version being replaced is backed up first. Use dry_run=true to read a version without changing anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "version": {"type": "string", "description": "A 'version' value returned by memory_history."},
+                "name": {"type": "string", "default": "", "description": "Entry slug, only needed when the version cannot tell."},
+                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": "", "description": "Target layer, only needed when the entry no longer exists."},
+                "dry_run": {"type": "boolean", "default": False, "description": "Return the saved content without writing it back."},
+                "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal')."},
+            },
+            "required": ["version"],
+        },
+    },
+    {
         "name": "memory_archive",
         "description": "Archive a user-managed entry or move an L0-L3 entry to archive/ (L4). Defaults to the personal library.",
         "inputSchema": {
@@ -1789,7 +1943,7 @@ def _audit_event(name, args, data, ok, ms, error="", result=None):
     elif isinstance(data, dict):
         ev["ref"] = data.get("ref") or data.get("path") or data.get("to")
         ev["library"] = data.get("library") or ev.get("library")
-        if name in ("memory_upsert", "memory_archive"):
+        if name in ("memory_upsert", "memory_archive", "memory_restore"):
             ev["action"] = data.get("status") or data.get("action")
     return ev
 
@@ -1862,6 +2016,21 @@ def _handle_tool_call(store, name, args):
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.upsert_entry(**kwargs)
+    elif name == "memory_history":
+        kwargs = dict(name=args["name"], limit=int(args.get("limit", 10) or 10))
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "personal")
+        data = store.entry_history(**kwargs)
+    elif name == "memory_restore":
+        kwargs = dict(
+            version=args["version"],
+            name=args.get("name", "") or "",
+            layer=args.get("layer", "") or "",
+            dry_run=bool(args.get("dry_run", False)),
+        )
+        if isinstance(store, WorkspaceStore):
+            kwargs["library"] = args.get("library", "personal")
+        data = store.restore_entry(**kwargs)
     elif name == "memory_archive":
         kwargs = dict(
             name=args["name"],
