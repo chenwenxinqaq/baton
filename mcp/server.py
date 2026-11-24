@@ -248,6 +248,10 @@ SECTION_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 # Progressive disclosure: large entries get a section outline so an agent can read
 # one section instead of the whole file (MemGPT-style paging over Markdown).
 OUTLINE_MIN_CHARS = 1200
+# Entries that cite each other turn a flat library into a small graph: reading one
+# conclusion shows the neighbours worth reading next (A-MEM, HippoRAG).
+ENTRY_LINK_RE = re.compile(r"\b(constraints|methods|preferences|projects|archive|user-managed)/([A-Za-z0-9][A-Za-z0-9._-]*)\.md\b")
+MAX_ENTRY_LINKS = 5
 
 
 def heading_line(preamble):
@@ -1084,7 +1088,39 @@ class MemoryStore:
         result = {**base, "partial": False, "content": text}
         if len(sections) >= 2 and len(text) >= OUTLINE_MIN_CHARS:
             result["sections"] = section_outline(sections)
+        links, backlinks = self.entry_links(rel_posix, body)
+        if links:
+            result["links"] = links
+        if backlinks:
+            result["backlinks"] = backlinks
         return result
+
+    def entry_links(self, rel_posix, body, limit=MAX_ENTRY_LINKS):
+        """Entries this one cites, and entries that cite it.
+
+        The index lists every entry, so links from MEMORY.md say nothing.
+        """
+        if rel_posix == self.index_path.name:
+            return [], []
+        wanted = {}
+        for folder, stem in ENTRY_LINK_RE.findall(body):
+            ref = f"{folder}/{stem}.md"
+            if ref != rel_posix:
+                wanted.setdefault(ref, True)
+        entries = {}
+        backlinks = []
+        for item in self.collect_entries(include_archived=True):
+            entries[item["path"]] = item
+            if item["path"] == rel_posix:
+                continue
+            if rel_posix in (item.get("body") or ""):
+                backlinks.append({"ref": self._entry_ref(item["path"]), "title": item.get("title", "")})
+        links = [
+            {"ref": self._entry_ref(ref), "title": entries[ref].get("title", "")}
+            for ref in wanted
+            if ref in entries
+        ]
+        return links[:limit], backlinks[:limit]
 
     def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False,
                      expected_updated_at=""):

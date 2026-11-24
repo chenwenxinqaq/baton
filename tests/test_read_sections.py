@@ -84,3 +84,29 @@ class ReadSectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntryLinkTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = _store(Path(tmp.name), "personal")
+        self.store.upsert_entry("L1", "docker-cache", "Docker 构建缓存排查",
+                                "缓存失效的根因", "2026-11-20 验证：改挂载顺序后缓存命中。")
+        self.store.upsert_entry("L3", "demo-status", "demo 项目进展",
+                                "构建已通过",
+                                "构建问题的根因见 methods/docker-cache.md，以及 methods/missing.md。")
+
+    def test_read_shows_cited_entries_and_citing_entries(self):
+        cited = self.store.read_entry("methods/docker-cache.md")
+        self.assertNotIn("links", cited)
+        self.assertEqual(cited["backlinks"], [{"ref": "projects/demo-status.md", "title": "demo 项目进展"}])
+
+        citing = self.store.read_entry("projects/demo-status.md")
+        self.assertEqual(citing["links"], [{"ref": "methods/docker-cache.md", "title": "Docker 构建缓存排查"}])
+        self.assertNotIn("backlinks", citing)
+
+    def test_index_links_are_skipped(self):
+        res = self.store.read_entry("MEMORY.md")
+        self.assertNotIn("links", res)
+        self.assertNotIn("backlinks", res)
