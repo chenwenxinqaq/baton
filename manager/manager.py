@@ -608,6 +608,46 @@ class Library:
         result = store.restore_entry(version)
         return result.get("path", "")
 
+    def version_diff(self, version):
+        """Return a unified diff between one saved backup version and the live entry."""
+        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
+        preview = store.restore_entry(version, dry_run=True)
+        _, backup_body = mcp_server.parse_frontmatter(preview.get("content") or "")
+        backup_lines = backup_body.strip().splitlines()
+        current_rel = preview.get("would_replace") or ""
+        current_body = ""
+        if current_rel:
+            cur_path = (self.root / current_rel).resolve()
+            if cur_path.is_relative_to(self.root) and cur_path.is_file():
+                _, current_body = mcp_server.parse_frontmatter(cur_path.read_text(encoding="utf-8", errors="replace"))
+        current_lines = current_body.strip().splitlines()
+        diff_lines = list(
+            difflib.unified_diff(
+                backup_lines,
+                current_lines,
+                fromfile=f"历史备份 ({preview.get('version') or version})",
+                tofile=f"当前版本 ({current_rel or preview.get('name') or ''})",
+                lineterm="",
+                n=3,
+            )
+        )
+        added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+        removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+        max_lines = 300
+        return {
+            "version": preview.get("version") or version,
+            "title": preview.get("title") or "",
+            "layer": preview.get("layer") or "",
+            "chars": preview.get("chars") or len(backup_body),
+            "verified_at": preview.get("verified_at") or "",
+            "valid_until": preview.get("valid_until") or "",
+            "added": added,
+            "removed": removed,
+            "identical": not diff_lines,
+            "diff_lines": diff_lines[:max_lines],
+            "truncated": len(diff_lines) > max_lines,
+        }
+
     def read_markdown(self, path, resource_roots=()):
         resolved = path.resolve(strict=True)
         allowed = resolved.is_relative_to(self.root) or any(resolved.is_relative_to(r) for r in resource_roots)
@@ -1603,23 +1643,34 @@ def render_topic_versions_html(token, library_key, slug, versions, readonly):
         saved = str(row.get("saved_at") or "").replace("T", " ")
         reason = VERSION_REASONS.get(row.get("reason"), "备份")
         chars = row.get("chars") or 0
+        ver = str(row.get("version") or "")
+        diff_btn = (
+            f'<button class="btn btn-ghost btn-compact" type="button" data-version-diff '
+            f'data-library="{escape(library_key)}" data-version="{escape(ver)}">对比差异</button>'
+        )
         action = ""
         if not readonly:
             action = f"""
               <form method="post" action="/restore_version#feedback" aria-label="恢复 {escape(saved)} 的版本">
                 {hidden("csrf", token)}{hidden("library", library_key)}
-                {hidden("version", str(row.get("version") or ""))}{hidden("slug", slug)}
+                {hidden("version", ver)}{hidden("slug", slug)}
                 <button class="btn btn-ghost btn-compact" type="submit">恢复此版本</button>
               </form>"""
         rows.append(
-            f'<li><span class="version-when">{escape(saved)}</span>'
+            f'<li>'
+            f'<div class="version-row-head">'
+            f'<span class="version-when">{escape(saved)}</span>'
             f'<span class="meta-chip">{escape(reason)}</span>'
-            f'<span class="version-size">{chars} 字</span>{action}</li>'
+            f'<span class="version-size">{chars} 字</span>'
+            f'<div class="version-actions">{diff_btn}{action}</div>'
+            f'</div>'
+            f'<div class="version-diff-slot" hidden></div>'
+            f'</li>'
         )
     return f"""
       <section class="detail-block" aria-labelledby="versions-title">
         <h2 class="block-title" id="versions-title">历史版本</h2>
-        <p class="block-hint">每次编辑、换层或归档前都会在本机备份一份。恢复会先备份当前版本，因此两个方向都不会丢内容。</p>
+        <p class="block-hint">每次编辑、换层或归档前都会在本机备份一份，可先「对比差异」再决定恢复；恢复会先备份当前版本，两个方向都不会丢内容。</p>
         <ul class="version-list">{"".join(rows)}</ul>
       </section>"""
 
@@ -4062,6 +4113,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/quick_search":
             self.handle_quick_search(parse_qs(url.query, max_num_fields=8))
             return
+        if url.path == "/version_diff":
+            self.handle_version_diff(parse_qs(url.query, max_num_fields=6))
+            return
         if url.path == "/sync_progress":
             self.show_sync_progress(parse_qs(url.query).get("job", [""])[0])
             return
@@ -4487,6 +4541,20 @@ class Handler(BaseHTTPRequestHandler):
             ql = q.casefold()
             actions = [a for a in actions if ql in a["title"].casefold() or ql in a["subtitle"].casefold()]
         self.respond_json(HTTPStatus.OK, {"query": q, "library": active_key, "items": items, "actions": actions})
+
+    def handle_version_diff(self, params):
+        key = params.get("library", ["primary"])[0]
+        version = (params.get("version", [""])[0] or "").strip()
+        library = self.server.libraries.get(key)
+        if library is None:
+            self.respond_json(HTTPStatus.NOT_FOUND, {"error": "记忆库不存在。"})
+            return
+        try:
+            payload = library.version_diff(version)
+        except (ValueError, OSError) as exc:
+            self.respond_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self.respond_json(HTTPStatus.OK, payload)
 
     def show_sync_progress(self, job_id):
         for key, job in self._sync_jobs_snapshot():

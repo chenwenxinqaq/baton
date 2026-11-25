@@ -357,6 +357,38 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertGreater(captured["payload"]["tokens"], 0)
         self.assertIn("明文凭据", captured["payload"]["secret_warning"])
 
+    def test_version_diff_endpoint_and_button(self):
+        import types
+        import manager as manager_mod
+
+        self._write("第一版步骤：\n- 运行构建\n")
+        self._write("第二版步骤：\n- 运行构建\n- 校验签名\n")
+        versions = self.library.topic_versions("docker-cache")
+        self.assertEqual(len(versions), 1)
+        ver = versions[0]["version"]
+
+        html_out = render_topic_versions_html("tok", "primary", "docker-cache", versions, False)
+        self.assertIn("data-version-diff", html_out)
+        self.assertIn("对比差异", html_out)
+        self.assertIn('class="version-diff-slot"', html_out)
+
+        captured = {}
+        handler = manager_mod.Handler.__new__(manager_mod.Handler)
+        handler.server = types.SimpleNamespace(libraries={"primary": self.library})
+        handler.respond_json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        handler.handle_version_diff({"library": ["primary"], "version": [ver]})
+        self.assertEqual(captured["status"], 200)
+        payload = captured["payload"]
+        self.assertFalse(payload["identical"])
+        self.assertGreaterEqual(payload["added"], 1)
+        self.assertTrue(any("+第二版步骤：" in ln or "+- 校验签名" in ln for ln in payload["diff_lines"]))
+
+        captured.clear()
+        handler.handle_version_diff({"library": ["primary"], "version": ["../evil.md"]})
+        self.assertEqual(captured["status"], 400)
+        self.assertIn("error", captured["payload"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -689,5 +689,86 @@
         menu.removeAttribute("open");
       }
     }
+    const diffBtn = event.target.closest("[data-version-diff]");
+    if (diffBtn) {
+      const li = diffBtn.closest("li");
+      const slot = li ? li.querySelector(".version-diff-slot") : null;
+      if (!slot) return;
+      if (!slot.hidden && slot.dataset.loaded === "1") {
+        slot.hidden = true;
+        diffBtn.textContent = "对比差异";
+        return;
+      }
+      if (slot.dataset.loaded === "1") {
+        slot.hidden = false;
+        diffBtn.textContent = "收起差异";
+        return;
+      }
+      const library = diffBtn.getAttribute("data-library") || currentLibraryKey();
+      const version = diffBtn.getAttribute("data-version") || "";
+      diffBtn.disabled = true;
+      diffBtn.textContent = "加载中…";
+      fetch(`/version_diff?library=${encodeURIComponent(library)}&version=${encodeURIComponent(version)}`, { cache: "no-store" })
+        .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
+        .then(({ ok, data }) => {
+          slot.replaceChildren();
+          if (!ok || data.error) {
+            const p = document.createElement("p");
+            p.className = "field-hint";
+            p.textContent = data.error || "无法加载版本差异。";
+            slot.appendChild(p);
+          } else if (data.identical) {
+            const p = document.createElement("p");
+            p.className = "field-hint";
+            p.textContent = "该历史备份与当前正文内容完全一致。";
+            slot.appendChild(p);
+          } else {
+            const summary = document.createElement("div");
+            summary.className = "version-diff-meta";
+            const stats = [];
+            if (data.added) stats.push(`当前新增 +${data.added} 行`);
+            if (data.removed) stats.push(`当前删去 -${data.removed} 行`);
+            if (data.verified_at) stats.push(`备份核实日期 ${data.verified_at}`);
+            if (data.valid_until) stats.push(`备份有效期 ${data.valid_until}`);
+            summary.textContent = stats.join(" · ") || "正文差异对比（备份 → 当前）";
+            slot.appendChild(summary);
+
+            const box = document.createElement("div");
+            box.className = "diff-view";
+            for (const line of data.diff_lines || []) {
+              const row = document.createElement("div");
+              let cls = "diff-ctx";
+              if (line.startsWith("+++") || line.startsWith("---")) cls = "diff-meta";
+              else if (line.startsWith("@@")) cls = "diff-hunk";
+              else if (line.startsWith("+")) cls = "diff-add";
+              else if (line.startsWith("-")) cls = "diff-del";
+              row.className = `diff-line ${cls}`;
+              row.textContent = line;
+              box.appendChild(row);
+            }
+            slot.appendChild(box);
+            if (data.truncated) {
+              const more = document.createElement("p");
+              more.className = "field-hint";
+              more.textContent = "差异较长，仅展示前 300 行。";
+              slot.appendChild(more);
+            }
+          }
+          slot.dataset.loaded = "1";
+          slot.hidden = false;
+          diffBtn.disabled = false;
+          diffBtn.textContent = "收起差异";
+        })
+        .catch(() => {
+          slot.replaceChildren();
+          const p = document.createElement("p");
+          p.className = "field-hint";
+          p.textContent = "无法加载版本差异。";
+          slot.appendChild(p);
+          slot.hidden = false;
+          diffBtn.disabled = false;
+          diffBtn.textContent = "重试对比";
+        });
+    }
   });
 })();
