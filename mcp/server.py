@@ -616,11 +616,13 @@ class MemoryStore:
         return out
 
     @staticmethod
-    def _check_expected_updated(expected_updated_at, old_meta, target):
+    def _check_expected_updated(expected_updated_at, old_meta=None, target=None):
         """Reject a write whose base version is stale (lost-update protection)."""
         expected = (expected_updated_at or "").strip()
         if not expected:
             return
+        if target is None:
+            raise ValueError("Entry changed since you read it: no current entry exists. Read it again before writing.")
         actual = str(old_meta.get("updated_at") or "").strip()
         if not actual:
             _, actual, _, _ = file_timestamps(target, old_meta)
@@ -1272,6 +1274,8 @@ class MemoryStore:
                     cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
                     if not topic_type and old_meta.get("type") in ALLOWED_LAYER_TYPES[layer]:
                         resolved_type = old_meta["type"]
+                else:
+                    self._check_expected_updated(expected_updated_at)
                 meta = {
                     "name": name,
                     "title": title,
@@ -1303,28 +1307,40 @@ class MemoryStore:
             target = self.root / folder / f"{name}.md"
             rel_path = f"{folder}/{name}.md"
 
-            # Find any existing entry (in target layer or another layer) to preserve created_at
-            stale_files = []
-            preserved_created = None
+            # A move replaces the live entry in its source layer, not the
+            # (usually absent) destination. Find and validate it under lock.
+            stale_files = [
+                (self.root / other_folder / f"{name}.md", f"{other_folder}/{name}.md")
+                for other_layer, other_folder in LAYER_DIRS.items()
+                if other_layer != layer and other_layer in self.allowed_layers
+                and (self.root / other_folder / f"{name}.md").is_file()
+            ]
+            current_paths = ([target] if target.is_file() else []) + [path for path, _ in stale_files]
+            if (expected_updated_at or "").strip() and len(current_paths) > 1:
+                raise ValueError(
+                    "Entry changed since you read it: multiple layers contain this name. "
+                    "Reconcile the duplicate entries before writing."
+                )
             previous = None
-            if target.is_file():
-                old_meta, old_body = parse_frontmatter(target.read_text(encoding="utf-8"))
-                self._check_expected_updated(expected_updated_at, old_meta, target)
-                backup = self._backup_to_trash(target, name)
-                previous = self._previous_receipt(old_meta, old_body, backup)
-                preserved_created, old_updated, _, _ = file_timestamps(target, old_meta)
-                ts_now = now_iso(old_updated)
-            for other_layer, other_folder in LAYER_DIRS.items():
-                if other_layer == layer or other_layer not in self.allowed_layers:
-                    continue
-                stale = self.root / other_folder / f"{name}.md"
-                if stale.is_file():
-                    if preserved_created is None:
-                        s_meta, _ = parse_frontmatter(stale.read_text(encoding="utf-8"))
-                        preserved_created, _, _, _ = file_timestamps(stale, s_meta)
-                    stale_files.append((stale, f"{other_folder}/{name}.md"))
-
+            preserved_created = None
+            prior_timestamps = []
+            for current in current_paths:
+                old_meta, old_body = parse_frontmatter(current.read_text(encoding="utf-8"))
+                if previous is None:
+                    self._check_expected_updated(expected_updated_at, old_meta, current)
+                created, updated, _, updated_epoch = file_timestamps(current, old_meta)
+                prior_timestamps.append((updated_epoch, updated))
+                backup_hint = name if current == target else f"migrated-{name}"
+                backup = self._backup_to_trash(current, backup_hint)
+                if previous is None:
+                    previous = self._previous_receipt(old_meta, old_body, backup)
+                    preserved_created = created
+            if prior_timestamps:
+                ts_now = now_iso(max(prior_timestamps)[1])
+            else:
+                self._check_expected_updated(expected_updated_at)
             cre_at = preserved_created or ts_now
+
             desc_val = json.dumps(description or title, ensure_ascii=False)
             formatted_body = body if body.lstrip().startswith("# ") else f"# {title}\n\n{body}"
             content = (
@@ -1359,7 +1375,6 @@ class MemoryStore:
 
             migrated_from = []
             for stale_path, stale_rel in stale_files:
-                self._backup_to_trash(stale_path, f"migrated-{name}")
                 stale_path.unlink(missing_ok=True)
                 migrated_from.append(stale_rel)
 

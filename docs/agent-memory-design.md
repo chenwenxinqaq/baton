@@ -35,6 +35,10 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   explicit conflict resolution. We cannot diff semantics in a Markdown store, so
   we do the cheap equivalent: compare-and-set on `updated_at`, a receipt for the
   version that was replaced, and a warning when a write shrinks an entry a lot.
+  MCP and desktop writes advance the timestamp under the same library lock.
+  A conditional move checks the source entry, even if the destination is empty;
+  a missing source or ambiguous same-name entries cause a conflict. This guard
+  is opt-in and does not detect out-of-band edits that keep `updated_at` intact.
 - **Duplicate hints** (`related` on a new entry). Mem0's update step and A-MEM
   (2502.12110) both avoid growing a pile of near-identical records. Before
   creating a new file we search for neighbours and tell the agent to fold them

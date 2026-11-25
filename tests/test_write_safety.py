@@ -72,6 +72,47 @@ class WriteSafetyTests(unittest.TestCase):
                     self._write("docker-cache", LONG, user_managed=user_managed, expected_updated_at=read["updated_at"])
                 self.assertIn("另一会话的新结论", self.store.read_entry(f"{path}/docker-cache.md")["content"])
 
+    def test_layer_move_compares_the_source_and_keeps_the_replaced_version(self):
+        with patch.object(mcp_server, "datetime", FrozenClock):
+            first = self._write("docker-cache", LONG)
+            fresh = self._write("docker-cache", "# Docker 构建缓存排查\n\n" + LONG + "最新结论。")
+            with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+                self._write("docker-cache", "旧会话试图换层。", layer="L3", expected_updated_at=first["updated_at"])
+            self.assertIn("最新结论", self.store.read_entry(first["path"])["content"])
+            self.assertFalse((self.store.root / "projects/docker-cache.md").exists())
+            self.assertEqual(self.store.entry_history("docker-cache")["total_versions"], 1)
+
+            moved = self._write("docker-cache", "移动后只留一句。", layer="L3", expected_updated_at=fresh["updated_at"])
+            self.assertEqual(moved["migrated_from"], [first["path"]])
+            self.assertEqual(moved["created_at"], first["created_at"])
+            self.assertGreater(datetime.fromisoformat(moved["updated_at"]), datetime.fromisoformat(fresh["updated_at"]))
+            self.assertEqual(moved["previous"]["updated_at"], fresh["updated_at"])
+            self.assertIn("最新结论", Path(moved["previous"]["backup"]).read_text(encoding="utf-8"))
+            self.assertIn("content_warning", moved)
+            self.assertFalse((self.store.root / first["path"]).exists())
+            self.assertIn(moved["path"], self.store.parse_index())
+            self.assertNotIn(first["path"], self.store.parse_index())
+            with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+                self._write("docker-cache", "旧会话试图写回原层。", expected_updated_at=fresh["updated_at"])
+
+    def test_conditional_write_cannot_recreate_a_deleted_entry(self):
+        for user_managed in (False, True):
+            with self.subTest(user_managed=user_managed):
+                old = self._write("docker-cache", LONG, user_managed=user_managed)
+                path = self.store.root / old["path"]
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, "no current entry exists"):
+                    self._write("docker-cache", "陈旧编辑。", user_managed=user_managed, expected_updated_at=old["updated_at"])
+                self.assertFalse(path.exists())
+
+    def test_conditional_move_refuses_duplicate_live_sources(self):
+        old = self._write("docker-cache", LONG)
+        (self.store.root / "projects/docker-cache.md").write_text("# 另一个版本\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "multiple layers contain this name"):
+            self._write("docker-cache", "不能猜要保留哪篇。", expected_updated_at=old["updated_at"])
+        self.assertTrue((self.store.root / "projects/docker-cache.md").is_file())
+        self.assertEqual(self.store.entry_history("docker-cache")["total_versions"], 0)
+
     def test_update_reports_the_version_it_replaced(self):
         self._write("docker-cache", LONG)
         res = self._write("docker-cache", LONG + "补充一句。")
