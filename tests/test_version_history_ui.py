@@ -1,10 +1,12 @@
 """The desktop UI must expose the same version history the agents can restore."""
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "manager"))
@@ -12,7 +14,8 @@ sys.path.insert(0, str(CODE / "scripts"))
 sys.path.insert(0, str(CODE / "mcp"))
 
 import server as mcp_server  # noqa: E402
-from manager import InvalidEntry, Library, render_topic_versions_html  # noqa: E402
+from manager import Entry, InvalidEntry, Library, render_topic_versions_html  # noqa: E402
+from test_write_safety import FrozenClock  # noqa: E402
 
 
 class VersionHistoryUITests(unittest.TestCase):
@@ -73,6 +76,26 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertIn("第一版结论", current)
         # Restoring backs up what it replaced, so the list grows instead of losing it.
         self.assertEqual(len(self.library.topic_versions("docker-cache")), 2)
+
+    def test_desktop_edits_invalidate_stale_agent_versions(self):
+        with patch.object(mcp_server, "datetime", FrozenClock):
+            first = self._write("第一版结论。")
+            current = self.library.read_topic(first["path"])
+            self.library.save_topic(current.path, current.revision, "L1", current.title,
+                                    current.description, "# Docker 构建缓存排查\n\n桌面改写。")
+            # A different client can have a good hash guard and still must advance
+            # the timestamp the agent used as its version token.
+            with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+                self.store.upsert_entry("L1", current.slug, current.title, current.description,
+                                        "旧会话改写。", expected_updated_at=first["updated_at"])
+
+            name = "handwritten"
+            self.library.save(Entry(name=name, title="手记", description="手记", body="原文"))
+            current = self.library.read(name)
+            self.library.save(replace(current, body="桌面改写。"))
+            with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+                self.store.upsert_entry("L2", name, current.title, current.description, "旧会话改写。",
+                                        user_managed=True, expected_updated_at=current.updated_at)
 
     def test_unknown_or_malformed_slugs_list_nothing(self):
         self._write("只写了一次。")

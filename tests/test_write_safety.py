@@ -1,9 +1,11 @@
 """Writes must not silently lose another session's edit or the previous version."""
 
+from datetime import datetime
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "scripts"))
@@ -14,6 +16,12 @@ import server as mcp_server  # noqa: E402
 from test_search_resilience import _store  # noqa: E402
 
 LONG = "排查步骤与证据。" * 80
+
+
+class FrozenClock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 11, 25, 12, 0, 0, 123456).astimezone(tz)
 
 
 class WriteSafetyTests(unittest.TestCase):
@@ -47,6 +55,22 @@ class WriteSafetyTests(unittest.TestCase):
         again = self._write("docker-cache", LONG + "新结论。", expected_updated_at=first["updated_at"])
         self.assertEqual(again["path"], "methods/docker-cache.md")
         self.assertIn("新结论", self.store.read_entry("methods/docker-cache.md")["content"])
+
+    def test_writes_change_the_version_even_with_a_frozen_clock(self):
+        for user_managed, path in ((False, "methods"), (True, "user-managed")):
+            with self.subTest(path=path), patch.object(mcp_server, "datetime", FrozenClock):
+                self._write("docker-cache", LONG, user_managed=user_managed)
+                read = self.store.read_entry(f"{path}/docker-cache.md")
+                updated = self._write(
+                    "docker-cache", "另一会话的新结论。", user_managed=user_managed,
+                    expected_updated_at=read["updated_at"],
+                )
+                self.assertGreater(
+                    datetime.fromisoformat(updated["updated_at"]), datetime.fromisoformat(read["updated_at"])
+                )
+                with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+                    self._write("docker-cache", LONG, user_managed=user_managed, expected_updated_at=read["updated_at"])
+                self.assertIn("另一会话的新结论", self.store.read_entry(f"{path}/docker-cache.md")["content"])
 
     def test_update_reports_the_version_it_replaced(self):
         self._write("docker-cache", LONG)

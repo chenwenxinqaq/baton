@@ -4,7 +4,7 @@
 import argparse
 from collections import Counter
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import fcntl
 import json
 import math
@@ -98,9 +98,17 @@ SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 
 
-def now_iso():
-    """Return local timezone-aware ISO 8601 timestamp with second precision."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+def now_iso(previous=""):
+    """Stamp a write newer than its previous version, even if the clock repeats."""
+    now = datetime.now().astimezone()
+    if previous:
+        try:
+            old, has_clock_time = parse_timestamp(previous)
+            if has_clock_time and old >= now:
+                now = old + timedelta(microseconds=1)
+        except (ValueError, OverflowError):
+            pass  # An unparseable legacy timestamp is not a clock floor.
+    return now.isoformat(timespec="microseconds")
 
 
 def local_tz():
@@ -1246,8 +1254,8 @@ class MemoryStore:
         if not user_managed and not (self.root / LAYER_DIRS[layer] / f"{name}.md").is_file():
             related = self._similar_entries(f"{title} {description}", name)
 
-        ts_now = now_iso()
         with self.write_lock():
+            ts_now = now_iso()
             if user_managed:
                 target = self.root / "user-managed" / f"{name}.md"
                 status = "active"
@@ -1257,6 +1265,7 @@ class MemoryStore:
                     old_text = target.read_text(encoding="utf-8")
                     old_meta, old_body = parse_frontmatter(old_text)
                     self._check_expected_updated(expected_updated_at, old_meta, target)
+                    ts_now = now_iso(file_timestamps(target, old_meta)[1])
                     backup = self._backup_to_trash(target, f"user-{name}")
                     previous = self._previous_receipt(old_meta, old_body, backup)
                     status = old_meta.get("status", "active")
@@ -1303,7 +1312,8 @@ class MemoryStore:
                 self._check_expected_updated(expected_updated_at, old_meta, target)
                 backup = self._backup_to_trash(target, name)
                 previous = self._previous_receipt(old_meta, old_body, backup)
-                preserved_created, _, _, _ = file_timestamps(target, old_meta)
+                preserved_created, old_updated, _, _ = file_timestamps(target, old_meta)
+                ts_now = now_iso(old_updated)
             for other_layer, other_folder in LAYER_DIRS.items():
                 if other_layer == layer or other_layer not in self.allowed_layers:
                     continue
@@ -1572,7 +1582,6 @@ class MemoryStore:
             raise ValueError(f"Layer L4 (archive) is not enabled in library '{self.library_id}'.")
         if not NAME_RE.fullmatch(name):
             raise ValueError("Invalid entry name.")
-        ts_now = now_iso()
         with self.write_lock():
             if user_managed:
                 target = self.root / "user-managed" / f"{name}.md"
@@ -1580,6 +1589,7 @@ class MemoryStore:
                     raise ValueError(f"User-managed entry not found: {name}")
                 self._backup_to_trash(target, f"archive-user-{name}")
                 meta, body = parse_frontmatter(target.read_text(encoding="utf-8"))
+                ts_now = now_iso(file_timestamps(target, meta)[1])
                 cre_at = meta.get("created_at") or meta.get("updated_at") or ts_now
                 ordered = {
                     "name": meta.get("name", name),
@@ -1617,7 +1627,8 @@ class MemoryStore:
                     idx_info = indexed.get(old_rel, {})
                     raw = candidate.read_text(encoding="utf-8")
                     meta, body = parse_frontmatter(raw)
-                    cre_at, _, _, _ = file_timestamps(candidate, meta)
+                    cre_at, old_updated, _, _ = file_timestamps(candidate, meta)
+                    ts_now = now_iso(old_updated)
                     title = idx_info.get("title") or extract_title(body, name)
                     fm_desc = meta.get("description") or idx_info.get("description") or title
                     idx_desc = idx_info.get("description") or fm_desc

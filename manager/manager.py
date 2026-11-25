@@ -697,7 +697,6 @@ class Library:
     def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type=""):
         self._ensure_writable(layer=layer)
         validate_common_fields(layer, title, description, body)
-        ts_now = mcp_server.now_iso()
         with self.write_lock():
             store = mcp_server.MemoryStore(self.root)
             _, current_topics = self.read_index()
@@ -731,6 +730,7 @@ class Library:
                 else:
                     fm_type = LAYERS[layer][1]
 
+                ts_now = mcp_server.now_iso(cur.updated_at)
                 cre_at = cur.created_at or ts_now
                 name_serialized = (
                     fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
@@ -771,6 +771,7 @@ class Library:
                 self._enqueue_async_sync(message)
                 return new_rel
 
+            ts_now = mcp_server.now_iso()
             final_slug = self._generate_unique_slug(title, slug)
             new_folder = mcp_server.LAYER_DIRS[layer]
             new_rel = f"{new_folder}/{final_slug}.md"
@@ -801,7 +802,6 @@ class Library:
 
     def archive_topic(self, topic_path, expected_revision):
         self._ensure_writable(layer="L4")
-        ts_now = mcp_server.now_iso()
         with self.write_lock():
             store = mcp_server.MemoryStore(self.root)
             _, current_topics = self.read_index()
@@ -820,6 +820,7 @@ class Library:
             if dest.exists():
                 raise InvalidEntry(f"归档目录已存在同名文件：{new_rel}")
 
+            ts_now = mcp_server.now_iso(cur.updated_at)
             cre_at = cur.created_at or ts_now
             fm_name = cur.meta_name or cur.slug
             name_serialized = (
@@ -914,6 +915,10 @@ class Library:
                     raise StaleEntry from exc
                 if entry.revision != current.revision:
                     raise StaleEntry
+                ts_now = mcp_server.now_iso(current.updated_at)
+            else:
+                ts_now = mcp_server.now_iso()
+            entry = replace(entry, updated_at=ts_now)
             staged = None
             try:
                 with NamedTemporaryFile(
@@ -4544,20 +4549,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if current.revision != revision:
                 raise StaleEntry
-            ts_now = mcp_server.now_iso()
             if saving:
                 validate_common_fields(entry.layer, entry.title, entry.description, entry.body)
                 new_name = fields.get("create_id", "")
                 if not name and not re.fullmatch(r"entry-[a-f0-9]{20}", new_name):
                     raise InvalidEntry("无法识别新条目，请刷新页面后重试。")
-                cre_at = current.created_at if name else ts_now
-                entry = replace(entry, name=name or new_name, created_at=cre_at, updated_at=ts_now)
+                entry = replace(entry, name=name or new_name, created_at=current.created_at)
                 notice = "saved"
             else:
                 if not name:
                     raise InvalidEntry("请选择一条记忆。")
                 state = "archived" if self.path == "/archive" else "active"
-                entry = replace(current, status=state, updated_at=ts_now)
+                entry = replace(current, status=state)
                 notice = "archived" if state == "archived" else "restored"
             library.save(entry)
         except (StaleEntry, FileNotFoundError, FileExistsError):
