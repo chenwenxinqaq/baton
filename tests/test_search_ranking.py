@@ -94,7 +94,7 @@ class StoreRankingTests(unittest.TestCase):
         ]
         cases = search_eval.build_cases(events)
         self.assertEqual(cases, [{"query": "docker 缓存", "library": "personal",
-                                  "relevant": ["methods/docker-build-cache-fix.md"]}])
+                                  "relevant": ["methods/docker-build-cache-fix.md"], "axis": "extraction"}])
 
         class _Wrap:
             def __init__(self, store):
@@ -107,6 +107,53 @@ class StoreRankingTests(unittest.TestCase):
         self.assertEqual(report["evaluated"], 1)
         for ranker in search_eval.RANKERS:
             self.assertEqual(report["rankers"][ranker]["hit@1"], 1.0, ranker)
+
+
+
+class MatchStrengthTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = _store(Path(self.tmp.name), "personal")
+        _write(self.store, "L1", "docker-build-cache-fix", "Docker 构建缓存失效排查", "COPY 顺序导致缓存失效", "调整 COPY 顺序。")
+        _write(self.store, "L1", "python-release", "Python 发布清单", "发布前检查", "偶尔提到 docker 镜像。")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_helper_levels(self):
+        self.assertEqual(mcp_server.match_strength(["a", "b"], ["a", "b"]), "full")
+        self.assertEqual(mcp_server.match_strength(["a", "b"], ["a"]), "partial")
+        self.assertEqual(mcp_server.match_strength(["构建方法"], ["构建", "方法"]), "fuzzy")
+
+    def test_search_reports_match_level(self):
+        hits = {h["path"]: h["match"] for h in self.store.search("docker 缓存")}
+        self.assertEqual(hits["methods/docker-build-cache-fix.md"], "full")
+        self.assertEqual(hits["methods/python-release.md"], "partial")
+        fuzzy = self.store.search("构建缓存问题")
+        self.assertTrue(fuzzy)
+        self.assertTrue(all(h["match"] == "fuzzy" for h in fuzzy))
+        self.assertEqual(self.store.search("最近")[0]["match"], "recent")
+
+    def test_eval_axes_and_abstention(self):
+        class _Wrap:
+            def __init__(self, store):
+                self.store = store
+
+            def search(self, query, limit=10, library="personal", ranker=None):
+                return self.store.search(query, limit=limit, ranker=ranker)
+
+        cases = search_eval.load_cases_from_rows([
+            ["docker 缓存", ["methods/docker-build-cache-fix.md"]],
+            {"query": "python 发布", "relevant": ["methods/python-release.md"], "axis": "update"},
+            {"query": "python 报销", "relevant": []},
+            {"query": "docker 缓存", "relevant": [], "axis": "abstention"},
+        ])
+        self.assertEqual([c["axis"] for c in cases], ["extraction", "update", "abstention", "abstention"])
+        report = search_eval.evaluate(_Wrap(self.store), cases, rankers=("legacy",))
+        self.assertEqual(report["evaluated"], 4)
+        self.assertEqual(report["rankers"]["legacy"]["abstention"], 0.5)
+        self.assertEqual(report["axes"]["update"]["legacy"]["hit@1"], 1.0)
+        self.assertEqual(report["axes"]["abstention"]["legacy"], {"pass": 0.5, "cases": 2})
 
 
 if __name__ == "__main__":

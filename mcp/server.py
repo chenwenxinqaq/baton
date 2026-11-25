@@ -496,6 +496,22 @@ def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
     return 0, []
 
 
+def match_strength(raw_terms, matched):
+    """How much of the query an entry covers: "full", "partial" or "fuzzy".
+
+    "full" means every query word appears in the entry. "partial" means only
+    some do. "fuzzy" means no whole word matched and the hit came from CJK
+    bigrams or alphanumeric fragments. LongMemEval (arXiv 2410.10813) scores
+    abstention: when memory lacks the answer, the agent should say so instead
+    of using the closest entry. Weak matches are the signal for that.
+    """
+    terms = set(raw_terms)
+    whole = terms & set(matched)
+    if not whole:
+        return "fuzzy"
+    return "full" if whole == terms else "partial"
+
+
 class MemoryStore:
     """Read, search, upsert, and archive entries in one L0-L4 Markdown library."""
 
@@ -906,6 +922,7 @@ class MemoryStore:
             return [
                 {
                     "score": 10,
+                    "match": "recent",
                     **self._result_metadata(),
                     "ref": self._entry_ref(it["path"]),
                     "path": it["path"],
@@ -977,6 +994,7 @@ class MemoryStore:
             results.append(
                 {
                     "score": score,
+                    "match": match_strength(raw_terms, matched),
                     **self._result_metadata(),
                     "ref": self._entry_ref(item["path"]),
                     "path": item["path"],
@@ -1880,7 +1898,7 @@ TOOLS = [
     },
     {
         "name": "memory_search",
-        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly.",
+        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly. Each hit has match=full (every space-separated query word found), partial (some words) or fuzzy (only fragments). Check the snippet before relying on partial or fuzzy hits, and say memory has no answer when none fits instead of using the closest entry.",
         "inputSchema": {
             "type": "object",
             "properties": {
