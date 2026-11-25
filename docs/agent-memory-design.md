@@ -43,7 +43,10 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   already existed under
   `~/.local/state/unified-memory/libraries/<hash>/trash/` but nothing could read
   them, so a bad overwrite was unrecoverable in practice. This is the
-  "gracefully invalidate, keep the old state" half of Zep made usable.
+  "gracefully invalidate, keep the old state" half of Zep made usable. The
+  desktop entry page lists the same versions and restores one in place
+  (`Library.topic_versions`, `/restore_version`), so a person who overwrote an
+  entry by hand gets back the recovery path the agents already had.
 - **Links and backlinks** (`links` / `backlinks` on a full read,
   `ENTRY_LINK_RE`). A-MEM builds Zettelkasten cards with bidirectional links;
   HippoRAG (2405.14831) and *From RAG to Memory* (2502.14802) argue that
