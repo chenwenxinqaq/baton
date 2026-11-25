@@ -148,9 +148,10 @@ def desktop_navigation(key, selected):
 
 
 def desktop_results(listing, layers, sources, sort_controls="", label="条目", count=0):
+    layer_bar = f'<nav class="desk-pills" aria-label="快速分层筛选">{"".join(layers)}</nav>' if layers else ""
+    source_bar = f'<nav class="desk-sources" aria-label="来源筛选">{sources}</nav>' if sources else ""
     return f'''<section class="desk-results"><div class="desk-tools"><h2>{label} · {count}</h2>
-      {sort_controls}</div><details class="desk-filter"><summary>筛选条件</summary>
-      <nav>{"".join(layers)}</nav><nav>{sources}</nav></details>{listing}</section>'''
+      {sort_controls}</div>{layer_bar}{source_bar}{listing}</section>'''
 
 
 def desktop_status_strip(key, library):
@@ -2695,7 +2696,7 @@ _LINT_CHECK_LABELS = {
 }
 
 
-def _daily_trend_section(daily):
+def _daily_trend_section(daily, pipeline=None):
     """Render a compact 7-day read/write trend chart so users can spot write-pipeline drops."""
     if not daily:
         return ""
@@ -2707,9 +2708,13 @@ def _daily_trend_section(daily):
         reads = day.get("reads", 0)
         writes = day.get("writes", 0)
         nudges = day.get("nudges", 0)
+        checkpoints = day.get("checkpoints", 0)
         r_step = max(1, min(10, round(reads * 10 / peak))) if peak and reads else 0
         w_step = max(1, min(10, round(writes * 10 / peak))) if peak and writes else 0
-        tip = f'{day.get("iso_date", day.get("date", ""))}：查询 {reads} 次 · 写入 {writes} 次 · 提醒 {nudges} 次'
+        tip = (
+            f'{day.get("iso_date", day.get("date", ""))}：查询 {reads} 次 · 写入 {writes} 次 · '
+            f'阶段提醒 {checkpoints} 次 · 沉淀提醒 {nudges} 次'
+        )
         cols.append(
             f'<div class="trend-col" title="{escape(tip)}">'
             f'<div class="trend-bars">'
@@ -2720,13 +2725,34 @@ def _daily_trend_section(daily):
             f'<span class="trend-day">{escape(day.get("date", ""))}</span>'
             f"</div>"
         )
+    pipeline_html = ""
+    if isinstance(pipeline, dict) and (pipeline.get("writes") or pipeline.get("nudges") or pipeline.get("checkpoints")):
+        pills = []
+        if pipeline.get("writes"):
+            append_cnt = pipeline.get("append_writes", 0)
+            pills.append(f'<span>增量追加 <strong>{append_cnt}/{pipeline["writes"]}</strong></span>')
+        if pipeline.get("checkpoints"):
+            pills.append(f'<span>阶段提醒 <strong>{pipeline["checkpoints"]}</strong> 次</span>')
+        if pipeline.get("nudges"):
+            rate = pipeline.get("nudge_conversion_rate")
+            rate_txt = "—" if rate is None else f"{rate * 100:.0f}%"
+            pills.append(
+                f'<span>提醒转化 <strong>{rate_txt}</strong> ({pipeline.get("nudge_conversions", 0)}/{pipeline["nudges"]})</span>'
+            )
+        if pipeline.get("write_p95_ms") is not None:
+            p95 = pipeline["write_p95_ms"]
+            slow_cnt = pipeline.get("slow_writes", 0)
+            slow_note = f' · <em class="act-err">{slow_cnt} 次慢写</em>' if slow_cnt else ""
+            pills.append(f'<span>写入 P95 <strong>{p95} ms</strong>{slow_note}</span>')
+        if pills:
+            pipeline_html = f'<div class="pipeline-strip">{"".join(pills)}</div>'
     return (
         '<section class="activity-usage" aria-labelledby="trend-heading">'
         '<div class="usage-head"><h3 id="trend-heading">近 7 天读写趋势</h3>'
         f'<span class="usage-hint">共查 {total_reads} 次 · 共写 {total_writes} 次 '
         '<span class="trend-legend"><i class="trend-dot trend-dot-read"></i>查询 '
         '<i class="trend-dot trend-dot-write"></i>写入</span></span></div>'
-        f'<div class="daily-trend">{"".join(cols)}</div></section>'
+        f'<div class="daily-trend">{"".join(cols)}</div>{pipeline_html}</section>'
     )
 
 
@@ -2738,23 +2764,25 @@ def _lint_edit_href(ref, key):
     return ""
 
 
-def _lint_section(key, root, token="", readonly=False, return_view=""):
+def _lint_section(key, root, token="", readonly=False, return_view="", return_meta=False):
     """Library health: the problems a curation pass should fix, worst first."""
     if not root:
-        return ""
+        return ("", False) if return_meta else ""
     try:
         report = mcp_server.MemoryStore(root).lint()
     except Exception:
-        return ""
+        return ("", False) if return_meta else ""
     findings = report.get("findings") or []
     if not findings:
-        return (
+        empty_html = (
             '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
             f'<span class="usage-hint">{report.get("entries", 0)} 条，没发现问题</span></div></section>'
         )
+        return (empty_html, False) if return_meta else empty_html
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (order.get(f["severity"], 3), f["ref"]))
     counts = report.get("summary", {}).get("by_severity", {})
+    urgent = bool(counts.get("error") or counts.get("warning"))
     chips = " · ".join(
         f"{label} {counts[sev]}"
         for sev, label in (("error", "需要修"), ("warning", "该看一眼"), ("info", "可以优化"))
@@ -2801,11 +2829,13 @@ def _lint_section(key, root, token="", readonly=False, return_view=""):
     if len(findings) > 8:
         lint_cmd = "umem lint" if key == "primary" else f"umem lint --library {key}"
         more = f'<li class="act-meta">还有 {len(findings) - 8} 条，运行 <code>{escape(lint_cmd)}</code> 看全部</li>'
-    return (
-        '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
+    section_cls = "activity-usage lint-urgent" if urgent else "activity-usage"
+    html_out = (
+        f'<section class="{section_cls}"><div class="usage-head"><h3>记忆库体检</h3>'
         f'<span class="usage-hint">{escape(chips)} {rebuild_btn}</span></div>'
         f'<ul class="lint-list" role="list">{"".join(rows)}{more}</ul></section>'
     )
+    return (html_out, urgent) if return_meta else html_out
 
 
 def render_activity_panel(key, agent_home=None, root=None, token="", readonly=False, return_view=""):
@@ -2876,22 +2906,29 @@ def render_activity_panel(key, agent_home=None, root=None, token="", readonly=Fa
     hit_rows = "".join(
         f'<li>{_ref_link(h["ref"], key, h.get("library"))} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
     ) or '<li class="act-meta">暂无高频命中</li>'
-    usage_section = _usage_section(summary.get("usage_today") or {}, summary.get("usage_7d") or {})
-    trend_section = _daily_trend_section(summary.get("daily") or [])
-    lint_section = _lint_section(key, root, token=token, readonly=readonly, return_view=return_view)
+    usage_week = summary.get("usage_7d") or {}
+    usage_section = _usage_section(summary.get("usage_today") or {}, usage_week)
+    trend_section = _daily_trend_section(summary.get("daily") or [], pipeline=usage_week.get("write_pipeline"))
+    lint_section, lint_urgent = _lint_section(
+        key, root, token=token, readonly=readonly, return_view=return_view, return_meta=True
+    )
+    checkpoint_note = f' · 阶段提醒 {summary["checkpoints_today"]} 次' if summary.get("checkpoints_today") else ""
+    ordered_sections = (
+        f"{lint_section}{trend_section}{usage_section}"
+        if lint_urgent
+        else f"{trend_section}{usage_section}{lint_section}"
+    )
 
     return f"""
       <section class="activity-panel" aria-labelledby="activity-heading">
         <div class="recent-panel-head">
           <div class="recent-panel-title">
             <h2 id="activity-heading">🤖 AI 读写动态</h2>
-            <span class="recent-stats">今日查询 {summary["reads_today"]} 次 · 今日写入 {summary["writes_today"]} 次 · 空结果搜索 {summary["empty_searches_today"]} 次 · 沉淀提醒 {summary["nudges_today"]} 次</span>
+            <span class="recent-stats">今日查询 {summary["reads_today"]} 次 · 今日写入 {summary["writes_today"]} 次 · 空结果搜索 {summary["empty_searches_today"]} 次{checkpoint_note} · 沉淀提醒 {summary["nudges_today"]} 次</span>
           </div>
         </div>
         <ul class="activity-clients" role="list">{"".join(client_rows) or '<li class="act-meta">尚无已接入客户端</li>'}</ul>
-        {trend_section}
-        {usage_section}
-        {lint_section}
+        {ordered_sections}
         <div class="activity-cols">
           <div><h3>最近写入</h3><ul role="list">{write_rows}</ul></div>
           <div><h3>最近查询</h3><ul role="list">{query_rows}</ul></div>
@@ -3582,13 +3619,18 @@ def render(
         detail_toolbar = f"""
           <a class="btn btn-primary btn-compact" href="{escape(edit_href)}">编辑手记</a>
           <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
-          <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{toggle_label}</a>
-          <form action="/{act}#feedback" method="post" aria-label="{act_label}当前条目">
-            {hidden("csrf", token)}{hidden("name", entry.name)}{hidden("revision", entry.revision)}
-            {hidden("library", key)}
-            <button class="btn btn-ghost btn-compact" type="submit">{act_label}</button>
-          </form>
-          <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
+          <details class="action-menu">
+            <summary class="btn btn-ghost btn-compact">更多 ▾</summary>
+            <div class="action-menu-pop">
+              <a class="action-menu-item" href="{escape(toggle_href)}">{toggle_label}</a>
+              <form action="/{act}#feedback" method="post" aria-label="{act_label}当前条目">
+                {hidden("csrf", token)}{hidden("name", entry.name)}{hidden("revision", entry.revision)}
+                {hidden("library", key)}
+                <button class="action-menu-item" type="submit">{act_label}</button>
+              </form>
+              <button class="action-menu-item action-menu-danger" type="button" commandfor="delete-dialog" command="show-modal">删除</button>
+            </div>
+          </details>"""
         confirm_dialog_html = render_delete_dialog_html(
             token=token,
             library_key=key,
@@ -3708,7 +3750,7 @@ def render(
                       <form action="/archive_topic#feedback" method="post" aria-label="归档当前记忆到 L4">
                         {hidden("csrf", token)}{hidden("library", key)}
                         {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
-                        <button class="btn btn-ghost btn-compact" type="submit">归档至 L4</button>
+                        <button class="action-menu-item" type="submit">归档至 L4</button>
                       </form>"""
                 writable_shared = [
                     (lk, lib)
@@ -3725,9 +3767,14 @@ def render(
                   {verify_btn}
                   {share_btn}
                   <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
-                  <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
-                  {archive_btn}
-                  <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
+                  <details class="action-menu">
+                    <summary class="btn btn-ghost btn-compact">更多 ▾</summary>
+                    <div class="action-menu-pop">
+                      <a class="action-menu-item" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
+                      {archive_btn}
+                      <button class="action-menu-item action-menu-danger" type="button" commandfor="delete-dialog" command="show-modal">删除</button>
+                    </div>
+                  </details>"""
                 confirm_dialog_html = render_delete_dialog_html(
                     token=token,
                     library_key=key,

@@ -542,6 +542,11 @@
   }
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      for (const menu of document.querySelectorAll("details.action-menu[open]")) {
+        menu.removeAttribute("open");
+      }
+    }
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
       event.preventDefault();
       if (paletteDialog && paletteDialog.open) {
@@ -556,6 +561,14 @@
       if (tag === "input" || tag === "textarea" || tag === "select") return;
       event.preventDefault();
       window.location.href = `/?library=${encodeURIComponent(currentLibraryKey())}&view=new#detail-title`;
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    for (const menu of document.querySelectorAll("details.action-menu[open]")) {
+      if (!menu.contains(event.target)) {
+        menu.removeAttribute("open");
+      }
     }
   });
 })();

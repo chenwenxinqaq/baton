@@ -247,6 +247,58 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertEqual(captured["payload"]["items"][0]["ref"], "methods/docker-cache.md")
         self.assertIn("topic=methods%2Fdocker-cache.md", captured["payload"]["items"][0]["href"])
 
+    def test_activity_panel_promotes_urgent_lint_and_shows_pipeline_strip(self):
+        import audit_log
+        import manager as manager_mod
+
+        self.store.upsert_entry(
+            "L3",
+            "expired-alert",
+            "过期配置提醒",
+            "需要尽快复核的临时配置",
+            "仅测试用。",
+            verified_at="2020-01-01",
+            valid_until="2020-01-02",
+        )
+        audit_log.record(
+            {
+                "source": "mcp",
+                "tool": "memory_upsert",
+                "ok": True,
+                "mode": "append",
+                "ms": 38,
+                "ref": "projects/expired-alert.md",
+                "client": "Codex",
+            },
+        )
+        audit_log.record({"source": "hook", "event": "checkpoint", "client": "Codex"})
+        panel = manager_mod.render_activity_panel(
+            "primary",
+            agent_home=self.root,
+            root=self.root,
+            token="tok",
+            readonly=False,
+            return_view="activity",
+        )
+        self.assertIn("lint-urgent", panel)
+        self.assertIn("pipeline-strip", panel)
+        self.assertIn("增量追加", panel)
+        self.assertLess(panel.index("记忆库体检"), panel.index("近 7 天读写趋势"))
+
+    def test_desktop_results_surfaces_layer_pills_directly(self):
+        import manager as manager_mod
+
+        html_out = manager_mod.desktop_results(
+            "<span>L0</span>",
+            "<span>全部</span>",
+            "<ul><li>item</li></ul>",
+            2,
+            "知识库记忆",
+        )
+        self.assertIn('class="desk-pills"', html_out)
+        self.assertIn('class="desk-sources"', html_out)
+        self.assertNotIn("<details", html_out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,8 +7,10 @@
   --surface-subtle: light-dark(#f7f7f7, #242424);
   --surface-hover: light-dark(#eeeeee, #2b2b2b);
   --text: light-dark(#1a1c1f, #ffffff);
+  --text-strong: var(--text);
   --text-secondary: light-dark(#595a5c, #bdbdbd);
   --muted: light-dark(#696a6c, #a3a3a3);
+  --text-muted: var(--muted);
   --line: light-dark(#e7e7e7, #333333);
   --line-strong: light-dark(#cdcdcd, #525252);
   --primary: light-dark(#0169cc, #66b5ff);
@@ -31,6 +33,15 @@
   --l1-fg: var(--link);
   --l1-bg: color-mix(in srgb, var(--link) 9%, var(--surface));
   --l1-bd: color-mix(in srgb, var(--link) 25%, var(--surface));
+  --l0-fg: light-dark(#be123c, #fb7185);
+  --l0-bg: color-mix(in srgb, var(--l0-fg) 10%, var(--surface));
+  --l0-bd: color-mix(in srgb, var(--l0-fg) 26%, var(--surface));
+  --l2-fg: light-dark(#6d28d9, #c4b5fd);
+  --l2-bg: color-mix(in srgb, var(--l2-fg) 10%, var(--surface));
+  --l2-bd: color-mix(in srgb, var(--l2-fg) 26%, var(--surface));
+  --l4-fg: light-dark(#b45309, #fbbf24);
+  --l4-bg: color-mix(in srgb, var(--l4-fg) 10%, var(--surface));
+  --l4-bd: color-mix(in srgb, var(--l4-fg) 26%, var(--surface));
   --panel: var(--surface);
   --shadow-sm: none;
 }
@@ -69,6 +80,9 @@
 .desk-stat span{font-size:12px;color:var(--text-secondary)}.desk-stat strong{font:500 32px/1.1 Georgia,serif;font-variant-numeric:tabular-nums;color:var(--text)}
 .desk-results h2{font-size:16px;font-weight:650}.desk-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 13px}
 .desk-filter{margin-bottom:13px;font-size:13px}.desk-filter summary{cursor:pointer;color:var(--muted)}.desk-filter nav{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.desk-pills{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}
+.desk-sources{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;margin:0 0 14px;padding:3px;border:1px solid var(--line);border-radius:8px;background:var(--surface-subtle)}
+.desk-sources .seg-link{padding:4px 10px;font-size:12px}
 .desk .entry-list{display:grid;gap:9px}.desk .entry-link{padding:15px 17px;background:var(--surface);border-radius:10px}.desk .entry-title{font-size:15px}.desk .entry-desc{font-size:13px;line-height:1.6}
 .desk .markdown-raw,.desk .doc-body{overflow-wrap:anywhere}
 @media(max-width:810px){.desk{grid-template-columns:170px minmax(0,1fr)}.identity{gap:6px;font-size:14px}.desk-top{padding-inline:15px}.sheet{padding:24px 19px}.desk-stat{padding:12px}}
