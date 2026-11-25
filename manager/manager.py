@@ -3233,9 +3233,10 @@ def render(
         heading = f"编辑手记 · {entry.title or entry.name}"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人手记区 · user-managed/</span></div>'
         detail_submeta = f'<p class="detail-path"><code>user-managed/{escape(entry.name)}.md</code></p>'
+        _, upd_full, _ = mcp_server.format_relative_zh(entry.updated_at, now_dt=now_dt)
         meta_note = (
             f"<span>当前状态：{STATES[entry.status]} · 类型：{escape(entry.resolved_type())} · "
-            f"上次修改：{escape(entry.updated_at)}</span>"
+            f"上次修改：{escape(upd_full or entry.updated_at)}</span>"
             f"<code>user-managed/{escape(entry.name)}.md</code>"
         )
         editor_html = render_memory_editor_html(
