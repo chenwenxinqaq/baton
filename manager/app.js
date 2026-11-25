@@ -282,4 +282,38 @@
       }
     });
   }
+
+  async function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+
+  for (const btn of document.querySelectorAll("[data-copy-target]")) {
+    btn.addEventListener("click", async () => {
+      const src = document.getElementById(btn.getAttribute("data-copy-target"));
+      if (!src) return;
+      const orig = btn.dataset.origLabel || btn.textContent;
+      btn.dataset.origLabel = orig;
+      try {
+        await copyText(src.value ?? src.textContent ?? "");
+        btn.textContent = "已复制";
+      } catch {
+        btn.textContent = "复制失败";
+      }
+      window.setTimeout(() => {
+        btn.textContent = orig;
+      }, 1500);
+    });
+  }
 })();

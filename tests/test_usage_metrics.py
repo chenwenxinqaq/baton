@@ -110,6 +110,24 @@ class ToolCallAuditSizeTests(unittest.TestCase):
             self.assertEqual(search["refs"], [h["ref"] for h in json.loads(text)])
             self.assertNotIn("正文内容", json.dumps(events, ensure_ascii=False))
 
+    def test_summarize_includes_seven_day_daily_read_write_buckets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = 1_764_100_000.0
+            events = [
+                {"t": now - 60, "source": "mcp", "client": "Codex", "tool": "memory_upsert", "ok": True, "ref": "projects/a.md"},
+                {"t": now - 30, "source": "mcp", "client": "Codex", "tool": "memory_search", "ok": True, "hits": 2},
+                {"t": now - 86400 - 30, "source": "mcp", "client": "Claude Code", "tool": "memory_upsert", "ok": True, "ref": "methods/b.md"},
+                {"t": now - 86400 - 20, "source": "hook", "client": "Claude Code", "event": "nudge", "ok": True},
+            ]
+            with mock.patch.object(audit_log, "read_events", return_value=events):
+                summary = audit_log.summarize(now=now, home=tmp, days=7)
+            daily = summary["daily"]
+            self.assertEqual(len(daily), 7)
+            self.assertEqual(daily[-1]["writes"], 1)
+            self.assertEqual(daily[-1]["reads"], 1)
+            self.assertEqual(daily[-2]["writes"], 1)
+            self.assertEqual(daily[-2]["nudges"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

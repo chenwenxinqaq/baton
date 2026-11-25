@@ -182,6 +182,17 @@ def desktop_status_strip(key, library):
             chips.append(f'<span class="chip-warn">! {len(sync_meta["conflicts"])} 个同步冲突待处理</span>')
     except Exception:
         pass
+    try:
+        report = mcp_server.MemoryStore(library.root).lint()
+        by_sev = (report.get("summary") or {}).get("by_severity") or {}
+        err_cnt = by_sev.get("error", 0)
+        warn_cnt = by_sev.get("warning", 0)
+        if err_cnt:
+            chips.append(f'<span class="chip-warn">! 体检 {err_cnt} 项需要修复</span>')
+        elif warn_cnt:
+            chips.append(f'<span class="chip-warn">! 体检 {warn_cnt} 项待复核</span>')
+    except Exception:
+        pass
     href = escape(query(library=key, view="activity"))
     return f'<div class="desk-status check-chips">{"".join(chips)}<a href="{href}">查看读写动态 →</a></div>'
 
@@ -552,6 +563,38 @@ class Library:
             return store.entry_history(slug, limit=limit).get("versions", [])
         except (ValueError, OSError):
             return []
+
+    def topic_links(self, topic_path, body):
+        """Return (outgoing links, incoming backlinks) for one topic."""
+        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
+        try:
+            return store.entry_links(topic_path, body)
+        except (ValueError, OSError):
+            return [], []
+
+    def verify_topic(self, topic_path, expected_revision=""):
+        """Mark a topic as verified today; clear an already-expired valid_until date."""
+        _, current_topics = self.read_index()
+        try:
+            cur = self.read_topic(topic_path, current_topics)
+        except (FileNotFoundError, InvalidEntry) as exc:
+            raise StaleEntry from exc
+        if expected_revision and cur.revision != expected_revision:
+            raise StaleEntry
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        next_valid_until = "" if mcp_server.is_date_expired(cur.valid_until) else cur.valid_until
+        return self.save_topic(
+            orig_path=cur.path,
+            expected_revision=cur.revision,
+            layer=cur.layer,
+            title=cur.title,
+            description=cur.description,
+            body=cur.body,
+            slug=cur.slug,
+            entry_type=cur.entry_type,
+            verified_at=today,
+            valid_until=next_valid_until,
+        )
 
     def restore_version(self, version):
         """Put a saved version back as the current entry; returns its path."""
@@ -1536,6 +1579,38 @@ def render_topic_versions_html(token, library_key, slug, versions, readonly):
         <h2 class="block-title" id="versions-title">历史版本</h2>
         <p class="block-hint">每次编辑、换层或归档前都会在本机备份一份。恢复会先备份当前版本，因此两个方向都不会丢内容。</p>
         <ul class="version-list">{"".join(rows)}</ul>
+      </section>"""
+
+
+def render_topic_links_html(library_key, links, backlinks):
+    """Render outgoing references and incoming backlinks for one memory entry."""
+    if not links and not backlinks:
+        return ""
+
+    def _pill_list(items):
+        return "".join(
+            f'<a class="link-pill" href="{escape(query(library=library_key, topic=item["ref"]) + "#detail-title")}">'
+            f'<span class="link-pill-title">{escape(item.get("title") or item["ref"])}</span>'
+            f'<code>{escape(item["ref"])}</code></a>'
+            for item in items
+            if item.get("ref")
+        )
+
+    blocks = []
+    if links:
+        blocks.append(
+            f'<div class="link-group"><span class="link-group-label">引用了 ({len(links)})</span>'
+            f'<div class="link-pills">{_pill_list(links)}</div></div>'
+        )
+    if backlinks:
+        blocks.append(
+            f'<div class="link-group"><span class="link-group-label">被引用 ({len(backlinks)})</span>'
+            f'<div class="link-pills">{_pill_list(backlinks)}</div></div>'
+        )
+    return f"""
+      <section class="detail-block" aria-labelledby="links-title">
+        <h2 class="block-title" id="links-title">关联记忆</h2>
+        <div class="link-groups">{"".join(blocks)}</div>
       </section>"""
 
 
@@ -2617,7 +2692,50 @@ _LINT_CHECK_LABELS = {
 }
 
 
-def _lint_section(key, root):
+def _daily_trend_section(daily):
+    """Render a compact 7-day read/write trend chart so users can spot write-pipeline drops."""
+    if not daily:
+        return ""
+    peak = max((max(d.get("reads", 0), d.get("writes", 0)) for d in daily), default=0)
+    total_writes = sum(d.get("writes", 0) for d in daily)
+    total_reads = sum(d.get("reads", 0) for d in daily)
+    cols = []
+    for day in daily:
+        reads = day.get("reads", 0)
+        writes = day.get("writes", 0)
+        nudges = day.get("nudges", 0)
+        r_step = max(1, min(10, round(reads * 10 / peak))) if peak and reads else 0
+        w_step = max(1, min(10, round(writes * 10 / peak))) if peak and writes else 0
+        tip = f'{day.get("iso_date", day.get("date", ""))}：查询 {reads} 次 · 写入 {writes} 次 · 提醒 {nudges} 次'
+        cols.append(
+            f'<div class="trend-col" title="{escape(tip)}">'
+            f'<div class="trend-bars">'
+            f'<span class="trend-bar trend-bar-read trend-h{r_step}"></span>'
+            f'<span class="trend-bar trend-bar-write trend-h{w_step}"></span>'
+            f"</div>"
+            f'<span class="trend-counts">{writes}写</span>'
+            f'<span class="trend-day">{escape(day.get("date", ""))}</span>'
+            f"</div>"
+        )
+    return (
+        '<section class="activity-usage" aria-labelledby="trend-heading">'
+        '<div class="usage-head"><h3 id="trend-heading">近 7 天读写趋势</h3>'
+        f'<span class="usage-hint">共查 {total_reads} 次 · 共写 {total_writes} 次 '
+        '<span class="trend-legend"><i class="trend-dot trend-dot-read"></i>查询 '
+        '<i class="trend-dot trend-dot-write"></i>写入</span></span></div>'
+        f'<div class="daily-trend">{"".join(cols)}</div></section>'
+    )
+
+
+def _lint_edit_href(ref, key):
+    if ref.startswith("user-managed/") and ref.endswith(".md"):
+        return query(library=key, entry=Path(ref).stem, view="edit") + "#detail-title"
+    if any(ref.startswith(f"{folder}/") for folder in mcp_server.LAYER_DIRS.values()):
+        return query(library=key, topic=ref, view="edit_topic") + "#detail-title"
+    return ""
+
+
+def _lint_section(key, root, token="", readonly=False, return_view=""):
     """Library health: the problems a curation pass should fix, worst first."""
     if not root:
         return ""
@@ -2639,26 +2757,54 @@ def _lint_section(key, root):
         for sev, label in (("error", "需要修"), ("warning", "该看一眼"), ("info", "可以优化"))
         if counts.get(sev)
     )
+    has_index_issue = any(f["check"] in {"index-missing", "index-orphan"} for f in findings)
+    rebuild_btn = ""
+    if has_index_issue and token and not readonly:
+        rebuild_btn = (
+            '<form class="inline-form" action="/rebuild_index#feedback" method="post">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("return_view", return_view)}'
+            '<button class="btn btn-secondary btn-compact" type="submit">一键重建索引</button></form>'
+        )
     rows = []
-    for item in findings[:6]:
+    for item in findings[:8]:
         cls = "act-err" if item["severity"] == "error" else "act-meta"
         label = _LINT_CHECK_LABELS.get(item["check"], item["check"])
+        ref = item["ref"]
+        actions = []
+        is_topic_ref = any(ref.startswith(f"{folder}/") for folder in mcp_server.LAYER_DIRS.values())
+        if (
+            token
+            and not readonly
+            and is_topic_ref
+            and item["check"] in {"missing-date", "stale-snapshot", "expired-entry"}
+        ):
+            actions.append(
+                '<form class="inline-form" action="/verify_topic#feedback" method="post">'
+                f'{hidden("csrf", token)}{hidden("library", key)}'
+                f'{hidden("topic", ref)}{hidden("return_view", return_view)}'
+                '<button class="btn btn-ghost btn-compact" type="submit">今日核实</button></form>'
+            )
+        edit_href = "" if readonly else _lint_edit_href(ref, key)
+        if edit_href and item["check"] not in {"index-orphan"}:
+            btn_label = "立即处理" if item["severity"] == "error" else "去编辑"
+            actions.append(f'<a class="btn btn-ghost btn-compact" href="{escape(edit_href)}">{btn_label}</a>')
+        action_html = f'<span class="lint-actions">{"".join(actions)}</span>' if actions else ""
         rows.append(
-            f'<li>{_ref_link(item["ref"], key, report.get("library"))} '
-            f'<span class="{cls}">{escape(label)}</span>'
+            f'<li><div class="lint-row-head"><span>{_ref_link(ref, key, report.get("library"))} '
+            f'<span class="{cls}">{escape(label)}</span></span>{action_html}</div>'
             f'<span class="act-meta">{escape(item["detail"])} → {escape(item["hint"])}</span></li>'
         )
     more = ""
-    if len(findings) > 6:
-        more = f'<li class="act-meta">还有 {len(findings) - 6} 条，运行 <code>umem lint</code> 看全部</li>'
+    if len(findings) > 8:
+        more = f'<li class="act-meta">还有 {len(findings) - 8} 条，运行 <code>umem lint</code> 看全部</li>'
     return (
         '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
-        f'<span class="usage-hint">{escape(chips)}</span></div>'
+        f'<span class="usage-hint">{escape(chips)} {rebuild_btn}</span></div>'
         f'<ul class="lint-list" role="list">{"".join(rows)}{more}</ul></section>'
     )
 
 
-def render_activity_panel(key, agent_home=None, root=None):
+def render_activity_panel(key, agent_home=None, root=None, token="", readonly=False, return_view=""):
     """First-screen dashboard: what AI clients searched/read/wrote locally (from the audit log)."""
     try:
         summary = audit_log.summarize()
@@ -2727,7 +2873,8 @@ def render_activity_panel(key, agent_home=None, root=None):
         f'<li>{_ref_link(h["ref"], key, h.get("library"))} <span class="act-meta">×{h["score"]}</span></li>' for h in summary["top_hits"]
     ) or '<li class="act-meta">暂无高频命中</li>'
     usage_section = _usage_section(summary.get("usage_today") or {}, summary.get("usage_7d") or {})
-    lint_section = _lint_section(key, root)
+    trend_section = _daily_trend_section(summary.get("daily") or [])
+    lint_section = _lint_section(key, root, token=token, readonly=readonly, return_view=return_view)
 
     return f"""
       <section class="activity-panel" aria-labelledby="activity-heading">
@@ -2738,6 +2885,7 @@ def render_activity_panel(key, agent_home=None, root=None):
           </div>
         </div>
         <ul class="activity-clients" role="list">{"".join(client_rows) or '<li class="act-meta">尚无已接入客户端</li>'}</ul>
+        {trend_section}
         {usage_section}
         {lint_section}
         <div class="activity-cols">
@@ -2748,7 +2896,7 @@ def render_activity_panel(key, agent_home=None, root=None):
       </section>"""
 
 
-def render_overview(topics, entries, key, root=None):
+def render_overview(topics, entries, key, root=None, token="", readonly=False):
     """Render Recent Work timeline + L0-L4 overview dashboard when no topic is selected."""
     now_dt = datetime.now().astimezone()
     now_ep = now_dt.timestamp()
@@ -2844,7 +2992,7 @@ def render_overview(topics, entries, key, root=None):
 
     active_user_cnt = sum(e.status == "active" for e in entries)
     return f"""
-      {render_activity_panel(key, root=root)}
+      {render_activity_panel(key, root=root, token=token, readonly=readonly)}
       {recent_panel}
       <p class="overview-section-label">按 L0–L4 记忆性质浏览</p>
       <div class="overview-grid">{"".join(cards)}</div>
@@ -3429,6 +3577,7 @@ def render(
         act, act_label = ("archive", "归档") if entry.status == "active" else ("restore", "恢复")
         detail_toolbar = f"""
           <a class="btn btn-primary btn-compact" href="{escape(edit_href)}">编辑手记</a>
+          <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
           <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{toggle_label}</a>
           <form action="/{act}#feedback" method="post" aria-label="{act_label}当前条目">
             {hidden("csrf", token)}{hidden("name", entry.name)}{hidden("revision", entry.revision)}
@@ -3461,7 +3610,8 @@ def render(
                 skip_h1=entry.title,
             )
         )
-        reader = summary_html + body_html
+        copy_source = f'<textarea id="copy-markdown-source" hidden readonly>{escape(entry.body)}</textarea>'
+        reader = summary_html + body_html + copy_source
     elif view == "clients":
         heading = "客户端接入"
         reader = render_agent_panel(token, key, agent_home=agent_home, library=library, flat=True)
@@ -3535,10 +3685,19 @@ def render(
             toggle_href = query(**link_params, topic=t_entry.path, raw="" if raw_mode else "1") + "#detail-title"
             if library.is_readonly:
                 detail_toolbar = (
+                    '<button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>'
                     f'<a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">'
                     f'{"阅读视图" if raw_mode else "查看源码"}</a>'
                 )
             else:
+                verify_btn = ""
+                if t_entry.layer != "L4":
+                    verify_btn = f"""
+                      <form action="/verify_topic#feedback" method="post" aria-label="标记当前记忆为今日已核实">
+                        {hidden("csrf", token)}{hidden("library", key)}
+                        {hidden("topic", t_entry.path)}{hidden("revision", t_entry.revision)}
+                        <button class="btn btn-ghost btn-compact" type="submit">今日核实</button>
+                      </form>"""
                 archive_btn = ""
                 if t_entry.layer != "L4" and "L4" in library.allowed_layers:
                     archive_btn = f"""
@@ -3559,7 +3718,9 @@ def render(
                     share_dialog = render_share_dialog_html(token, key, t_entry, writable_shared)
                 detail_toolbar = f"""
                   <a class="btn btn-primary btn-compact" href="{escape(edit_topic_href)}">编辑记忆</a>
+                  {verify_btn}
                   {share_btn}
+                  <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
                   <a class="btn btn-ghost btn-compact" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
                   {archive_btn}
                   <button class="btn btn-danger-ghost btn-compact" type="button" commandfor="delete-dialog" command="show-modal">删除</button>"""
@@ -3589,8 +3750,14 @@ def render(
                 )
             )
             slug = Path(t_entry.path).stem
-            reader = summary_html + body_html + render_topic_versions_html(
-                token, key, slug, library.topic_versions(slug), library.is_readonly
+            links, backlinks = library.topic_links(t_entry.path, detail)
+            copy_source = f'<textarea id="copy-markdown-source" hidden readonly>{escape(detail)}</textarea>'
+            reader = (
+                summary_html
+                + body_html
+                + render_topic_links_html(key, links, backlinks)
+                + render_topic_versions_html(token, key, slug, library.topic_versions(slug), library.is_readonly)
+                + copy_source
             )
         except (ValueError, OSError) as exc:
             heading = "无法读取条目"
@@ -3606,7 +3773,9 @@ def render(
     else:
         heading = "记忆库概览"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'
-        reader = "" if DESKTOP else render_overview(topics, entries, key, root=library.root)
+        reader = "" if DESKTOP else render_overview(
+            topics, entries, key, root=library.root, token=token, readonly=library.is_readonly
+        )
 
     feedback = ""
     if error:
@@ -3653,13 +3822,21 @@ def render(
             detail_badges = detail_submeta = ""
             if view == "activity":
                 heading = "读写动态"
-                reader = render_activity_panel(key, root=library.root)
+                reader = render_activity_panel(
+                    key, root=library.root, token=token, readonly=library.is_readonly, return_view="activity"
+                )
         elif not view and not topic_path and not entry.name:
             heading = "搜索结果" if q else "记忆库"
             detail_badges = detail_submeta = detail_toolbar = ""
-            stats = (("知识库条目", len(topics)), ("近七天活跃", len(recent_7d_rows)), ("个人手记", active_user_cnt))
-            metrics = "".join(f'<div class="desk-stat"><span>{label}</span><strong>{value}</strong></div>'
-                              for label, value in stats)
+            stats = (
+                ("知识库条目", len(topics), query(library=key, source="index")),
+                ("近七天活跃", len(recent_7d_rows), query(library=key, window="7d")),
+                ("个人手记", active_user_cnt, query(library=key, source="user")),
+            )
+            metrics = "".join(
+                f'<a class="desk-stat" href="{escape(href)}"><span>{label}</span><strong>{value}</strong></a>'
+                for label, value, href in stats
+            )
             reader = ("" if q else desktop_status_strip(key, library) + f'<div class="desk-stats">{metrics}</div>') + desktop_results(
                 listing, layer_tabs, source_tabs, sort_controls_html, "记忆条目", len(rows))
 
@@ -3839,6 +4016,7 @@ class Handler(BaseHTTPRequestHandler):
         notices = {
             "saved": "个人手记已保存。",
             "topic_saved": "记忆已保存并同步更新 MEMORY.md 索引。",
+            "topic_verified": "已将该记忆标记为今日核实（若原有效期已过则同步清除过期状态）。",
             "topic_archived": "记忆已移入 L4 事故归档并同步更新索引。",
             "index_saved": "MEMORY.md 规范与索引已保存。",
             "deleted": "记忆条目已移除（已在本机回收站保留安全备份）。",
@@ -3897,6 +4075,7 @@ class Handler(BaseHTTPRequestHandler):
             "/save",
             "/save_index",
             "/archive_topic",
+            "/verify_topic",
             "/delete",
             "/archive",
             "/restore",
@@ -3968,6 +4147,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/archive_topic":
             self.handle_archive_topic(fields)
+            return
+        if self.path == "/verify_topic":
+            self.handle_verify_topic(fields)
             return
         if self.path == "/restore_version":
             self.handle_restore_version(fields)
@@ -4482,6 +4664,41 @@ class Handler(BaseHTTPRequestHandler):
             self.page(HTTPStatus.BAD_REQUEST, key=key, topic_path=topic_path, error=str(exc))
             return
         loc = query(library=key, topic=new_rel, notice="topic_archived")
+        self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def handle_verify_topic(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        topic_path = fields.get("topic", "")
+        revision = fields.get("revision", "")
+        return_view = fields.get("return_view", "")
+        try:
+            new_rel = library.verify_topic(topic_path, revision)
+        except StaleEntry:
+            self.page(
+                HTTPStatus.CONFLICT,
+                key=key,
+                topic_path="" if return_view else topic_path,
+                view=return_view,
+                error="核实冲突：该条目内容或索引刚发生变化，请刷新后再试。",
+            )
+            return
+        except (InvalidEntry, OSError) as exc:
+            self.page(
+                HTTPStatus.BAD_REQUEST,
+                key=key,
+                topic_path="" if return_view else topic_path,
+                view=return_view,
+                error=str(exc),
+            )
+            return
+        if return_view:
+            loc = query(library=key, view=return_view, notice="topic_verified")
+        else:
+            loc = query(library=key, topic=new_rel, notice="topic_verified")
         self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
 
     def handle_restore_version(self, fields):

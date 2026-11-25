@@ -382,6 +382,24 @@ def summarize(now=None, home=None, days=7):
     nudges_today = sum(1 for e in events if e.get("source") == "hook" and e.get("event") == "nudge" and e.get("t", 0) >= today0)
     sessions_today = sum(1 for e in events if e.get("source") == "hook" and e.get("event") == "sessionStart" and e.get("t", 0) >= today0)
 
+    daily = []
+    for offset in range(days - 1, -1, -1):
+        day_start = today0 - offset * 86400
+        day_end = day_start + 86400
+        dt = datetime.fromtimestamp(day_start)
+        day_events = [e for e in events if day_start <= float(e.get("t", 0)) < day_end]
+        day_mcp = [e for e in day_events if e.get("source") == "mcp"]
+        daily.append(
+            {
+                "date": dt.strftime("%m-%d"),
+                "iso_date": dt.strftime("%Y-%m-%d"),
+                "reads": sum(1 for e in day_mcp if e.get("tool") in READ_TOOLS and e.get("ok", True)),
+                "writes": sum(1 for e in day_mcp if e.get("tool") in WRITE_TOOLS and e.get("ok", True)),
+                "nudges": sum(1 for e in day_events if e.get("source") == "hook" and e.get("event") == "nudge"),
+                "errors": sum(1 for e in day_mcp if e.get("ok") is False),
+            }
+        )
+
     return {
         "now": now,
         "clients": sorted(clients.values(), key=lambda x: -x["last_t"]),
@@ -396,4 +414,5 @@ def summarize(now=None, home=None, days=7):
         "total_events": len(events),
         "usage_today": usage_stats([e for e in events if e.get("t", 0) >= today0]),
         "usage_7d": usage_stats(events),
+        "daily": daily,
     }

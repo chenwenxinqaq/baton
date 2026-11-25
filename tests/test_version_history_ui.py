@@ -134,6 +134,73 @@ class VersionHistoryUITests(unittest.TestCase):
     def test_nothing_renders_when_there_is_no_history(self):
         self.assertEqual(render_topic_versions_html("tok", "primary", "docker-cache", [], False), "")
 
+    def test_verify_topic_sets_today_and_clears_expired_valid_until(self):
+        self.store.upsert_entry(
+            "L3",
+            "release-window",
+            "发布窗口",
+            "当前发布窗口状态",
+            "待核实。",
+            verified_at="2020-01-01",
+            valid_until="2020-02-01",
+        )
+        rel = self.library.verify_topic("projects/release-window.md")
+        self.assertEqual(rel, "projects/release-window.md")
+        updated = self.library.read_topic(rel)
+        self.assertRegex(updated.verified_at, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertNotEqual(updated.verified_at, "2020-01-01")
+        self.assertEqual(updated.valid_until, "")
+
+        # A future valid_until must stay intact when verifying today.
+        self.store.upsert_entry(
+            "L3",
+            "future-window",
+            "未来窗口",
+            "长期有效状态",
+            "正文。",
+            verified_at="2020-01-01",
+            valid_until="2099-12-31",
+        )
+        self.library.verify_topic("projects/future-window.md")
+        kept = self.library.read_topic("projects/future-window.md")
+        self.assertEqual(kept.valid_until, "2099-12-31")
+
+    def test_topic_links_and_actionable_lint_section_render_safely(self):
+        import manager as manager_mod
+
+        self.store.upsert_entry("L1", "base-guide", "基础指南", "基础方法摘要", "核心步骤。")
+        self.store.upsert_entry(
+            "L3",
+            "rollout-plan",
+            "上线计划",
+            "参考基础指南执行",
+            "遵循 methods/base-guide.md 完成上线。",
+            verified_at="2020-01-01",
+            valid_until="2020-01-02",
+        )
+        links, backlinks = self.library.topic_links("projects/rollout-plan.md", "遵循 methods/base-guide.md 完成上线。")
+        self.assertEqual([x["ref"] for x in links], ["methods/base-guide.md"])
+        self.assertEqual(backlinks, [])
+        base_links, base_backlinks = self.library.topic_links("methods/base-guide.md", "核心步骤。")
+        self.assertEqual(base_links, [])
+        self.assertEqual([x["ref"] for x in base_backlinks], ["projects/rollout-plan.md"])
+
+        links_html = manager_mod.render_topic_links_html("primary", links, base_backlinks)
+        self.assertIn("关联记忆", links_html)
+        self.assertIn("引用了 (1)", links_html)
+        self.assertIn("被引用 (1)", links_html)
+        self.assertIn("methods/base-guide.md", links_html)
+        self.assertIn("projects/rollout-plan.md", links_html)
+
+        writable_lint = manager_mod._lint_section("primary", self.root, token="tok", readonly=False, return_view="activity")
+        self.assertIn('action="/verify_topic#feedback"', writable_lint)
+        self.assertIn("今日核实", writable_lint)
+        self.assertIn("去编辑", writable_lint)
+
+        ro_lint = manager_mod._lint_section("team", self.root, token="tok", readonly=True, return_view="activity")
+        self.assertNotIn("/verify_topic", ro_lint)
+        self.assertNotIn("/rebuild_index", ro_lint)
+
 
 if __name__ == "__main__":
     unittest.main()
