@@ -1,5 +1,6 @@
 """memory_read must support outline and single-section reads (progressive disclosure)."""
 
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -192,3 +193,23 @@ class BatchReadTests(unittest.TestCase):
         res = ws.read_entries(["methods/one.md", "team:methods/guide.md"])
         self.assertEqual(res["count"], 2)
         self.assertEqual([e["ref"] for e in res["entries"]], ["methods/one.md", "team:methods/guide.md"])
+
+    def test_memory_list_supports_limit_and_compact_projection(self):
+        self.store.upsert_entry("L3", "three", "条目三", "摘要三", "第三条正文。")
+        _, full = mcp_server._handle_tool_call(self.store, "memory_list", {})
+        _, capped = mcp_server._handle_tool_call(
+            self.store, "memory_list", {"limit": 2, "compact": True}
+        )
+        self.assertEqual(len(full), 3)
+        self.assertEqual(len(capped), 2)
+        for item in capped:
+            self.assertIn("ref", item)
+            self.assertIn("title", item)
+            self.assertIn("description", item)
+            self.assertNotIn("library", item)
+            self.assertNotIn("trust", item)
+            self.assertNotIn("created_at", item)
+        self.assertLess(
+            len(json.dumps(capped, ensure_ascii=False)),
+            len(json.dumps(full, ensure_ascii=False)),
+        )

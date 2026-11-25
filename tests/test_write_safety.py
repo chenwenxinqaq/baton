@@ -229,6 +229,99 @@ class WriteSafetyTests(unittest.TestCase):
         self.assertIn("初始结论。", text)
         self.assertIn("追加结论。", text)
 
+    def test_section_upsert_replaces_appends_creates_and_ignores_code_fences(self):
+        body = (
+            "背景摘要。\n\n"
+            "## 当前进展\n\n"
+            "已完成初版验证。\n\n"
+            "```markdown\n"
+            "## 示例代码块里的标题\n"
+            "不要当成真小节。\n"
+            "```\n\n"
+            "## 下一步\n\n"
+            "整理文档。"
+        )
+        self._write("docker-cache", body)
+
+        # 1. Replace a targeted section in place while preserving sibling sections & code blocks.
+        replaced = self.store.upsert_entry(
+            layer="L1",
+            name="docker-cache",
+            body="已完成 v2 回归测试。",
+            section="当前进展",
+        )
+        self.assertEqual(replaced["section"], "当前进展")
+        self.assertEqual(replaced["section_action"], "replaced")
+        saved = self.store.read_entry("methods/docker-cache.md")["content"]
+        self.assertIn("已完成 v2 回归测试。", saved)
+        self.assertNotIn("已完成初版验证。", saved)
+        self.assertIn("## 下一步\n\n整理文档。", saved)
+        self.assertIn("背景摘要。", saved)
+
+        # 2. Append inside an existing section without touching other sections.
+        appended = self.store.upsert_entry(
+            layer="L1",
+            name="docker-cache",
+            body="2026-11-26 补充：压测通过。",
+            mode="append",
+            section="下一步",
+        )
+        self.assertEqual(appended["section"], "下一步")
+        self.assertEqual(appended["section_action"], "appended")
+        saved = self.store.read_entry("methods/docker-cache.md")["content"]
+        self.assertIn("整理文档。\n\n2026-11-26 补充：压测通过。", saved)
+
+        # 3. Create a new section when absent via MCP tool call.
+        res, created = mcp_server._handle_tool_call(
+            self.store,
+            "memory_upsert",
+            {"layer": "L1", "name": "docker-cache", "section": "风险与边界", "body": "仅适用 Linux 构建节点。"},
+        )
+        self.assertFalse(res.get("isError", False))
+        self.assertEqual(created["section"], "风险与边界")
+        self.assertEqual(created["section_action"], "created")
+        saved = self.store.read_entry("methods/docker-cache.md")["content"]
+        self.assertIn("## 风险与边界\n\n仅适用 Linux 构建节点。", saved)
+
+        # 4. Ambiguous substring match raises ValueError rather than silently picking one.
+        self.store.upsert_entry(layer="L1", name="docker-cache", section="测试方案 A", body="A")
+        self.store.upsert_entry(layer="L1", name="docker-cache", section="测试方案 B", body="B")
+        with self.assertRaisesRegex(ValueError, "Ambiguous section"):
+            self.store.upsert_entry(layer="L1", name="docker-cache", section="测试方案", body="C")
+
+        # 5. Fenced code block heading is not treated as an outline section.
+        self.store.upsert_entry(
+            layer="L1",
+            name="fenced-doc",
+            title="带代码块的条目",
+            description="验证代码块标题不干扰分节",
+            body="## 正文小节\n\n```md\n## 假标题\n```\n",
+        )
+        outline = self.store.read_entry("methods/fenced-doc.md", outline=True)
+        self.assertEqual([s["section"] for s in outline["sections"]], ["正文小节"])
+
+    def test_section_upsert_works_on_user_managed_entries(self):
+        self.store.upsert_entry(
+            layer="L2",
+            name="my-pref",
+            title="我的偏好",
+            description="长期工作习惯",
+            body="## 沟通\n\n先给结论。\n\n## 输出\n\n保持简洁。",
+            user_managed=True,
+        )
+        updated = self.store.upsert_entry(
+            layer="L2",
+            name="my-pref",
+            body="多用表格对比。",
+            mode="append",
+            section="输出",
+            user_managed=True,
+        )
+        self.assertEqual(updated["section_action"], "appended")
+        content = self.store.read_entry("user-managed/my-pref.md")["content"]
+        self.assertIn("保持简洁。\n\n多用表格对比。", content)
+        self.assertIn("## 沟通\n\n先给结论。", content)
+
 
 if __name__ == "__main__":
     unittest.main()

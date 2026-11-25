@@ -2352,6 +2352,10 @@ def main():
         if command in {"list", "search"}:
             item.add_argument("--layer", choices=ALL_LAYERS, default="")
             item.add_argument("--archived", action="store_true", help="Include archived entries.")
+        if command == "list":
+            item.add_argument("--sort", choices=("updated", "created", "layer"), default="updated")
+            item.add_argument("--limit", type=int, default=0, help="Optional max entries to return (0 = all).")
+            item.add_argument("--compact", action="store_true", help="Omit duplicate routing/bookkeeping fields.")
         if command == "search":
             item.add_argument("query")
             item.add_argument("--limit", type=int, default=10)
@@ -2365,6 +2369,7 @@ def main():
             item.add_argument("--title", default="", help="Single-line title (required for new entries; optional when updating/appending).")
             item.add_argument("--description", default="", help="Concise retrieval cue (optional when updating/appending).")
             item.add_argument("--append", action="store_true", help="Append body to an existing entry without replacing it.")
+            item.add_argument("--section", default="", help="Target a single '## ' section to replace, append, or create in place.")
             item.add_argument("--verified-at", default=None, help="Optional YYYY-MM-DD verification date (empty string clears).")
             item.add_argument("--valid-until", default=None, help="Optional YYYY-MM-DD expiration date (empty string clears).")
             item.add_argument("--body-file", required=True, help="UTF-8 Markdown file, or - for standard input.")
@@ -2476,11 +2481,19 @@ def main():
 
     if args.command in {"list", "search", "read", "write", "lint"}:
         sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
-        from server import WorkspaceStore
+        from server import WorkspaceStore, compact_list_entry
         try:
             store = WorkspaceStore(MEMORY_ROOT)
             if args.command == "list":
-                result = store.list_entries(library=args.library or "*", layer=args.layer, include_archived=args.archived)
+                result = store.list_entries(
+                    library=args.library or "*",
+                    layer=args.layer,
+                    include_archived=args.archived,
+                    sort=args.sort,
+                    limit=args.limit,
+                )
+                if args.compact:
+                    result = [compact_list_entry(item) for item in result]
             elif args.command == "search":
                 result = store.search(args.query, library=args.library or "*", layer=args.layer,
                                       include_archived=args.archived, limit=args.limit)
@@ -2511,6 +2524,7 @@ def main():
                     body,
                     library=args.library or "personal",
                     mode="append" if args.append else "replace",
+                    section=args.section,
                     verified_at=args.verified_at,
                     valid_until=args.valid_until,
                 )

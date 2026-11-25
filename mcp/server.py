@@ -288,6 +288,7 @@ def parse_frontmatter(text):
 
 
 SECTION_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
 # Progressive disclosure: large entries get a section outline so an agent can read
 # one section instead of the whole file (MemGPT-style paging over Markdown).
 OUTLINE_MIN_CHARS = 1200
@@ -312,8 +313,16 @@ def split_sections(body):
     preamble = []
     sections = []
     current = None
+    in_fence = ""
     for line in body.replace("\r\n", "\n").split("\n"):
-        match = SECTION_HEADING_RE.match(line)
+        fence = FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)[0]
+            if not in_fence:
+                in_fence = marker
+            elif in_fence == marker:
+                in_fence = ""
+        match = None if in_fence else SECTION_HEADING_RE.match(line)
         if match and len(match.group(1)) == 2:
             if current is not None:
                 sections.append(current)
@@ -335,6 +344,100 @@ def split_sections(body):
         # is a readable section too, named after the document title.
         out.insert(0, {"title": title_line[2:].strip() or "intro", "text": intro})
     return title_line, out
+
+
+def patch_markdown_section(existing_body, section_query, new_body, mode="replace"):
+    """Replace or append a single '## ' section without disturbing the rest of the entry.
+
+    Returns (patched_body, resolved_section_title, section_action).
+    If no existing section matches, appends a new '## <section_query>' section at the end.
+    """
+    wanted = (section_query or "").strip()
+    if not wanted or "\n" in wanted:
+        raise ValueError("section must be a single non-empty heading title.")
+    if wanted.startswith("#"):
+        wanted = wanted.lstrip("#").strip()
+    if not wanted:
+        raise ValueError("section must be a single non-empty heading title.")
+
+    preamble_lines = []
+    sections = []
+    current = None
+    in_fence = ""
+    for line in (existing_body or "").replace("\r\n", "\n").split("\n"):
+        fence = FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)[0]
+            if not in_fence:
+                in_fence = marker
+            elif in_fence == marker:
+                in_fence = ""
+        match = None if in_fence else SECTION_HEADING_RE.match(line)
+        if match and len(match.group(1)) == 2:
+            if current is not None:
+                sections.append(current)
+            current = {"title": match.group(2).strip(), "lines": [line]}
+        elif current is not None:
+            current["lines"].append(line)
+        else:
+            preamble_lines.append(line)
+    if current is not None:
+        sections.append(current)
+
+    folded = wanted.casefold()
+    exact_idx = [i for i, sec in enumerate(sections) if sec["title"].casefold() == folded]
+    if exact_idx:
+        match_idx = exact_idx[0]
+    else:
+        sub_idx = [i for i, sec in enumerate(sections) if folded in sec["title"].casefold()]
+        if len(sub_idx) > 1:
+            candidates = ", ".join(sections[i]["title"] for i in sub_idx)
+            raise ValueError(f"Ambiguous section '{wanted}'. Matches: {candidates}")
+        match_idx = sub_idx[0] if len(sub_idx) == 1 else None
+
+    chunk = (new_body or "").strip()
+    if match_idx is not None:
+        target = sections[match_idx]
+        resolved_title = target["title"]
+        if mode == "append":
+            first_line, _, rest = chunk.partition("\n")
+            first_match = SECTION_HEADING_RE.match(first_line)
+            if first_match and len(first_match.group(1)) == 2 and first_match.group(2).strip().casefold() == resolved_title.casefold():
+                chunk = rest.strip()
+            existing_sec_text = "\n".join(target["lines"]).rstrip()
+            target["lines"] = (f"{existing_sec_text}\n\n{chunk}" if chunk else existing_sec_text).split("\n")
+            action = "appended"
+        else:
+            first_line = chunk.split("\n", 1)[0]
+            first_match = SECTION_HEADING_RE.match(first_line)
+            if first_match and len(first_match.group(1)) == 2:
+                resolved_title = first_match.group(2).strip()
+                replacement = chunk
+            else:
+                replacement = f"## {resolved_title}\n\n{chunk}"
+            target["lines"] = replacement.split("\n")
+            action = "replaced"
+    else:
+        first_line = chunk.split("\n", 1)[0]
+        first_match = SECTION_HEADING_RE.match(first_line)
+        if first_match and len(first_match.group(1)) == 2:
+            resolved_title = first_match.group(2).strip()
+            new_block = chunk
+        else:
+            resolved_title = wanted
+            new_block = f"## {wanted}\n\n{chunk}"
+        sections.append({"title": resolved_title, "lines": new_block.split("\n")})
+        action = "created"
+
+    blocks = []
+    preamble_text = "\n".join(preamble_lines).strip()
+    if preamble_text:
+        blocks.append(preamble_text)
+    for sec in sections:
+        sec_text = "\n".join(sec["lines"]).strip()
+        if sec_text:
+            blocks.append(sec_text)
+    return "\n\n".join(blocks), resolved_title, action
 
 
 def section_outline(sections):
@@ -1140,7 +1243,7 @@ class MemoryStore:
         if see_also:
             results[0]["see_also"] = see_also
 
-    def list_entries(self, layer="", include_archived=False, sort="updated"):
+    def list_entries(self, layer="", include_archived=False, sort="updated", limit=0):
         """List entries optionally filtered by layer and sorted by updated/created/layer."""
         collected = [
             it for it in self.collect_entries(include_archived=include_archived)
@@ -1152,6 +1255,9 @@ class MemoryStore:
             collected.sort(key=lambda it: (it["layer"], -it["updated_epoch"], it["path"]))
         else:
             collected.sort(key=lambda it: (-it["updated_epoch"], it["layer"], it["path"]))
+        cap = max(0, int(limit or 0))
+        if cap:
+            collected = collected[:cap]
 
         return [
             {
@@ -1300,13 +1406,15 @@ class MemoryStore:
         return links[:limit], backlinks[:limit]
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False,
-                     expected_updated_at="", mode="replace", verified_at=None, valid_until=None):
+                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None):
         """Create or update a memory entry under lock, backing up previous versions to trash.
 
         ``expected_updated_at`` turns the write into a compare-and-set: if the entry
         changed since the agent read it, the write is rejected instead of silently
         dropping the other session's edit. ``mode="append"`` appends ``body`` to an
-        existing entry without needing to read and re-emit the entire document.
+        existing entry without needing to read and re-emit the entire document. Passing
+        ``section`` targets a single ``## `` section (replace or append, or create if
+        absent) without rewriting the rest of the document.
         """
         if self.mode == "ro":
             raise ValueError(f"Library '{self.library_id}' is read-only.")
@@ -1322,6 +1430,9 @@ class MemoryStore:
         mode = (mode or "replace").strip().lower()
         if mode not in {"replace", "append"}:
             raise ValueError("mode must be 'replace' or 'append'.")
+        section = (section or "").strip()
+        if "\n" in section:
+            raise ValueError("section must be a single heading title.")
         title = (title or "").strip()
         description = (description or "").strip()
         body = (body or "").strip() if user_managed else strip_generated_header(body or "")
@@ -1355,6 +1466,8 @@ class MemoryStore:
                 effective_title = title
                 effective_desc = description
                 merged_body = body
+                resolved_section = ""
+                section_action = ""
                 old_verified = ""
                 old_valid_until = ""
                 if target.is_file():
@@ -1372,10 +1485,18 @@ class MemoryStore:
                         resolved_type = old_meta["type"]
                     effective_title = title or old_meta.get("title") or extract_title(old_body, name)
                     effective_desc = description or old_meta.get("description", "")
-                    if mode == "append" and old_body.strip():
+                    if section:
+                        merged_body, resolved_section, section_action = patch_markdown_section(
+                            old_body, section, body, mode=mode
+                        )
+                    elif mode == "append" and old_body.strip():
                         merged_body = f"{old_body.strip()}\n\n{body}"
                 else:
                     self._check_expected_updated(expected_updated_at)
+                    if section:
+                        merged_body, resolved_section, section_action = patch_markdown_section(
+                            "", section, body, mode=mode
+                        )
                 if not effective_title:
                     raise ValueError("title must be a single non-empty line.")
                 eff_verified = old_verified if norm_verified is None else norm_verified
@@ -1411,6 +1532,9 @@ class MemoryStore:
                     "created_at": cre_at,
                     "updated_at": ts_now,
                 }
+                if resolved_section:
+                    res["section"] = resolved_section
+                    res["section_action"] = section_action
                 if eff_verified:
                     res["verified_at"] = eff_verified
                 if eff_valid_until:
@@ -1480,7 +1604,23 @@ class MemoryStore:
                 raise ValueError("valid_until must not be earlier than verified_at.")
 
             desc_val = json.dumps(effective_desc, ensure_ascii=False)
-            if mode == "append" and existing_body.strip():
+            resolved_section = ""
+            section_action = ""
+            if section:
+                if existing_body.strip():
+                    base_body = existing_body.strip()
+                    if base_body.startswith("# "):
+                        if title:
+                            _, _, rest = base_body.partition("\n")
+                            base_body = f"# {effective_title}\n{rest}" if rest else f"# {effective_title}"
+                    else:
+                        base_body = f"# {effective_title}\n\n{base_body}"
+                else:
+                    base_body = f"# {effective_title}"
+                formatted_body, resolved_section, section_action = patch_markdown_section(
+                    base_body, section, body, mode=mode
+                )
+            elif mode == "append" and existing_body.strip():
                 base_body = existing_body.strip()
                 if base_body.startswith("# "):
                     if title:
@@ -1544,6 +1684,9 @@ class MemoryStore:
                 "created_at": cre_at,
                 "updated_at": ts_now,
             }
+            if resolved_section:
+                res["section"] = resolved_section
+                res["section_action"] = section_action
             if eff_verified:
                 res["verified_at"] = eff_verified
             if eff_valid_until:
@@ -2071,10 +2214,11 @@ class WorkspaceStore:
             hit.pop("see_also", None)
         return hits
 
-    def list_entries(self, layer="", include_archived=False, sort="updated", library="personal"):
+    def list_entries(self, layer="", include_archived=False, sort="updated", library="personal", limit=0):
         stores = self._target_stores(library)
+        cap = max(0, int(limit or 0))
         if len(stores) == 1:
-            return stores[0].list_entries(layer=layer, include_archived=include_archived, sort=sort)
+            return stores[0].list_entries(layer=layer, include_archived=include_archived, sort=sort, limit=cap)
 
         merged = []
         for st, items in self._per_store(
@@ -2097,7 +2241,8 @@ class WorkspaceStore:
             merged.sort(key=lambda t: (t[0]["layer"], -t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["path"]))
         else:
             merged.sort(key=lambda t: (-t[2], 0 if t[0]["library"] == "personal" else 1, t[0]["layer"], t[0]["path"]))
-        return [t[0] for t in merged]
+        out = [t[0] for t in merged]
+        return out[:cap] if cap else out
 
     def read_entry(self, rel_path, library="", section="", outline=False):
         self._load_stores()
@@ -2138,7 +2283,7 @@ class WorkspaceStore:
         return result
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False, library="personal",
-                     expected_updated_at="", mode="replace", verified_at=None, valid_until=None):
+                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None):
         store = self._resolve_single_store(library or "personal")
         return store.upsert_entry(
             layer=layer,
@@ -2150,6 +2295,7 @@ class WorkspaceStore:
             user_managed=user_managed,
             expected_updated_at=expected_updated_at,
             mode=mode,
+            section=section,
             verified_at=verified_at,
             valid_until=valid_until,
         )
@@ -2213,13 +2359,15 @@ TOOLS = [
     },
     {
         "name": "memory_list",
-        "description": "List indexed L0-L4 and user-managed memory entries from the personal library by default; pass library='*' or 'all' to include mounted shared libraries.",
+        "description": "List indexed L0-L4 and user-managed memory entries from the personal library by default; pass library='*' or 'all' to include mounted shared libraries. Use compact=true and limit on large libraries to save tokens.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"]},
                 "include_archived": {"type": "boolean", "default": False},
                 "sort": {"type": "string", "enum": ["updated", "created", "layer"], "default": "updated"},
+                "limit": {"type": "integer", "default": 0, "description": "Optional max entries to return (0 = all)."},
+                "compact": {"type": "boolean", "default": False, "description": "Omit duplicate routing/bookkeeping fields while keeping ref, layer, status, updated_at, validity, title, and description."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for all mounted libraries, or a shared mount id)."},
             },
         },
@@ -2254,6 +2402,7 @@ TOOLS = [
                 "description": {"type": "string", "description": "Concise single-line retrieval cue. Optional when updating or appending to an existing entry."},
                 "body": {"type": "string", "description": "Markdown body (or incremental note/section when mode='append') with conditions, evidence, and dates. Do not include frontmatter or the H1 title; the server writes both (a leading frontmatter block is stripped)."},
                 "mode": {"type": "string", "enum": ["replace", "append"], "default": "replace", "description": "Use 'replace' (default) to write the full entry body, or 'append' to append an incremental update to an existing entry without reading and re-emitting the entire file."},
+                "section": {"type": "string", "default": "", "description": "Optional '## ' heading title to update or append in place (creates the section if absent) without rewriting the rest of a long entry."},
                 "topic_type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
@@ -2371,6 +2520,8 @@ def _audit_event(name, args, data, ok, ms, error="", result=None):
                 ev["action"] = data.get("status") or data.get("action")
             if name == "memory_upsert" and data.get("mode"):
                 ev["mode"] = data.get("mode")
+            if name == "memory_upsert" and data.get("section_action"):
+                ev["section_action"] = data.get("section_action")
     return ev
 
 
@@ -2405,6 +2556,13 @@ def compact_search_hit(hit):
     return {key: hit[key] for key in fields if key in hit}
 
 
+def compact_list_entry(item):
+    """Project a list_entries item to its high-signal fields for low-token browsing."""
+    fields = ("ref", "layer", "status", "updated_at",
+              "verified_at", "valid_until", "expired", "title", "description")
+    return {key: item[key] for key in fields if key in item}
+
+
 def _handle_tool_call(store, name, args):
     """Dispatch an MCP tools/call invocation; return (mcp_result, raw_data)."""
     if name == "memory_libraries":
@@ -2426,10 +2584,13 @@ def _handle_tool_call(store, name, args):
             layer=args.get("layer", ""),
             include_archived=bool(args.get("include_archived", False)),
             sort=args.get("sort", "updated"),
+            limit=int(args.get("limit", 0) or 0),
         )
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.list_entries(**kwargs)
+        if args.get("compact") is True:
+            data = [compact_list_entry(item) for item in data]
     elif name == "memory_read":
         kwargs = dict(
             section=args.get("section", "") or "",
@@ -2458,6 +2619,7 @@ def _handle_tool_call(store, name, args):
             user_managed=bool(args.get("user_managed", False)),
             expected_updated_at=args.get("expected_updated_at", "") or "",
             mode=args.get("mode", "replace") or "replace",
+            section=args.get("section", "") or "",
         )
         if "verified_at" in args and args["verified_at"] is not None:
             kwargs["verified_at"] = args["verified_at"]
@@ -2525,7 +2687,7 @@ def process_one_message(store, msg):
                     "Unified Memory stores persistent personal and shared knowledge across sessions. "
                     "At task start, call memory_search(compact=true) for relevant constraints, methods, preferences, and project context, then use memory_read (paths, outline, or section) to inspect details. "
                     "Capture verified root causes, non-obvious fixes, reusable workflows, key decisions, and user preferences or corrections as soon as they are confirmed—do not wait to be reminded. "
-                    "Prefer memory_upsert(mode='append') to add dated progress to an existing entry without rewriting the whole file, and do a quick capture check before ending substantial work. "
+                    "Prefer memory_upsert(mode='append') or memory_upsert(section='...') to update an existing entry incrementally without rewriting the whole file, and do a quick capture check before ending substantial work. "
                     "Follow MEMORY.md §0 for layering and never store plaintext secrets or credentials."
                 ),
             }
