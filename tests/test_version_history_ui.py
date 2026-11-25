@@ -201,6 +201,46 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertNotIn("/verify_topic", ro_lint)
         self.assertNotIn("/rebuild_index", ro_lint)
 
+    def test_quick_search_returns_recent_items_matches_and_actions(self):
+        from types import SimpleNamespace
+        import manager as manager_mod
+
+        self.store.upsert_entry(
+            "L1",
+            "docker-cache",
+            "Docker 缓存清理方法",
+            "定期清理 buildx 缓存避免磁盘占满",
+            "执行 docker builder prune 清理缓存。",
+        )
+        self.store.upsert_entry(
+            "L3",
+            "expired-note",
+            "临时环境配置",
+            "过期快照测试",
+            "仅用于测试。",
+            verified_at="2020-01-01",
+            valid_until="2020-01-02",
+        )
+        captured = {}
+        handler = object.__new__(manager_mod.Handler)
+        handler.server = SimpleNamespace(libraries={"primary": self.library})
+        handler.respond_json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        handler.handle_quick_search({"library": ["primary"], "q": [""]})
+        self.assertEqual(captured["status"], 200)
+        refs = [item["ref"] for item in captured["payload"]["items"]]
+        self.assertIn("methods/docker-cache.md", refs)
+        self.assertIn("projects/expired-note.md", refs)
+        expired_item = next(item for item in captured["payload"]["items"] if item["ref"] == "projects/expired-note.md")
+        self.assertTrue(expired_item["expired"])
+        self.assertTrue(any(a["title"] == "新建记忆" for a in captured["payload"]["actions"]))
+
+        captured.clear()
+        handler.handle_quick_search({"library": ["primary"], "q": ["Docker 缓存"]})
+        self.assertEqual(captured["status"], 200)
+        self.assertEqual(captured["payload"]["items"][0]["ref"], "methods/docker-cache.md")
+        self.assertIn("topic=methods%2Fdocker-cache.md", captured["payload"]["items"][0]["href"])
+
 
 if __name__ == "__main__":
     unittest.main()

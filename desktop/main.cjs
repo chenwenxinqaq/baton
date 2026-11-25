@@ -181,6 +181,9 @@ function installMenu() {
     ...(process.platform === 'darwin' ? [appMenu] : []),
     { role: 'editMenu' },
     { label: '工作空间', submenu: [
+      { label: '快速跳转与搜索', accelerator: 'CmdOrCtrl+K', click: () =>
+        win?.webContents.executeJavaScript("window.__openQuickPalette?.()").catch(() => {}) },
+      { label: '新建记忆', accelerator: 'CmdOrCtrl+N', click: () => showWindow('/?view=new#detail-title') },
       { label: '搜索记忆或技能', accelerator: 'CmdOrCtrl+F', click: () =>
         win?.webContents.executeJavaScript("document.getElementById('filter-q')?.focus()").catch(() => {}) },
       { label: '后退', accelerator: 'CmdOrCtrl+[', click: () => go(-1) },

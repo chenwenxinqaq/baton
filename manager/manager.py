@@ -3960,6 +3960,9 @@ class Handler(BaseHTTPRequestHandler):
             self.show_inline_sync_jobs()
             return
         self._refresh_mounts()
+        if url.path == "/quick_search":
+            self.handle_quick_search(parse_qs(url.query, max_num_fields=8))
+            return
         if url.path == "/sync_progress":
             self.show_sync_progress(parse_qs(url.query).get("job", [""])[0])
             return
@@ -4299,6 +4302,88 @@ class Handler(BaseHTTPRequestHandler):
                     status.update(state="success", title="同步完成", link=destination, link_text="查看同步")
             jobs.append(status)
         self.respond_json(HTTPStatus.OK, jobs)
+
+    def handle_quick_search(self, params):
+        q = (params.get("q", [""])[0] or "").strip()[:120]
+        active_key = params.get("library", ["primary"])[0]
+        if active_key not in self.server.libraries:
+            active_key = "primary"
+        items = []
+        active_lib = self.server.libraries[active_key]
+        if not q:
+            # Show the most recently updated items across mounted libraries when empty.
+            recent = []
+            for lib_key, lib in self.server.libraries.items():
+                try:
+                    store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
+                    for entry in store.list_entries(include_archived=False, sort="updated")[:8]:
+                        recent.append((entry.get("updated_at") or "", lib_key, lib.label, entry))
+                except OSError:
+                    continue
+            recent.sort(key=lambda row: row[0], reverse=True)
+            for _, lib_key, lib_label, entry in recent[:10]:
+                ref = entry.get("ref", "")
+                if ref.startswith("user-managed/") and ref.endswith(".md"):
+                    href = query(library=lib_key, entry=Path(ref).stem) + "#detail-title"
+                else:
+                    href = query(library=lib_key, topic=ref) + "#detail-title"
+                items.append(
+                    {
+                        "title": entry.get("title") or ref,
+                        "description": entry.get("description") or "",
+                        "layer": entry.get("layer") or "",
+                        "library": lib_label,
+                        "ref": ref,
+                        "href": href,
+                        "expired": bool(entry.get("expired")),
+                    }
+                )
+        else:
+            scored = []
+            for lib_key, lib in self.server.libraries.items():
+                try:
+                    store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
+                    for hit in store.search(q, limit=8, include_archived=True):
+                        scored.append((hit.get("score", 0), hit.get("updated_at") or "", lib_key, lib.label, hit))
+                except OSError:
+                    continue
+            # Sort by descending score, breaking ties by descending updated_at.
+            scored.sort(key=lambda row: row[1], reverse=True)
+            scored.sort(key=lambda row: row[0], reverse=True)
+            for _, _, lib_key, lib_label, hit in scored[:12]:
+                ref = hit.get("ref", "")
+                if ref.startswith("user-managed/") and ref.endswith(".md"):
+                    href = query(library=lib_key, entry=Path(ref).stem) + "#detail-title"
+                else:
+                    href = query(library=lib_key, topic=ref) + "#detail-title"
+                items.append(
+                    {
+                        "title": hit.get("title") or ref,
+                        "description": hit.get("description") or hit.get("snippet") or "",
+                        "layer": hit.get("layer") or "",
+                        "library": lib_label,
+                        "ref": ref,
+                        "href": href,
+                        "expired": bool(hit.get("expired")),
+                    }
+                )
+        actions = []
+        if not active_lib.is_readonly:
+            actions.append({"title": "新建记忆", "subtitle": f"写入 {active_lib.label}", "href": query(library=active_key, view="new") + "#detail-title", "shortcut": "⌘N"})
+        if DESKTOP:
+            actions.append({"title": "读写动态与体检", "subtitle": "查看 AI 调用、7 天趋势与一键修复", "href": query(library=active_key, view="activity")})
+        actions.extend(
+            [
+                {"title": "客户端接入", "subtitle": "管理 Claude / Codex / Cursor / Claude Desktop", "href": query(library=active_key, view="clients")},
+                {"title": "共享与 Git 同步", "subtitle": "查看个人同步与团队共享记忆库", "href": query(library=active_key, view="sync_hub")},
+                {"title": "Skills 技能中心", "subtitle": "启用或停用跨客户端共享技能", "href": query(library=active_key, tab="skills")},
+                {"title": "查看 MEMORY.md 规范与索引", "subtitle": active_lib.label, "href": query(library=active_key, view="index") + "#detail-title"},
+            ]
+        )
+        if q:
+            ql = q.casefold()
+            actions = [a for a in actions if ql in a["title"].casefold() or ql in a["subtitle"].casefold()]
+        self.respond_json(HTTPStatus.OK, {"query": q, "library": active_key, "items": items, "actions": actions})
 
     def show_sync_progress(self, job_id):
         for key, job in self._sync_jobs_snapshot():

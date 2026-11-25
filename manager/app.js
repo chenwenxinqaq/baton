@@ -316,4 +316,246 @@
       }, 1500);
     });
   }
+
+  // Quick command palette (Cmd/Ctrl+K) across all mounted libraries + quick actions.
+  let paletteDialog = null;
+  let paletteInput = null;
+  let paletteList = null;
+  let paletteEmpty = null;
+  let paletteItems = [];
+  let paletteIndex = 0;
+  let paletteSeq = 0;
+  let paletteTimer = 0;
+
+  function currentLibraryKey() {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("library") || "primary";
+  }
+
+  function ensurePalette() {
+    if (paletteDialog) return paletteDialog;
+    const dialog = document.createElement("dialog");
+    dialog.className = "cmdk-dialog";
+    dialog.setAttribute("aria-label", "快速跳转与搜索");
+
+    const head = document.createElement("div");
+    head.className = "cmdk-head";
+    const input = document.createElement("input");
+    input.type = "search";
+    input.className = "cmdk-input";
+    input.placeholder = "搜索所有记忆库、标题、关键词，或输入操作名称…";
+    input.setAttribute("aria-label", "快速搜索");
+    const escHint = document.createElement("kbd");
+    escHint.className = "cmdk-kbd";
+    escHint.textContent = "ESC";
+    head.append(input, escHint);
+
+    const list = document.createElement("div");
+    list.className = "cmdk-list";
+    list.setAttribute("role", "listbox");
+
+    const empty = document.createElement("p");
+    empty.className = "cmdk-empty";
+    empty.hidden = true;
+    empty.textContent = "没有匹配的记忆或操作。";
+
+    const foot = document.createElement("div");
+    foot.className = "cmdk-foot";
+    foot.textContent = "↑↓ 选择 · Enter 打开 · Esc 关闭";
+
+    dialog.append(head, list, empty, foot);
+    document.body.appendChild(dialog);
+
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) closePalette();
+    });
+    input.addEventListener("input", () => {
+      window.clearTimeout(paletteTimer);
+      paletteTimer = window.setTimeout(() => fetchPalette(input.value), 120);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        movePalette(1);
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        movePalette(-1);
+      } else if (event.key === "Enter") {
+        const active = paletteItems[paletteIndex];
+        if (active && active.href) {
+          event.preventDefault();
+          closePalette();
+          window.location.href = active.href;
+        }
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        closePalette();
+      }
+    });
+
+    paletteDialog = dialog;
+    paletteInput = input;
+    paletteList = list;
+    paletteEmpty = empty;
+    return dialog;
+  }
+
+  function setPaletteActive(index) {
+    const rows = paletteList ? paletteList.querySelectorAll(".cmdk-item") : [];
+    if (!rows.length) {
+      paletteIndex = 0;
+      return;
+    }
+    paletteIndex = ((index % rows.length) + rows.length) % rows.length;
+    rows.forEach((row, idx) => {
+      const active = idx === paletteIndex;
+      row.classList.toggle("is-active", active);
+      row.setAttribute("aria-selected", active ? "true" : "false");
+      if (active) row.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function movePalette(delta) {
+    setPaletteActive(paletteIndex + delta);
+  }
+
+  function renderPalette(data) {
+    paletteList.textContent = "";
+    paletteItems = [];
+
+    const appendSection = (label, entries, kind) => {
+      if (!entries || !entries.length) return;
+      const heading = document.createElement("div");
+      heading.className = "cmdk-group";
+      heading.textContent = label;
+      paletteList.appendChild(heading);
+
+      for (const entry of entries) {
+        const idx = paletteItems.length;
+        paletteItems.push(entry);
+        const link = document.createElement("a");
+        link.className = "cmdk-item";
+        link.href = entry.href;
+        link.setAttribute("role", "option");
+
+        const main = document.createElement("div");
+        main.className = "cmdk-item-main";
+
+        const top = document.createElement("div");
+        top.className = "cmdk-item-title";
+        if (kind === "item" && entry.layer) {
+          const badge = document.createElement("span");
+          badge.className = "cmdk-layer";
+          badge.textContent = entry.layer;
+          top.appendChild(badge);
+        }
+        const titleText = document.createElement("span");
+        titleText.textContent = entry.title || entry.ref || "";
+        top.appendChild(titleText);
+        if (kind === "item" && entry.expired) {
+          const exp = document.createElement("span");
+          exp.className = "cmdk-expired";
+          exp.textContent = "已过期";
+          top.appendChild(exp);
+        }
+        main.appendChild(top);
+
+        const sub = entry.description || entry.subtitle || "";
+        if (sub) {
+          const desc = document.createElement("div");
+          desc.className = "cmdk-item-sub";
+          desc.textContent = sub;
+          main.appendChild(desc);
+        }
+        link.appendChild(main);
+
+        if (kind === "item" && entry.library) {
+          const meta = document.createElement("span");
+          meta.className = "cmdk-item-meta";
+          meta.textContent = entry.library;
+          link.appendChild(meta);
+        } else if (kind === "action" && entry.shortcut) {
+          const kbd = document.createElement("kbd");
+          kbd.className = "cmdk-kbd";
+          kbd.textContent = entry.shortcut;
+          link.appendChild(kbd);
+        }
+
+        link.addEventListener("mouseenter", () => setPaletteActive(idx));
+        paletteList.appendChild(link);
+      }
+    };
+
+    if (data.query) {
+      appendSection("记忆条目", data.items, "item");
+      appendSection("快捷操作", data.actions, "action");
+    } else {
+      appendSection("最近更新", data.items, "item");
+      appendSection("快捷操作", data.actions, "action");
+    }
+
+    paletteEmpty.hidden = paletteItems.length > 0;
+    setPaletteActive(0);
+  }
+
+  async function fetchPalette(q) {
+    const seq = ++paletteSeq;
+    try {
+      const url = `/quick_search?library=${encodeURIComponent(currentLibraryKey())}&q=${encodeURIComponent(q || "")}`;
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok || seq !== paletteSeq) return;
+      const data = await response.json();
+      if (seq !== paletteSeq) return;
+      renderPalette(data);
+    } catch {
+      // Ignore transient cancellation or local server reload errors.
+    }
+  }
+
+  function openPalette() {
+    const dialog = ensurePalette();
+    if (!dialog.open) {
+      if (typeof dialog.showModal === "function") {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute("open", "");
+      }
+    }
+    paletteInput.value = "";
+    paletteInput.focus();
+    fetchPalette("");
+  }
+
+  function closePalette() {
+    if (!paletteDialog) return;
+    if (typeof paletteDialog.close === "function" && paletteDialog.open) {
+      paletteDialog.close();
+    } else {
+      paletteDialog.removeAttribute("open");
+    }
+  }
+
+  window.__openQuickPalette = openPalette;
+
+  for (const trigger of document.querySelectorAll("[data-cmdk-trigger]")) {
+    trigger.addEventListener("click", () => openPalette());
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      if (paletteDialog && paletteDialog.open) {
+        closePalette();
+      } else {
+        openPalette();
+      }
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "n") {
+      const tag = (event.target && event.target.tagName) ? event.target.tagName.toLowerCase() : "";
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      event.preventDefault();
+      window.location.href = `/?library=${encodeURIComponent(currentLibraryKey())}&view=new#detail-title`;
+    }
+  });
 })();

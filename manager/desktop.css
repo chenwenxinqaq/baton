@@ -41,6 +41,9 @@
 .identity .mark{width:20px;height:20px;flex:none;fill:none;stroke:var(--primary);stroke-width:1.7;stroke-linejoin:round;stroke-linecap:round}
 .identity b{font-weight:inherit}
 .rail-search input{min-height:36px;padding:7px 11px;border:1px solid var(--line-strong);border-radius:7px;background:var(--surface);font-size:13px}
+.rail-cmdk{display:flex;align-items:center;justify-content:space-between;width:100%;padding:7px 11px;margin-top:-15px;border:1px solid var(--line);border-radius:7px;background:var(--surface-subtle);color:var(--text-secondary);font-size:12.5px;cursor:pointer;transition:border-color .15s ease,background .15s ease,color .15s ease}
+.rail-cmdk:hover{border-color:var(--line-strong);background:var(--surface-hover);color:var(--text)}
+.rail-cmdk kbd{font:500 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;padding:2px 5px;border:1px solid var(--line-strong);border-radius:4px;background:var(--surface);color:var(--muted)}
 .routes{display:grid;gap:4px}
 .routes a{display:flex;align-items:center;gap:11px;color:var(--text-secondary);font-size:14px;font-weight:550;padding:9px 12px;border-radius:7px;line-height:1.4}
 .routes a:hover{background:var(--surface-hover);text-decoration:none}
