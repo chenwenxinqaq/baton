@@ -12,6 +12,7 @@ entries, because an index line is written as a short human cue and is allowed to
 read differently from the entry's own summary.
 """
 
+from datetime import date, datetime
 import re
 import time
 
@@ -49,6 +50,7 @@ def lint_entries(entries, index=None, now=None, stale_days=STALE_DAYS):
     """Return consolidation findings for one library's entries and index."""
     index = index or {}
     now = now or time.time()
+    today = datetime.fromtimestamp(now).astimezone().date()
     findings = []
     stale_cutoff = now - stale_days * 86400
 
@@ -90,11 +92,24 @@ def lint_entries(entries, index=None, now=None, stale_days=STALE_DAYS):
                 "没有摘要，搜索结果里看不出结论",
                 "补一行给出结论的 description",
             ))
-        if layer in DATED_LAYERS and not DATE_RE.search(body):
+        verified_at = (entry.get("verified_at") or "").strip()
+        valid_until = (entry.get("valid_until") or "").strip()
+        if valid_until and layer != "L4" and entry.get("status", "active") != "archived":
+            try:
+                until_date = date.fromisoformat(valid_until)
+            except ValueError:
+                until_date = None
+            if until_date is not None and until_date < today:
+                findings.append(_finding(
+                    "expired-entry", "warning", ref,
+                    f"条目有效期已过（valid_until: {valid_until}）",
+                    "重新核实后延长或清空有效期，或归档为历史记录",
+                ))
+        if layer in DATED_LAYERS and not (verified_at and DATE_RE.fullmatch(verified_at)) and not DATE_RE.search(body):
             findings.append(_finding(
                 "missing-date", "info", ref,
                 "正文里没有 YYYY-MM-DD 的验证日期",
-                "写清这个结论是哪天验证的",
+                "在 frontmatter 补 verified_at，或在正文写清这个结论是哪天验证的",
             ))
         if layer == "L3" and (entry.get("updated_epoch") or 0) < stale_cutoff:
             findings.append(_finding(

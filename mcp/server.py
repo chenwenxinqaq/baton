@@ -117,6 +117,32 @@ def local_tz():
     return datetime.now().astimezone().tzinfo
 
 
+def normalize_iso_date(value, field_name="date"):
+    """Validate an optional YYYY-MM-DD date string; return '' when empty."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        raise ValueError(f"{field_name} must be a YYYY-MM-DD date.")
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid YYYY-MM-DD date.") from exc
+
+
+def is_date_expired(valid_until, today=None):
+    """Return True when valid_until is a valid YYYY-MM-DD strictly before today."""
+    text = str(valid_until or "").strip()
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return False
+    try:
+        until_date = date.fromisoformat(text)
+    except ValueError:
+        return False
+    ref_day = today or datetime.now().astimezone().date()
+    return until_date < ref_day
+
+
 def parse_timestamp(ts_str, fallback_epoch=None):
     """Parse ISO 8601 datetime or YYYY-MM-DD date into (aware_datetime, has_clock_time)."""
     tz = local_tz()
@@ -834,6 +860,8 @@ class MemoryStore:
                 meta, body = parse_frontmatter(raw)
                 cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
                 idx = indexed.get(rel, {})
+                verified_at = (meta.get("verified_at") or "").strip()
+                valid_until = (meta.get("valid_until") or "").strip()
                 items.append(
                     {
                         "library": self.library_id,
@@ -849,6 +877,9 @@ class MemoryStore:
                         "status": meta.get("status", "active"),
                         "created_at": cre_at,
                         "updated_at": upd_at,
+                        "verified_at": verified_at,
+                        "valid_until": valid_until,
+                        "expired": is_date_expired(valid_until),
                         "created_epoch": cre_ep,
                         "updated_epoch": upd_ep,
                         "body": body,
@@ -871,6 +902,8 @@ class MemoryStore:
                 if layer_val not in self.allowed_layers:
                     continue
                 cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
+                verified_at = (meta.get("verified_at") or "").strip()
+                valid_until = (meta.get("valid_until") or "").strip()
                 items.append(
                     {
                         "library": self.library_id,
@@ -886,6 +919,9 @@ class MemoryStore:
                         "status": status,
                         "created_at": cre_at,
                         "updated_at": upd_at,
+                        "verified_at": verified_at,
+                        "valid_until": valid_until,
+                        "expired": is_date_expired(valid_until),
                         "created_epoch": cre_ep,
                         "updated_epoch": upd_ep,
                         "body": body,
@@ -1033,6 +1069,9 @@ class MemoryStore:
                     score += 1.0 if ranker == "bm25f" else 6
                 elif age_sec <= 7 * 86400:
                     score += 0.5 if ranker == "bm25f" else 3
+            if item.get("expired") and item["layer"] != "L4":
+                # Gently demote expired entries so current facts rank first while keeping history findable.
+                score = round(max(0.001, score * 0.7), 3) if ranker == "bm25f" else max(1, score - 3)
 
             snippet = ""
             for line in item["body"].splitlines():
@@ -1056,6 +1095,9 @@ class MemoryStore:
                     "status": item["status"],
                     "created_at": item["created_at"],
                     "updated_at": item["updated_at"],
+                    **({"verified_at": item["verified_at"]} if item.get("verified_at") else {}),
+                    **({"valid_until": item["valid_until"]} if item.get("valid_until") else {}),
+                    **({"expired": True} if item.get("expired") else {}),
                     "_updated_epoch": item["updated_epoch"],
                     "_legacy_score": legacy_score,
                     "snippet": snippet or first_summary_snippet(item["body"]),
@@ -1123,6 +1165,9 @@ class MemoryStore:
                 "status": item["status"],
                 "created_at": item["created_at"],
                 "updated_at": item["updated_at"],
+                **({"verified_at": item["verified_at"]} if item.get("verified_at") else {}),
+                **({"valid_until": item["valid_until"]} if item.get("valid_until") else {}),
+                **({"expired": True} if item.get("expired") else {}),
             }
             for item in collected
         ]
@@ -1154,6 +1199,14 @@ class MemoryStore:
             # Agents pass this back as expected_updated_at to avoid clobbering a
             # parallel session's edit.
             base["updated_at"] = str(meta["updated_at"]).strip()
+        verified_at = str(meta.get("verified_at") or "").strip()
+        valid_until = str(meta.get("valid_until") or "").strip()
+        if verified_at:
+            base["verified_at"] = verified_at
+        if valid_until:
+            base["valid_until"] = valid_until
+            if is_date_expired(valid_until):
+                base["expired"] = True
         wanted = (section or "").strip()
         if wanted:
             if not sections:
@@ -1247,7 +1300,7 @@ class MemoryStore:
         return links[:limit], backlinks[:limit]
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False,
-                     expected_updated_at="", mode="replace"):
+                     expected_updated_at="", mode="replace", verified_at=None, valid_until=None):
         """Create or update a memory entry under lock, backing up previous versions to trash.
 
         ``expected_updated_at`` turns the write into a compare-and-set: if the entry
@@ -1279,6 +1332,8 @@ class MemoryStore:
         if not body:
             raise ValueError("body must not be empty.")
         secret_guard.ensure_no_secrets(title, description, body)
+        norm_verified = None if verified_at is None else normalize_iso_date(verified_at, "verified_at")
+        norm_valid_until = None if valid_until is None else normalize_iso_date(valid_until, "valid_until")
 
         resolved_type = topic_type or LAYER_DEFAULT_TYPE[layer]
         allowed_types = ALLOWED_LAYER_TYPES[layer] if user_managed else VALID_TOPIC_TYPES
@@ -1300,6 +1355,8 @@ class MemoryStore:
                 effective_title = title
                 effective_desc = description
                 merged_body = body
+                old_verified = ""
+                old_valid_until = ""
                 if target.is_file():
                     old_text = target.read_text(encoding="utf-8")
                     old_meta, old_body = parse_frontmatter(old_text)
@@ -1309,6 +1366,8 @@ class MemoryStore:
                     previous = self._previous_receipt(old_meta, old_body, backup)
                     status = old_meta.get("status", "active")
                     cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
+                    old_verified = (old_meta.get("verified_at") or "").strip()
+                    old_valid_until = (old_meta.get("valid_until") or "").strip()
                     if not topic_type and old_meta.get("type") in ALLOWED_LAYER_TYPES[layer]:
                         resolved_type = old_meta["type"]
                     effective_title = title or old_meta.get("title") or extract_title(old_body, name)
@@ -1319,6 +1378,10 @@ class MemoryStore:
                     self._check_expected_updated(expected_updated_at)
                 if not effective_title:
                     raise ValueError("title must be a single non-empty line.")
+                eff_verified = old_verified if norm_verified is None else norm_verified
+                eff_valid_until = old_valid_until if norm_valid_until is None else norm_valid_until
+                if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
+                    raise ValueError("valid_until must not be earlier than verified_at.")
                 meta = {
                     "name": name,
                     "title": effective_title,
@@ -1329,6 +1392,10 @@ class MemoryStore:
                     "created_at": cre_at,
                     "updated_at": ts_now,
                 }
+                if eff_verified:
+                    meta["verified_at"] = eff_verified
+                if eff_valid_until:
+                    meta["valid_until"] = eff_valid_until
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{merged_body}\n")
                 rel_out = target.relative_to(self.root).as_posix()
@@ -1344,6 +1411,12 @@ class MemoryStore:
                     "created_at": cre_at,
                     "updated_at": ts_now,
                 }
+                if eff_verified:
+                    res["verified_at"] = eff_verified
+                if eff_valid_until:
+                    res["valid_until"] = eff_valid_until
+                    if is_date_expired(eff_valid_until):
+                        res["expired"] = True
                 self._attach_previous(res, previous, merged_body)
                 return self._with_sync_warning(res, sync_status)
 
@@ -1399,6 +1472,12 @@ class MemoryStore:
             if mode == "append" and existing_is_target and not topic_type:
                 if existing_meta.get("type") in VALID_TOPIC_TYPES:
                     resolved_type = existing_meta["type"]
+            old_verified = (existing_meta.get("verified_at") or "").strip()
+            old_valid_until = (existing_meta.get("valid_until") or "").strip()
+            eff_verified = old_verified if norm_verified is None else norm_verified
+            eff_valid_until = old_valid_until if norm_valid_until is None else norm_valid_until
+            if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
+                raise ValueError("valid_until must not be earlier than verified_at.")
 
             desc_val = json.dumps(effective_desc, ensure_ascii=False)
             if mode == "append" and existing_body.strip():
@@ -1412,6 +1491,11 @@ class MemoryStore:
                 formatted_body = f"{base_body}\n\n{body}"
             else:
                 formatted_body = body if body.lstrip().startswith("# ") else f"# {effective_title}\n\n{body}"
+            extra_fm = ""
+            if eff_verified:
+                extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
+            if eff_valid_until:
+                extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
             content = (
                 f"---\n"
                 f"name: {name}\n"
@@ -1419,6 +1503,7 @@ class MemoryStore:
                 f"type: {resolved_type}\n"
                 f"created_at: {json.dumps(cre_at)}\n"
                 f"updated_at: {json.dumps(ts_now)}\n"
+                f"{extra_fm}"
                 f"---\n\n"
                 f"{formatted_body}\n"
             )
@@ -1459,6 +1544,12 @@ class MemoryStore:
                 "created_at": cre_at,
                 "updated_at": ts_now,
             }
+            if eff_verified:
+                res["verified_at"] = eff_verified
+            if eff_valid_until:
+                res["valid_until"] = eff_valid_until
+                if is_date_expired(eff_valid_until):
+                    res["expired"] = True
             if migrated_from:
                 res["migrated_from"] = migrated_from
             if related and previous is None and not migrated_from:
@@ -1686,6 +1777,10 @@ class MemoryStore:
                     "created_at": cre_at,
                     "updated_at": ts_now,
                 }
+                if (meta.get("verified_at") or "").strip():
+                    ordered["verified_at"] = str(meta["verified_at"]).strip()
+                if (meta.get("valid_until") or "").strip():
+                    ordered["valid_until"] = str(meta["valid_until"]).strip()
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
                 atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
                 rel_out = target.relative_to(self.root).as_posix()
@@ -1721,6 +1816,11 @@ class MemoryStore:
                     name_serialized = fm_name if NAME_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
                     desc_json = json.dumps(fm_desc, ensure_ascii=False)
                     fm_type = meta.get("type") if meta.get("type") in VALID_TOPIC_TYPES else "reference"
+                    extra_fm = ""
+                    if (meta.get("verified_at") or "").strip():
+                        extra_fm += f"verified_at: {json.dumps(str(meta['verified_at']).strip())}\n"
+                    if (meta.get("valid_until") or "").strip():
+                        extra_fm += f"valid_until: {json.dumps(str(meta['valid_until']).strip())}\n"
                     archived_raw = (
                         f"---\n"
                         f"name: {name_serialized}\n"
@@ -1728,6 +1828,7 @@ class MemoryStore:
                         f"type: {fm_type}\n"
                         f"created_at: {json.dumps(cre_at)}\n"
                         f"updated_at: {json.dumps(ts_now)}\n"
+                        f"{extra_fm}"
                         f"---\n\n"
                         f"{body.strip()}\n"
                     )
@@ -2037,7 +2138,7 @@ class WorkspaceStore:
         return result
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False, library="personal",
-                     expected_updated_at="", mode="replace"):
+                     expected_updated_at="", mode="replace", verified_at=None, valid_until=None):
         store = self._resolve_single_store(library or "personal")
         return store.upsert_entry(
             layer=layer,
@@ -2049,6 +2150,8 @@ class WorkspaceStore:
             user_managed=user_managed,
             expected_updated_at=expected_updated_at,
             mode=mode,
+            verified_at=verified_at,
+            valid_until=valid_until,
         )
 
     def archive_entry(self, name, user_managed=False, library="personal"):
@@ -2155,6 +2258,8 @@ TOOLS = [
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
                 "expected_updated_at": {"type": "string", "default": "", "description": "The updated_at you based your edit on. The write is rejected if the entry changed since then, so a parallel session's edit is not lost."},
+                "verified_at": {"type": "string", "description": "Optional YYYY-MM-DD date when the facts in this entry were last verified. Omit to preserve existing value on updates; pass empty string to clear."},
+                "valid_until": {"type": "string", "description": "Optional YYYY-MM-DD expiration date for temporary rules, deadlines, or authorizations. Omit to preserve existing value on updates; pass empty string to clear."},
             },
             "required": ["layer", "name", "body"],
         },
@@ -2292,7 +2397,8 @@ def handle_tool_call(store, name, args):
 
 def compact_search_hit(hit):
     """Project only after final ranking/merge: qualified ref is the read address."""
-    fields = ("ref", "trust", "read_only", "layer", "status", "updated_at", "match",
+    fields = ("ref", "trust", "read_only", "layer", "status", "updated_at",
+              "verified_at", "valid_until", "expired", "match",
               "matched_phrase", "title", "description", "snippet", "see_also")
     return {key: hit[key] for key in fields if key in hit}
 
@@ -2351,6 +2457,10 @@ def _handle_tool_call(store, name, args):
             expected_updated_at=args.get("expected_updated_at", "") or "",
             mode=args.get("mode", "replace") or "replace",
         )
+        if "verified_at" in args and args["verified_at"] is not None:
+            kwargs["verified_at"] = args["verified_at"]
+        if "valid_until" in args and args["valid_until"] is not None:
+            kwargs["valid_until"] = args["valid_until"]
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.upsert_entry(**kwargs)

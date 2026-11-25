@@ -727,6 +727,19 @@
     padding: 0.08rem 0.5rem;
     border-radius: 999px;
   }
+  .meta-chip-warn {
+    color: #9a3412;
+    background: #fff7ed;
+    border-color: #fdba74;
+    font-weight: 600;
+  }
+  @media (prefers-color-scheme: dark) {
+    .meta-chip-warn {
+      color: #fdba74;
+      background: rgba(234, 88, 12, 0.18);
+      border-color: rgba(251, 146, 60, 0.45);
+    }
+  }
 
   .detail-title {
     font-size: clamp(1.25rem, 2.2vw, 1.55rem);

@@ -231,6 +231,8 @@ class TopicEntry:
     entry_type: str = "reference"
     created_at: str = ""
     updated_at: str = ""
+    verified_at: str = ""
+    valid_until: str = ""
     body: str = ""
     revision: str = ""
 
@@ -246,6 +248,8 @@ class Entry:
     status: str = "active"
     created_at: str = ""
     updated_at: str = ""
+    verified_at: str = ""
+    valid_until: str = ""
     created_epoch: float = 0.0
     updated_epoch: float = 0.0
     revision: str = ""
@@ -267,6 +271,10 @@ class Entry:
             "created_at": self.created_at or self.updated_at,
             "updated_at": self.updated_at,
         }
+        if self.verified_at:
+            metadata["verified_at"] = self.verified_at
+        if self.valid_until:
+            metadata["valid_until"] = self.valid_until
         fields = "\n".join(
             f"{key}: {json.dumps(value, ensure_ascii=False)}"
             for key, value in metadata.items()
@@ -286,7 +294,7 @@ class Entry:
                 raise InvalidEntry("条目头部格式无效。")
             fields[key] = json.loads(value)
         required = {"name", "title", "description", "type", "layer", "status", "updated_at"}
-        allowed_keys = required | {"created_at"}
+        allowed_keys = required | {"created_at", "verified_at", "valid_until"}
         if not (required <= fields.keys() <= allowed_keys) or any(not isinstance(v, str) for v in fields.values()):
             raise InvalidEntry("条目头部字段不匹配。")
         if fields["name"] != name or fields["layer"] not in LAYERS or fields["status"] not in STATES:
@@ -296,6 +304,8 @@ class Entry:
             raise InvalidEntry("条目类型与层级不匹配。")
         upd_str = fields["updated_at"]
         cre_str = fields.pop("created_at", "") or upd_str
+        verified_str = fields.pop("verified_at", "").strip()
+        valid_until_str = fields.pop("valid_until", "").strip()
         upd_dt, _ = mcp_server.parse_timestamp(upd_str)
         cre_dt, _ = mcp_server.parse_timestamp(cre_str)
         if cre_dt > upd_dt:
@@ -303,6 +313,8 @@ class Entry:
         return cls(
             **fields,
             created_at=cre_str,
+            verified_at=verified_str,
+            valid_until=valid_until_str,
             created_epoch=cre_dt.timestamp(),
             updated_epoch=upd_dt.timestamp(),
             entry_type=entry_type,
@@ -671,6 +683,8 @@ class Library:
             entry_type=meta.get("type", LAYERS[topic.layer][1]),
             created_at=cre_at,
             updated_at=upd_at,
+            verified_at=(meta.get("verified_at") or "").strip(),
+            valid_until=(meta.get("valid_until") or "").strip(),
             body=body.rstrip("\n"),
             revision=self._topic_revision(raw_bytes, topic),
         )
@@ -695,9 +709,12 @@ class Library:
             candidate = f"{prefix}-{stamp}-{secrets.token_hex(2)}"
         return candidate
 
-    def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type=""):
+    def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type="",
+                   verified_at=None, valid_until=None):
         self._ensure_writable(layer=layer)
-        validate_common_fields(layer, title, description, body)
+        validate_common_fields(layer, title, description, body, verified_at=verified_at, valid_until=valid_until)
+        norm_verified = None if verified_at is None else str(verified_at).strip()
+        norm_valid_until = None if valid_until is None else str(valid_until).strip()
         with self.write_lock():
             store = mcp_server.MemoryStore(self.root)
             _, current_topics = self.read_index()
@@ -733,10 +750,19 @@ class Library:
 
                 ts_now = mcp_server.now_iso(cur.updated_at)
                 cre_at = cur.created_at or ts_now
+                eff_verified = cur.verified_at if norm_verified is None else norm_verified
+                eff_valid_until = cur.valid_until if norm_valid_until is None else norm_valid_until
+                if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
+                    raise InvalidEntry("有效期截止日期不能早于核实日期。")
                 name_serialized = (
                     fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
                 )
                 desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
+                extra_fm = ""
+                if eff_verified:
+                    extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
+                if eff_valid_until:
+                    extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
                 content = (
                     f"---\n"
                     f"name: {name_serialized}\n"
@@ -744,6 +770,7 @@ class Library:
                     f"type: {fm_type}\n"
                     f"created_at: {json.dumps(cre_at)}\n"
                     f"updated_at: {json.dumps(ts_now)}\n"
+                    f"{extra_fm}"
                     f"---\n\n"
                     f"{body.strip()}\n"
                 )
@@ -780,6 +807,13 @@ class Library:
             fm_type = entry_type if entry_type in VALID_TOPIC_TYPES else LAYERS[layer][1]
             idx_desc = description.strip() or title
             desc_serialized = json.dumps(idx_desc, ensure_ascii=False)
+            eff_verified = norm_verified or ""
+            eff_valid_until = norm_valid_until or ""
+            extra_fm = ""
+            if eff_verified:
+                extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
+            if eff_valid_until:
+                extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
             content = (
                 f"---\n"
                 f"name: {final_slug}\n"
@@ -787,6 +821,7 @@ class Library:
                 f"type: {fm_type}\n"
                 f"created_at: {json.dumps(ts_now)}\n"
                 f"updated_at: {json.dumps(ts_now)}\n"
+                f"{extra_fm}"
                 f"---\n\n"
                 f"{body.strip()}\n"
             )
@@ -830,6 +865,11 @@ class Library:
             fm_desc = cur.file_description or cur.description or cur.title
             desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
             fm_type = cur.entry_type if cur.entry_type in VALID_TOPIC_TYPES else "reference"
+            extra_fm = ""
+            if cur.verified_at:
+                extra_fm += f"verified_at: {json.dumps(cur.verified_at)}\n"
+            if cur.valid_until:
+                extra_fm += f"valid_until: {json.dumps(cur.valid_until)}\n"
             content = (
                 f"---\n"
                 f"name: {name_serialized}\n"
@@ -837,6 +877,7 @@ class Library:
                 f"type: {fm_type}\n"
                 f"created_at: {json.dumps(cre_at)}\n"
                 f"updated_at: {json.dumps(ts_now)}\n"
+                f"{extra_fm}"
                 f"---\n\n"
                 f"{cur.body.strip()}\n"
             )
@@ -909,8 +950,13 @@ class Library:
         self._ensure_writable(layer=entry.layer, user_managed=True)
         try:
             secret_guard.ensure_no_secrets(entry.title, entry.description, entry.body)
+            norm_v = mcp_server.normalize_iso_date(entry.verified_at, "verified_at") if entry.verified_at else ""
+            norm_u = mcp_server.normalize_iso_date(entry.valid_until, "valid_until") if entry.valid_until else ""
         except ValueError as exc:
             raise InvalidEntry(str(exc)) from exc
+        if norm_v and norm_u and norm_u < norm_v:
+            raise InvalidEntry("有效期截止日期不能早于核实日期。")
+        entry = replace(entry, verified_at=norm_v, valid_until=norm_u)
         path = self.path(entry.name)
         with self.write_lock():
             if entry.revision:
@@ -961,7 +1007,7 @@ class Library:
         self._enqueue_async_sync(message)
 
 
-def validate_common_fields(layer, title, description, body):
+def validate_common_fields(layer, title, description, body, verified_at=None, valid_until=None):
     if layer not in LAYERS:
         raise InvalidEntry("请选择 L0–L4 中的一层。")
     if not title or len(title) > MAX_TITLE_CHARS or len(title.splitlines()) != 1:
@@ -972,6 +1018,13 @@ def validate_common_fields(layer, title, description, body):
         raise InvalidEntry(f"检索摘要须为单行且不超过 {MAX_DESC_CHARS} 个字符。")
     if not body.strip() or len(body) > MAX_BODY_CHARS:
         raise InvalidEntry(f"正文不能为空且不超过 {MAX_BODY_CHARS:,} 个字符。")
+    try:
+        norm_v = "" if verified_at is None else mcp_server.normalize_iso_date(verified_at, "verified_at")
+        norm_u = "" if valid_until is None else mcp_server.normalize_iso_date(valid_until, "valid_until")
+    except ValueError as exc:
+        raise InvalidEntry("核实日期和有效期截止日期须为 YYYY-MM-DD 格式。") from exc
+    if norm_v and norm_u and norm_u < norm_v:
+        raise InvalidEntry("有效期截止日期不能早于核实日期。")
     try:
         secret_guard.ensure_no_secrets(title, description, body)
     except ValueError as exc:
@@ -1081,6 +1134,8 @@ def render_memory_editor_html(
     entry_name="",
     revision="",
     entry_type="",
+    verified_at="",
+    valid_until="",
     file_meta_note="",
 ):
     """Render unified accessible Markdown editor for indexed topics and user-managed notes."""
@@ -1155,6 +1210,18 @@ def render_memory_editor_html(
             <input id="description" name="description" type="text" value="{escape(description)}" maxlength="{MAX_DESC_CHARS}"
                    aria-describedby="desc-help" placeholder="写明核心结论与下次遇到什么场景时 Agent 应该优先读这条">
             <span id="desc-help" class="field-hint">主知识库记忆会将此摘要同步展示在 <code>MEMORY.md</code> 索引行（单行 ≤ {MAX_DESC_CHARS} 字）。</span>
+          </div>
+          <div class="form-row-two">
+            <div class="field">
+              <label for="verified_at">核实日期（可选）</label>
+              <input id="verified_at" name="verified_at" type="date" value="{escape(verified_at)}">
+              <span class="field-hint">事实最后一次人工或实测核实的日期（YYYY-MM-DD），有助于判断记忆新鲜度。</span>
+            </div>
+            <div class="field">
+              <label for="valid_until">有效期至（可选）</label>
+              <input id="valid_until" name="valid_until" type="date" value="{escape(valid_until)}">
+              <span class="field-hint">临时授权、限时策略或里程碑快照的截止日；过期后搜索降权并提示复核。</span>
+            </div>
           </div>
           <div class="field">
             <label for="body">正文（Markdown） <span class="required">必填</span></label>
@@ -2538,6 +2605,7 @@ def _usage_section(today, week):
 
 _LINT_CHECK_LABELS = {
     "secret-leak": "包含疑似明文凭据",
+    "expired-entry": "有效期已过，待复核",
     "duplicate-frontmatter": "正文里混进了 frontmatter",
     "index-missing": "不在索引里",
     "index-orphan": "索引指向了不存在的文件",
@@ -3237,6 +3305,8 @@ def render(
             title=topic_draft.title if topic_draft else entry.title,
             description=topic_draft.description if topic_draft else entry.description,
             body=topic_draft.body if topic_draft else entry.body,
+            verified_at=topic_draft.verified_at if topic_draft else entry.verified_at,
+            valid_until=topic_draft.valid_until if topic_draft else entry.valid_until,
             slug=draft_slug,
             cancel_link=query(**link_params),
         )
@@ -3262,6 +3332,8 @@ def render(
             entry_name=entry.name,
             revision=entry.revision,
             entry_type=entry.entry_type,
+            verified_at=entry.verified_at,
+            valid_until=entry.valid_until,
             cancel_link=query(**link_params, entry=entry.name) + "#detail-title",
             file_meta_note=meta_note,
         )
@@ -3293,6 +3365,8 @@ def render(
                 orig_topic=t_entry.path,
                 revision=t_entry.revision,
                 entry_type=t_entry.entry_type,
+                verified_at=t_entry.verified_at,
+                valid_until=t_entry.valid_until,
                 cancel_link=query(**link_params, topic=t_entry.path) + "#detail-title",
                 file_meta_note=meta_note,
             )
@@ -3326,12 +3400,21 @@ def render(
     elif entry.name and entry.revision:
         heading = entry.title
         lname = LAYERS[entry.layer][0]
+        validity_chips = ""
+        if entry.verified_at:
+            validity_chips += f'<span class="meta-chip">核实于 {escape(entry.verified_at)}</span>'
+        if entry.valid_until:
+            exp = mcp_server.is_date_expired(entry.valid_until)
+            chip_cls = "meta-chip meta-chip-warn" if exp else "meta-chip"
+            chip_txt = f"已过期 · {entry.valid_until}" if exp else f"有效期至 {entry.valid_until}"
+            validity_chips += f'<span class="{chip_cls}">{escape(chip_txt)}</span>'
         detail_badges = (
             f'<div class="detail-badges">'
             f'<span class="layer-badge layer-{entry.layer}">{entry.layer} · {escape(lname)}</span>'
             f'<span class="meta-chip">个人手记</span>'
             f'<span class="meta-chip">类型: {escape(entry.resolved_type())}</span>'
             f'<span class="meta-chip">{STATES[entry.status]}</span>'
+            f"{validity_chips}"
             f"</div>"
         )
         detail_submeta = render_detail_timestamps_html(
@@ -3426,11 +3509,20 @@ def render(
             detail = library.read_markdown(library.root / t_entry.path)
             heading = t_entry.title
             lname = LAYERS[t_entry.layer][0]
+            validity_chips = ""
+            if t_entry.verified_at:
+                validity_chips += f'<span class="meta-chip">核实于 {escape(t_entry.verified_at)}</span>'
+            if t_entry.valid_until:
+                exp = mcp_server.is_date_expired(t_entry.valid_until) and t_entry.layer != "L4"
+                chip_cls = "meta-chip meta-chip-warn" if exp else "meta-chip"
+                chip_txt = f"已过期 · {t_entry.valid_until}" if exp else f"有效期至 {t_entry.valid_until}"
+                validity_chips += f'<span class="{chip_cls}">{escape(chip_txt)}</span>'
             detail_badges = (
                 f'<div class="detail-badges">'
                 f'<span class="layer-badge layer-{t_entry.layer}">{t_entry.layer} · {escape(lname)}</span>'
                 f'<span class="meta-chip">知识库索引</span>'
                 f'<span class="meta-chip">type: {escape(t_entry.entry_type)}</span>'
+                f"{validity_chips}"
                 f"</div>"
             )
             detail_submeta = render_detail_timestamps_html(
@@ -4471,6 +4563,8 @@ class Handler(BaseHTTPRequestHandler):
             body = fields.get("body", "").replace("\r\n", "\n").replace("\r", "\n")
             slug = fields.get("slug", "").strip()
             entry_type = fields.get("entry_type", "").strip()
+            verified_at = fields.get("verified_at", "").strip()
+            valid_until = fields.get("valid_until", "").strip()
             draft = TopicEntry(
                 path=orig_topic,
                 slug=Path(orig_topic).stem if orig_topic else slug,
@@ -4478,6 +4572,8 @@ class Handler(BaseHTTPRequestHandler):
                 description=description,
                 layer=layer if layer in LAYERS else "L1",
                 entry_type=entry_type or LAYERS.get(layer, ("", "reference", ""))[1],
+                verified_at=verified_at,
+                valid_until=valid_until,
                 body=body,
                 revision=revision,
             )
@@ -4492,6 +4588,8 @@ class Handler(BaseHTTPRequestHandler):
                     body=body,
                     slug=slug,
                     entry_type=entry_type,
+                    verified_at=verified_at,
+                    valid_until=valid_until,
                 )
             except StaleEntry:
                 self.page(
@@ -4545,6 +4643,8 @@ class Handler(BaseHTTPRequestHandler):
                 description=fields.get("description", "").strip(),
                 layer=fields.get("layer", ""),
                 body=fields.get("body", "").replace("\r\n", "\n").replace("\r", "\n"),
+                verified_at=fields.get("verified_at", "").strip(),
+                valid_until=fields.get("valid_until", "").strip(),
             )
         try:
             current = library.read(name) if name else Entry()
@@ -4563,7 +4663,14 @@ class Handler(BaseHTTPRequestHandler):
             if current.revision != revision:
                 raise StaleEntry
             if saving:
-                validate_common_fields(entry.layer, entry.title, entry.description, entry.body)
+                validate_common_fields(
+                    entry.layer,
+                    entry.title,
+                    entry.description,
+                    entry.body,
+                    verified_at=entry.verified_at,
+                    valid_until=entry.valid_until,
+                )
                 new_name = fields.get("create_id", "")
                 if not name and not re.fullmatch(r"entry-[a-f0-9]{20}", new_name):
                     raise InvalidEntry("无法识别新条目，请刷新页面后重试。")

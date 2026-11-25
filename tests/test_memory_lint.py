@@ -9,6 +9,7 @@ import unittest
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "scripts"))
 sys.path.insert(0, str(CODE / "mcp"))
+sys.path.insert(0, str(CODE / "manager"))
 sys.path.insert(0, str(CODE / "tests"))
 
 import memory_lint  # noqa: E402
@@ -144,6 +145,109 @@ class LintStoreTests(unittest.TestCase):
         findings = self.store.lint()["findings"]
         self.assertEqual([f["check"] for f in findings], ["duplicate-frontmatter"])
         self.assertEqual(findings[0]["ref"], "methods/docker-cache.md")
+
+    def test_verified_at_and_valid_until_drive_lint_search_and_manager_roundtrip(self):
+        import manager
+
+        # Frontmatter verified_at satisfies dated-layer requirement without inline date in body.
+        self.store.upsert_entry(
+            "L1",
+            "release-steps",
+            "发版操作指南",
+            "本地发版核心步骤",
+            "运行单测后再打包。",
+            verified_at="2026-11-20",
+        )
+        self.assertEqual(self.store.lint()["findings"], [])
+
+        # Expired entry is flagged by lint and gently ranked below an active match.
+        self.store.upsert_entry(
+            "L3",
+            "temp-token-policy",
+            "临时发版令牌策略",
+            "临时发版令牌有效期说明",
+            "2026-01-01 确认的临时策略。",
+            verified_at="2026-01-01",
+            valid_until="2026-01-15",
+        )
+        self.store.upsert_entry(
+            "L3",
+            "current-token-policy",
+            "临时发版令牌策略",
+            "临时发版令牌有效期说明",
+            "2026-11-20 确认的最新策略。",
+            verified_at="2026-11-20",
+            valid_until="2099-12-31",
+        )
+        read_exp = self.store.read_entry("projects/temp-token-policy.md")
+        self.assertEqual(read_exp["verified_at"], "2026-01-01")
+        self.assertEqual(read_exp["valid_until"], "2026-01-15")
+        self.assertTrue(read_exp["expired"])
+
+        hits = self.store.search("临时发版令牌策略", limit=5)
+        self.assertEqual(hits[0]["path"], "projects/current-token-policy.md")
+        self.assertFalse(hits[0].get("expired"))
+        self.assertEqual(hits[1]["path"], "projects/temp-token-policy.md")
+        self.assertTrue(hits[1]["expired"])
+
+        lint_res = self.store.lint()
+        expired_findings = [f for f in lint_res["findings"] if f["check"] == "expired-entry"]
+        self.assertEqual(len(expired_findings), 1)
+        self.assertEqual(expired_findings[0]["ref"], "projects/temp-token-policy.md")
+
+        # Updating body without passing dates preserves existing dates; invalid range is rejected.
+        self.store.upsert_entry(
+            "L3",
+            "current-token-policy",
+            body="补充说明。",
+            mode="append",
+        )
+        read_cur = self.store.read_entry("projects/current-token-policy.md")
+        self.assertEqual(read_cur["verified_at"], "2026-11-20")
+        self.assertEqual(read_cur["valid_until"], "2099-12-31")
+        with self.assertRaises(ValueError):
+            self.store.upsert_entry(
+                "L3",
+                "bad-dates",
+                "错误日期",
+                "测试",
+                "正文",
+                verified_at="2026-11-25",
+                valid_until="2026-11-01",
+            )
+
+        # Manager Library preserves verified_at / valid_until across topic edits and user-managed saves.
+        lib = manager.Library(self.store.root, "personal")
+        topic = lib.read_topic("projects/current-token-policy.md")
+        self.assertEqual(topic.verified_at, "2026-11-20")
+        self.assertEqual(topic.valid_until, "2099-12-31")
+        lib.save_topic(
+            orig_path=topic.path,
+            expected_revision=topic.revision,
+            layer="L3",
+            title=topic.title,
+            description=topic.description,
+            body=topic.body + "\n补充人工确认。",
+            verified_at="2026-11-26",
+            valid_until="2099-12-31",
+        )
+        topic2 = lib.read_topic("projects/current-token-policy.md")
+        self.assertEqual(topic2.verified_at, "2026-11-26")
+        self.assertEqual(topic2.valid_until, "2099-12-31")
+
+        um = manager.Entry(
+            name="entry-0123456789abcdef0123",
+            title="手记测试",
+            description="个人手记带有效期",
+            layer="L2",
+            body="只用于测试。",
+            verified_at="2026-11-26",
+            valid_until="2099-01-01",
+        )
+        lib.save(um)
+        um_read = lib.read(um.name)
+        self.assertEqual(um_read.verified_at, "2026-11-26")
+        self.assertEqual(um_read.valid_until, "2099-01-01")
 
 
 if __name__ == "__main__":

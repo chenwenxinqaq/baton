@@ -2365,6 +2365,8 @@ def main():
             item.add_argument("--title", default="", help="Single-line title (required for new entries; optional when updating/appending).")
             item.add_argument("--description", default="", help="Concise retrieval cue (optional when updating/appending).")
             item.add_argument("--append", action="store_true", help="Append body to an existing entry without replacing it.")
+            item.add_argument("--verified-at", default=None, help="Optional YYYY-MM-DD verification date (empty string clears).")
+            item.add_argument("--valid-until", default=None, help="Optional YYYY-MM-DD expiration date (empty string clears).")
             item.add_argument("--body-file", required=True, help="UTF-8 Markdown file, or - for standard input.")
 
     p_init = sub.add_parser("init", help="Initialize an empty private or shared library.")
@@ -2509,6 +2511,8 @@ def main():
                     body,
                     library=args.library or "personal",
                     mode="append" if args.append else "replace",
+                    verified_at=args.verified_at,
+                    valid_until=args.valid_until,
                 )
         except (ValueError, OSError) as exc:
             parser.exit(1, f"{exc}\n")
