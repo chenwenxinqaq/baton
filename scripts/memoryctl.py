@@ -2204,8 +2204,9 @@ def main():
         if command == "write":
             item.add_argument("--layer", choices=ALL_LAYERS, required=True)
             item.add_argument("--name", required=True)
-            item.add_argument("--title", required=True)
-            item.add_argument("--description", required=True)
+            item.add_argument("--title", default="", help="Single-line title (required for new entries; optional when updating/appending).")
+            item.add_argument("--description", default="", help="Concise retrieval cue (optional when updating/appending).")
+            item.add_argument("--append", action="store_true", help="Append body to an existing entry without replacing it.")
             item.add_argument("--body-file", required=True, help="UTF-8 Markdown file, or - for standard input.")
 
     p_init = sub.add_parser("init", help="Initialize an empty private or shared library.")
@@ -2342,8 +2343,15 @@ def main():
                     )
             else:
                 body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
-                result = store.upsert_entry(args.layer, args.name, args.title, args.description, body,
-                                            library=args.library or "personal")
+                result = store.upsert_entry(
+                    args.layer,
+                    args.name,
+                    args.title,
+                    args.description,
+                    body,
+                    library=args.library or "personal",
+                    mode="append" if args.append else "replace",
+                )
         except (ValueError, OSError) as exc:
             parser.exit(1, f"{exc}\n")
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -160,6 +160,75 @@ class WriteSafetyTests(unittest.TestCase):
                     if "default" in schema:
                         self.assertIn(schema["default"], schema["enum"])
 
+    def test_append_mode_adds_incremental_note_without_rewriting_whole_entry(self):
+        first = self._write("docker-cache", "2026-11-25 首次定位到缓存键漂移。")
+        second = self.store.upsert_entry(
+            layer="L1",
+            name="docker-cache",
+            body="## 2026-11-26 补充\n\n已改为显式传入锁定哈希，构建耗时下降 40%。",
+            mode="append",
+        )
+        self.assertEqual(second["mode"], "append")
+        self.assertNotIn("content_warning", second)
+        self.assertEqual(second["created_at"], first["created_at"])
+        self.assertNotEqual(second["updated_at"], first["updated_at"])
+        saved = self.store.read_entry("methods/docker-cache.md")
+        self.assertIn("# Docker 构建缓存排查", saved["content"])
+        self.assertIn("2026-11-25 首次定位到缓存键漂移。", saved["content"])
+        self.assertIn("## 2026-11-26 补充", saved["content"])
+        self.assertIn("构建耗时下降 40%", saved["content"])
+        index_text = (self.store.root / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("[Docker 构建缓存排查](methods/docker-cache.md) — 缓存失效的根因", index_text)
+
+    def test_append_mode_respects_expected_updated_at_and_requires_title_for_new_entry(self):
+        first = self._write("docker-cache", "第一段。")
+        second = self.store.upsert_entry(
+            layer="L1",
+            name="docker-cache",
+            body="第二段。",
+            mode="append",
+            expected_updated_at=first["updated_at"],
+        )
+        with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+            self.store.upsert_entry(
+                layer="L1",
+                name="docker-cache",
+                body="过期的追加。",
+                mode="append",
+                expected_updated_at=first["updated_at"],
+            )
+        self.assertNotEqual(second["updated_at"], first["updated_at"])
+        with self.assertRaisesRegex(ValueError, "title must be a single non-empty line"):
+            self.store.upsert_entry(layer="L1", name="brand-new", body="没有标题的新条目。", mode="append")
+
+    def test_mcp_initialize_returns_write_guidance_instructions_for_all_clients(self):
+        resp = mcp_server.process_one_message(
+            self.store,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "claude-ai"}},
+            },
+        )
+        instructions = resp["result"].get("instructions", "")
+        self.assertIn("memory_search", instructions)
+        self.assertIn("mode='append'", instructions)
+        self.assertIn("MEMORY.md §0", instructions)
+
+    def test_mcp_tool_call_supports_append_without_title_or_description(self):
+        self._write("docker-cache", "初始结论。")
+        res, data = mcp_server._handle_tool_call(
+            self.store,
+            "memory_upsert",
+            {"layer": "L1", "name": "docker-cache", "body": "追加结论。", "mode": "append"},
+        )
+        self.assertFalse(res.get("isError", False))
+        self.assertEqual(data["mode"], "append")
+        text = self.store.read_entry("methods/docker-cache.md")["content"]
+        self.assertIn("初始结论。", text)
+        self.assertIn("追加结论。", text)
+
 
 if __name__ == "__main__":
     unittest.main()

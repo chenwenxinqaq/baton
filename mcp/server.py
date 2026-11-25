@@ -1246,13 +1246,14 @@ class MemoryStore:
         ]
         return links[:limit], backlinks[:limit]
 
-    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False,
-                     expected_updated_at=""):
+    def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False,
+                     expected_updated_at="", mode="replace"):
         """Create or update a memory entry under lock, backing up previous versions to trash.
 
         ``expected_updated_at`` turns the write into a compare-and-set: if the entry
         changed since the agent read it, the write is rejected instead of silently
-        dropping the other session's edit.
+        dropping the other session's edit. ``mode="append"`` appends ``body`` to an
+        existing entry without needing to read and re-emit the entire document.
         """
         if self.mode == "ro":
             raise ValueError(f"Library '{self.library_id}' is read-only.")
@@ -1265,10 +1266,13 @@ class MemoryStore:
             raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
         if not NAME_RE.fullmatch(name) or name.lower() == "readme":
             raise ValueError("name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ and not be 'readme'.")
-        title = title.strip()
-        description = description.strip()
-        body = body.strip() if user_managed else strip_generated_header(body)
-        if not title or "\n" in title:
+        mode = (mode or "replace").strip().lower()
+        if mode not in {"replace", "append"}:
+            raise ValueError("mode must be 'replace' or 'append'.")
+        title = (title or "").strip()
+        description = (description or "").strip()
+        body = (body or "").strip() if user_managed else strip_generated_header(body or "")
+        if "\n" in title:
             raise ValueError("title must be a single non-empty line.")
         if "\n" in description:
             raise ValueError("description must be a single line.")
@@ -1283,7 +1287,8 @@ class MemoryStore:
 
         related = []
         if not user_managed and not (self.root / LAYER_DIRS[layer] / f"{name}.md").is_file():
-            related = self._similar_entries(f"{title} {description}", name)
+            if title or description:
+                related = self._similar_entries(f"{title} {description}", name)
 
         with self.write_lock():
             ts_now = now_iso()
@@ -1292,6 +1297,9 @@ class MemoryStore:
                 status = "active"
                 cre_at = ts_now
                 previous = None
+                effective_title = title
+                effective_desc = description
+                merged_body = body
                 if target.is_file():
                     old_text = target.read_text(encoding="utf-8")
                     old_meta, old_body = parse_frontmatter(old_text)
@@ -1303,12 +1311,18 @@ class MemoryStore:
                     cre_at = old_meta.get("created_at") or old_meta.get("updated_at") or ts_now
                     if not topic_type and old_meta.get("type") in ALLOWED_LAYER_TYPES[layer]:
                         resolved_type = old_meta["type"]
+                    effective_title = title or old_meta.get("title") or extract_title(old_body, name)
+                    effective_desc = description or old_meta.get("description", "")
+                    if mode == "append" and old_body.strip():
+                        merged_body = f"{old_body.strip()}\n\n{body}"
                 else:
                     self._check_expected_updated(expected_updated_at)
+                if not effective_title:
+                    raise ValueError("title must be a single non-empty line.")
                 meta = {
                     "name": name,
-                    "title": title,
-                    "description": description,
+                    "title": effective_title,
+                    "description": effective_desc,
                     "type": resolved_type,
                     "layer": layer,
                     "status": status,
@@ -1316,7 +1330,7 @@ class MemoryStore:
                     "updated_at": ts_now,
                 }
                 header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
-                atomic_write(target, f"---\n{header}\n---\n\n{body}\n")
+                atomic_write(target, f"---\n{header}\n---\n\n{merged_body}\n")
                 rel_out = target.relative_to(self.root).as_posix()
                 message = f"memory({self.library_id}): upsert {rel_out}"
                 sync_status = self._maybe_auto_commit(message)
@@ -1326,10 +1340,11 @@ class MemoryStore:
                     "ref": self._entry_ref(rel_out),
                     "path": rel_out,
                     "indexed": False,
+                    "mode": mode,
                     "created_at": cre_at,
                     "updated_at": ts_now,
                 }
-                self._attach_previous(res, previous, body)
+                self._attach_previous(res, previous, merged_body)
                 return self._with_sync_warning(res, sync_status)
 
             folder = LAYER_DIRS[layer]
@@ -1352,6 +1367,9 @@ class MemoryStore:
                 )
             previous = None
             preserved_created = None
+            existing_meta = {}
+            existing_body = ""
+            existing_is_target = False
             prior_timestamps = []
             for current in current_paths:
                 old_meta, old_body = parse_frontmatter(current.read_text(encoding="utf-8"))
@@ -1364,14 +1382,36 @@ class MemoryStore:
                 if previous is None:
                     previous = self._previous_receipt(old_meta, old_body, backup)
                     preserved_created = created
+                    existing_meta = old_meta
+                    existing_body = old_body
+                    existing_is_target = (current == target)
             if prior_timestamps:
                 ts_now = now_iso(max(prior_timestamps)[1])
             else:
                 self._check_expected_updated(expected_updated_at)
             cre_at = preserved_created or ts_now
 
-            desc_val = json.dumps(description or title, ensure_ascii=False)
-            formatted_body = body if body.lstrip().startswith("# ") else f"# {title}\n\n{body}"
+            existing_title = extract_title(existing_body, name) if previous is not None else ""
+            effective_title = title or existing_title
+            if not effective_title:
+                raise ValueError("title must be a single non-empty line.")
+            effective_desc = description or existing_meta.get("description", "") or effective_title
+            if mode == "append" and existing_is_target and not topic_type:
+                if existing_meta.get("type") in VALID_TOPIC_TYPES:
+                    resolved_type = existing_meta["type"]
+
+            desc_val = json.dumps(effective_desc, ensure_ascii=False)
+            if mode == "append" and existing_body.strip():
+                base_body = existing_body.strip()
+                if base_body.startswith("# "):
+                    if title:
+                        _, _, rest = base_body.partition("\n")
+                        base_body = f"# {effective_title}\n{rest}" if rest else f"# {effective_title}"
+                else:
+                    base_body = f"# {effective_title}\n\n{base_body}"
+                formatted_body = f"{base_body}\n\n{body}"
+            else:
+                formatted_body = body if body.lstrip().startswith("# ") else f"# {effective_title}\n\n{body}"
             content = (
                 f"---\n"
                 f"name: {name}\n"
@@ -1390,7 +1430,7 @@ class MemoryStore:
             try:
                 for _, stale_rel in stale_files:
                     self._remove_index_line(stale_rel)
-                self._upsert_index_line(layer, title, rel_path, description or title)
+                self._upsert_index_line(layer, effective_title, rel_path, effective_desc)
             except Exception:
                 if prev_target_bytes is None:
                     target.unlink(missing_ok=True)
@@ -1415,6 +1455,7 @@ class MemoryStore:
                 "ref": self._entry_ref(rel_path),
                 "path": rel_path,
                 "indexed": True,
+                "mode": mode,
                 "created_at": cre_at,
                 "updated_at": ts_now,
             }
@@ -1995,8 +2036,8 @@ class WorkspaceStore:
             result["errors"] = errors
         return result
 
-    def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal",
-                     expected_updated_at=""):
+    def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False, library="personal",
+                     expected_updated_at="", mode="replace"):
         store = self._resolve_single_store(library or "personal")
         return store.upsert_entry(
             layer=layer,
@@ -2007,6 +2048,7 @@ class WorkspaceStore:
             topic_type=topic_type,
             user_managed=user_managed,
             expected_updated_at=expected_updated_at,
+            mode=mode,
         )
 
     def archive_entry(self, name, user_managed=False, library="personal"):
@@ -2099,21 +2141,22 @@ TOOLS = [
     },
     {
         "name": "memory_upsert",
-        "description": "Apply the writing rules in MEMORY.md §0. Search for the topic first. Use its existing name and supply the complete revised body when updating. Defaults to writing into the personal library; specify 'library' explicitly to write to a writable shared library.",
+        "description": "Create or update a memory entry following MEMORY.md §0. Search for the topic first and reuse its existing name. Use mode='append' to quickly add a new verified note or dated section to an existing entry without rewriting the whole file (title and description are optional when updating an existing entry). Defaults to the personal library; pass 'library' explicitly to write to a writable shared library.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"]},
                 "name": {"type": "string", "description": "Kebab-case slug matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$."},
-                "title": {"type": "string", "description": "Single-line human-readable title."},
-                "description": {"type": "string", "description": "Concise single-line retrieval cue."},
-                "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates. Do not include frontmatter or the H1 title; the server writes both (a leading frontmatter block is stripped)."},
+                "title": {"type": "string", "description": "Single-line human-readable title. Required when creating a new entry; optional when updating or appending to an existing entry."},
+                "description": {"type": "string", "description": "Concise single-line retrieval cue. Optional when updating or appending to an existing entry."},
+                "body": {"type": "string", "description": "Markdown body (or incremental note/section when mode='append') with conditions, evidence, and dates. Do not include frontmatter or the H1 title; the server writes both (a leading frontmatter block is stripped)."},
+                "mode": {"type": "string", "enum": ["replace", "append"], "default": "replace", "description": "Use 'replace' (default) to write the full entry body, or 'append' to append an incremental update to an existing entry without reading and re-emitting the entire file."},
                 "topic_type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
                 "expected_updated_at": {"type": "string", "default": "", "description": "The updated_at you based your edit on. The write is rejected if the entry changed since then, so a parallel session's edit is not lost."},
             },
-            "required": ["layer", "name", "title", "description", "body"],
+            "required": ["layer", "name", "body"],
         },
     },
     {
@@ -2300,12 +2343,13 @@ def _handle_tool_call(store, name, args):
         kwargs = dict(
             layer=args["layer"],
             name=args["name"],
-            title=args["title"],
-            description=args["description"],
+            title=args.get("title", "") or "",
+            description=args.get("description", "") or "",
             body=args["body"],
             topic_type=args.get("topic_type", ""),
             user_managed=bool(args.get("user_managed", False)),
             expected_updated_at=args.get("expected_updated_at", "") or "",
+            mode=args.get("mode", "replace") or "replace",
         )
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
@@ -2365,13 +2409,14 @@ def process_one_message(store, msg):
                 "protocolVersion": negotiated,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "unified-memory", "version": "1.2.0"},
+                "instructions": (
+                    "Unified Memory stores persistent personal and shared knowledge across sessions. "
+                    "At task start, call memory_search(compact=true) for relevant constraints, methods, preferences, and project context, then use memory_read (paths, outline, or section) to inspect details. "
+                    "Capture verified root causes, non-obvious fixes, reusable workflows, key decisions, and user preferences or corrections as soon as they are confirmed—do not wait to be reminded. "
+                    "Prefer memory_upsert(mode='append') to add dated progress to an existing entry without rewriting the whole file, and do a quick capture check before ending substantial work. "
+                    "Follow MEMORY.md §0 for layering and never store plaintext secrets or credentials."
+                ),
             }
-            if CONFIGURED_CLIENT == "DeepSeek Harness":
-                result["instructions"] = (
-                    "When past decisions or preferences may be relevant, search Unified Memory. "
-                    "When asked to remember something, read MEMORY.md §0 and follow its writing rules. "
-                    "Do not save ordinary conversation automatically."
-                )
         elif method == "ping":
             result = {}
         elif method == "tools/list":
