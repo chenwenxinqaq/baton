@@ -252,6 +252,7 @@ OUTLINE_MIN_CHARS = 1200
 # conclusion shows the neighbours worth reading next (A-MEM, HippoRAG).
 ENTRY_LINK_RE = re.compile(r"\b(constraints|methods|preferences|projects|archive|user-managed)/([A-Za-z0-9][A-Za-z0-9._-]*)\.md\b")
 MAX_ENTRY_LINKS = 5
+SEE_ALSO_LIMIT = 3
 
 
 def heading_line(preamble):
@@ -1015,7 +1016,37 @@ class MemoryStore:
         for r in results:
             r.pop("_updated_epoch", None)
             r.pop("_legacy_score", None)
-        return results[:capped_limit]
+        results = results[:capped_limit]
+        self._attach_see_also(results, all_items)
+        return results
+
+    def _attach_see_also(self, results, items, limit=SEE_ALSO_LIMIT):
+        """Give the top hit the entries it cites that the search did not return.
+
+        HippoRAG (arXiv 2405.14831) and "From RAG to Memory" (2502.14802) find
+        that following associations recovers facts a single lookup misses. Our
+        associations are the ``methods/xxx.md`` citations agents write, so the
+        cheapest one-hop step is to name the top hit's citations.
+        """
+        if not results or results[0].get("match") == "fuzzy":
+            return
+        by_path = {it["path"]: it for it in items}
+        top = by_path.get(results[0]["path"])
+        if not top:
+            return
+        shown = {r["path"] for r in results}
+        see_also = []
+        for folder, stem in ENTRY_LINK_RE.findall(top.get("body") or ""):
+            ref = f"{folder}/{stem}.md"
+            linked = by_path.get(ref)
+            if not linked or ref in shown:
+                continue
+            shown.add(ref)
+            see_also.append({"ref": self._entry_ref(ref), "title": linked.get("title", "")})
+            if len(see_also) >= limit:
+                break
+        if see_also:
+            results[0]["see_also"] = see_also
 
     def list_entries(self, layer="", include_archived=False, sort="updated"):
         """List entries optionally filtered by layer and sorted by updated/created/layer."""
@@ -1799,7 +1830,12 @@ class WorkspaceStore:
                 pair[0].get("path", ""),
             )
         )
-        return [pair[0] for pair in merged[:capped_limit]]
+        hits = [pair[0] for pair in merged[:capped_limit]]
+        # Each library attached see_also to its own best hit; only the overall
+        # top hit keeps it, so the agent gets one expansion, not one per library.
+        for hit in hits[1:]:
+            hit.pop("see_also", None)
+        return hits
 
     def list_entries(self, layer="", include_archived=False, sort="updated", library="personal"):
         stores = self._target_stores(library)
@@ -1898,7 +1934,7 @@ TOOLS = [
     },
     {
         "name": "memory_search",
-        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly. Each hit has match=full (every space-separated query word found), partial (some words) or fuzzy (only fragments). Check the snippet before relying on partial or fuzzy hits, and say memory has no answer when none fits instead of using the closest entry.",
+        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly. Each hit has match=full (every space-separated query word found), partial (some words) or fuzzy (only fragments). Check the snippet before relying on partial or fuzzy hits, and say memory has no answer when none fits instead of using the closest entry. The best hit may carry see_also: entries it cites that this search did not return; read one when the answer needs the cited detail.",
         "inputSchema": {
             "type": "object",
             "properties": {

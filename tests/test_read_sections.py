@@ -110,3 +110,33 @@ class EntryLinkTests(unittest.TestCase):
         res = self.store.read_entry("MEMORY.md")
         self.assertNotIn("links", res)
         self.assertNotIn("backlinks", res)
+
+    def test_search_expands_the_top_hit_with_what_it_cites(self):
+        hits = self.store.search("demo 进展")
+        self.assertEqual(hits[0]["path"], "projects/demo-status.md")
+        # One hop from the best hit: a cited entry the query itself never matched.
+        self.assertEqual(
+            hits[0]["see_also"],
+            [{"ref": "methods/docker-cache.md", "title": "Docker 构建缓存排查"}],
+        )
+        self.assertTrue(all("see_also" not in h for h in hits[1:]))
+
+    def test_no_expansion_for_weak_matches_or_already_shown_entries(self):
+        both = self.store.search("构建")
+        self.assertEqual({h["path"] for h in both},
+                         {"methods/docker-cache.md", "projects/demo-status.md"})
+        self.assertTrue(all("see_also" not in h for h in both))
+
+        fuzzy = self.store.search("项目进展情况")
+        self.assertTrue(fuzzy)
+        self.assertEqual(fuzzy[0]["match"], "fuzzy")
+        self.assertNotIn("see_also", fuzzy[0])
+
+    def test_expansion_is_capped(self):
+        body = " ".join(f"methods/note-{i}.md" for i in range(6))
+        for i in range(6):
+            self.store.upsert_entry("L1", f"note-{i}", f"笔记 {i}", "备注", "内容。")
+        self.store.upsert_entry("L3", "hub", "索引条目", "引用很多条目", body)
+        hits = self.store.search("索引 条目")
+        self.assertEqual(hits[0]["path"], "projects/hub.md")
+        self.assertEqual(len(hits[0]["see_also"]), mcp_server.SEE_ALSO_LIMIT)
