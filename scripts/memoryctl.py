@@ -125,6 +125,7 @@ MCP_SERVER = FRAMEWORK_ROOT / "mcp" / "server.py"
 CURSOR_HOOK_SCRIPT = FRAMEWORK_ROOT / "scripts" / "cursor_hook.py"
 CURSOR_HOOK_MARKERS = ("umem-hook", "cursor_hook.py")  # second marker migrates legacy entries
 CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "stop")
+NESTED_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop")
 SKILLS_DIR = MEMORY_ROOT / "skills"
 
 MD_START = "<!-- unified-memory:managed:start -->"
@@ -641,6 +642,8 @@ def agent_specs(home=None):
             "mcp_path": home / ".claude.json",
             "mcp_key": "unified-memory",
             "skills_dir": home / ".claude" / "skills",
+            "hooks_path": home / ".claude" / "settings.json",
+            "hooks_style": "nested",
         },
         "claude-desktop": {
             "name": "Claude Desktop",
@@ -661,6 +664,8 @@ def agent_specs(home=None):
             "mcp_path": home / ".codex" / "config.toml",
             "mcp_key": "unified_memory",
             "skills_dir": home / ".codex" / "skills",
+            "hooks_path": home / ".codex" / "hooks.json",
+            "hooks_style": "nested",
         },
         "cursor": {
             "name": "Cursor",
@@ -671,6 +676,7 @@ def agent_specs(home=None):
             "mcp_key": "unified_memory",
             "skills_dir": home / ".cursor" / "skills",
             "hooks_path": home / ".cursor" / "hooks.json",
+            "hooks_style": "cursor",
         },
         "workbuddy": {
             "name": "WorkBuddy",
@@ -1119,9 +1125,50 @@ def desired_cursor_hooks():
     return entries
 
 
+def desired_nested_hooks(agent_id):
+    """Return {event: command-hook-entry} for Claude Code / Codex nested hook configs."""
+    entries = {}
+    for event in NESTED_HOOK_EVENTS:
+        command = " ".join(
+            shlex.quote(part)
+            for part in [
+                str(shim_path("umem-hook")),
+                event,
+                "--client",
+                agent_id,
+                "--memory-root",
+                str(MEMORY_ROOT),
+            ]
+        )
+        entries[event] = {"type": "command", "command": command, "timeout": 10}
+    return entries
+
+
 def _is_our_hook(entry):
     command = str(entry.get("command", "")) if isinstance(entry, dict) else ""
     return any(marker in command for marker in CURSOR_HOOK_MARKERS)
+
+
+def _strip_our_nested_hooks(groups):
+    """Remove our managed hook entries from nested matcher groups, preserving unrelated hooks."""
+    kept_groups = []
+    removed = False
+    for group in groups or []:
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+            orig = group["hooks"]
+            kept = [h for h in orig if not _is_our_hook(h)]
+            if len(kept) != len(orig):
+                removed = True
+                if not kept and set(group.keys()) == {"hooks"}:
+                    continue
+                updated = dict(group)
+                updated["hooks"] = kept
+                kept_groups.append(updated)
+            else:
+                kept_groups.append(group)
+        else:
+            kept_groups.append(group)
+    return kept_groups, removed
 
 
 def inspect_cursor_hooks(hooks_path):
@@ -1148,6 +1195,46 @@ def inspect_cursor_hooks(hooks_path):
     return "drifted", ["Cursor hooks differ from current script path/args (re-sync to fix)"]
 
 
+def inspect_nested_hooks(agent_id, spec):
+    """Return (state, issues) for Claude Code / Codex hooks: managed|drifted|missing."""
+    hooks_path = spec["hooks_path"]
+    if not hooks_path.is_file():
+        return "missing", []
+    try:
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return "drifted", [f"{hooks_path} is not valid JSON"]
+    if not isinstance(data, dict):
+        return "drifted", [f"{hooks_path} root must be a JSON object"]
+    hooks = data.get("hooks")
+    if hooks is None:
+        return "missing", []
+    if not isinstance(hooks, dict):
+        return "drifted", [f"{hooks_path} hooks must be a JSON object"]
+    desired = desired_nested_hooks(agent_id)
+    found, exact = 0, 0
+    for event, want in desired.items():
+        ours = []
+        for group in hooks.get(event) or []:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+                ours.extend(h for h in group["hooks"] if _is_our_hook(h))
+        if ours:
+            found += 1
+            if len(ours) == 1 and ours[0] == want:
+                exact += 1
+    if found == 0:
+        return "missing", []
+    if exact == len(desired):
+        return "managed", []
+    return "drifted", [f"{spec['name']} hooks differ from current script path/args (re-sync to fix)"]
+
+
+def inspect_agent_hooks(agent_id, spec):
+    if spec.get("hooks_style") == "nested":
+        return inspect_nested_hooks(agent_id, spec)
+    return inspect_cursor_hooks(spec["hooks_path"])
+
+
 def apply_cursor_hooks(hooks_path, restore, changes):
     """Merge managed hook entries into ~/.cursor/hooks.json, preserving unrelated hooks."""
     existed = hooks_path.is_file()
@@ -1164,6 +1251,37 @@ def apply_cursor_hooks(hooks_path, restore, changes):
         hooks_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         changes.append(f"wired Cursor hooks in {hooks_path}")
+
+
+def apply_nested_hooks(agent_id, spec, restore, changes):
+    """Merge managed hook entries into Claude Code / Codex JSON hooks, preserving unrelated config."""
+    hooks_path = spec["hooks_path"]
+    existed = hooks_path.is_file()
+    data = json.loads(hooks_path.read_text(encoding="utf-8")) if existed else {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{hooks_path} must be a JSON object")
+    if "hooks_file_existed" not in restore:
+        restore["hooks_file_existed"] = existed
+    if "hooks_key_existed" not in restore:
+        restore["hooks_key_existed"] = "hooks" in data
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"{hooks_path} hooks field must be a JSON object")
+    original = json.dumps(data, sort_keys=True)
+    for event, want in desired_nested_hooks(agent_id).items():
+        kept, _ = _strip_our_nested_hooks(hooks.get(event) or [])
+        hooks[event] = kept + [{"hooks": [want]}]
+    if json.dumps(data, sort_keys=True) != original or not existed:
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        changes.append(f"wired {spec['name']} hooks in {hooks_path}")
+
+
+def apply_agent_hooks(agent_id, spec, restore, changes):
+    if spec.get("hooks_style") == "nested":
+        apply_nested_hooks(agent_id, spec, restore, changes)
+    else:
+        apply_cursor_hooks(spec["hooks_path"], restore, changes)
 
 
 def remove_cursor_hooks(hooks_path, restore, changes):
@@ -1193,6 +1311,46 @@ def remove_cursor_hooks(hooks_path, restore, changes):
         data["hooks"] = hooks
         atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         changes.append(f"removed managed Cursor hooks from {hooks_path}")
+
+
+def remove_nested_hooks(agent_id, spec, restore, changes):
+    """Remove only managed nested hook entries while preserving unrelated hooks and settings."""
+    hooks_path = spec["hooks_path"]
+    if not hooks_path.is_file():
+        return
+    try:
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+        return
+    hooks = data["hooks"]
+    touched = False
+    for event in list(hooks):
+        kept, removed = _strip_our_nested_hooks(hooks.get(event) or [])
+        if removed:
+            touched = True
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+    if not touched:
+        return
+    if not hooks and restore.get("hooks_key_existed") is False:
+        data.pop("hooks", None)
+    if not data and not restore.get("hooks_file_existed", True):
+        hooks_path.unlink()
+        changes.append(f"removed {hooks_path}")
+    else:
+        atomic_write(hooks_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        changes.append(f"removed managed {spec['name']} hooks from {hooks_path}")
+
+
+def remove_agent_hooks(agent_id, spec, restore, changes):
+    if spec.get("hooks_style") == "nested":
+        remove_nested_hooks(agent_id, spec, restore, changes)
+    else:
+        remove_cursor_hooks(spec["hooks_path"], restore, changes)
 
 
 def inspect_agent(agent_id, spec):
@@ -1295,7 +1453,7 @@ def inspect_agent(agent_id, spec):
         issues.extend(skill_issues)
         components["skill"] = {"path": str(spec["skills_dir"]), "state": skill_state, "linked": linked, "total": total}
     if "hooks_path" in spec:
-        hooks_state, hook_issues = inspect_cursor_hooks(spec["hooks_path"])
+        hooks_state, hook_issues = inspect_agent_hooks(agent_id, spec)
         issues.extend(hook_issues)
         components["hooks"] = {"path": str(spec["hooks_path"]), "state": hooks_state}
 
@@ -1466,9 +1624,9 @@ def connect_agent(agent_id, spec, dry_run=False):
             restore["expected_mcp_cmd"] = exp_cmd
             restore["expected_mcp_args"] = exp_args
 
-        # 2b. Cursor hooks (deterministic read/write triggers)
+        # 2b. Deterministic client hooks (session context + post-turn write check)
         if spec.get("hooks_path") is not None:
-            apply_cursor_hooks(spec["hooks_path"], restore, changes)
+            apply_agent_hooks(agent_id, spec, restore, changes)
 
         if "skills_dir" in spec:
             sync_skills_into_dir(agent_id, spec["skills_dir"], restore, changes)
@@ -1588,7 +1746,7 @@ def disconnect_agent(agent_id, spec, force=False):
                 atomic_write(mcp_path, text)
 
         if spec.get("hooks_path") is not None:
-            remove_cursor_hooks(spec["hooks_path"], restore, changes)
+            remove_agent_hooks(agent_id, spec, restore, changes)
 
         if "skills_dir" in spec:
             restore_skills_dir(agent_id, spec["skills_dir"], restore, changes)

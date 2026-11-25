@@ -655,6 +655,114 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("disconnect", "cursor")
         self.assertFalse(hooks_file.exists())
 
+    def test_claude_and_codex_nested_hooks_merge_trigger_and_disconnect_cleanly(self):
+        (self.home / ".claude").mkdir(exist_ok=True)
+        (self.home / ".codex").mkdir(exist_ok=True)
+        claude_settings = self.home / ".claude/settings.json"
+        codex_hooks = self.home / ".codex/hooks.json"
+        foreign_hook = {"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook", "timeout": 30}]}
+        claude_settings.write_text(
+            json.dumps({"theme": "dark", "hooks": {"Stop": [foreign_hook], "PreToolUse": [{"hooks": []}]}}),
+            encoding="utf-8",
+        )
+        codex_hooks.write_text(json.dumps({"hooks": {"SessionStart": [foreign_hook]}}), encoding="utf-8")
+
+        self.cli("connect", "claude")
+        self.cli("connect", "codex")
+
+        claude_data = json.loads(claude_settings.read_text(encoding="utf-8"))
+        self.assertEqual(claude_data["theme"], "dark")
+        self.assertEqual(claude_data["hooks"]["PreToolUse"], [{"hooks": []}])
+        self.assertEqual(claude_data["hooks"]["Stop"][0], foreign_hook)
+        self.assertEqual(
+            set(claude_data["hooks"]),
+            {"PreToolUse", "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"},
+        )
+        codex_data = json.loads(codex_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(codex_data["hooks"]["SessionStart"][0], foreign_hook)
+        self.assertEqual(
+            set(codex_data["hooks"]),
+            {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"},
+        )
+
+        # Idempotent and reported managed.
+        self.cli("connect", "claude")
+        self.cli("connect", "codex")
+        self.assertEqual(json.loads(claude_settings.read_text(encoding="utf-8")), claude_data)
+        self.assertEqual(json.loads(codex_hooks.read_text(encoding="utf-8")), codex_data)
+        agents = {a["id"]: a for a in self.cli("doctor")["agents"]}
+        self.assertEqual(agents["claude"]["components"]["hooks"]["state"], "managed")
+        self.assertEqual(agents["codex"]["components"]["hooks"]["state"], "managed")
+
+        # Tampering is reported as drift.
+        codex_data["hooks"]["Stop"][0]["hooks"][0]["command"] += " --stale"
+        codex_hooks.write_text(json.dumps(codex_data), encoding="utf-8")
+        codex = next(a for a in self.cli("doctor")["agents"] if a["id"] == "codex")
+        self.assertEqual((codex["components"]["hooks"]["state"], codex["state"]), ("drifted", "drifted"))
+
+        # Runtime protocol test for nested hooks: SessionStart + tool-count Stop trigger + loop/subagent guards.
+        def run_nested(event, client, payload, **extra):
+            out = subprocess.check_output(
+                [
+                    sys.executable,
+                    str(CODE / "scripts/cursor_hook.py"),
+                    event,
+                    "--client",
+                    client,
+                    "--memory-root",
+                    str(self.library),
+                ],
+                input=json.dumps(payload),
+                env={**self.environment(), **extra},
+                cwd=self.home,
+                text=True,
+            )
+            return json.loads(out)
+
+        start = run_nested("SessionStart", "codex", {"session_id": "s1"})
+        self.assertEqual(start["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("mode='append'", start["hookSpecificOutput"]["additionalContext"])
+
+        # Subagents stay quiet on SessionStart and Stop.
+        self.assertEqual(run_nested("SessionStart", "codex", {"session_id": "s1", "agent_id": "sub1"}), {})
+
+        # Short turn with >= 4 tool calls triggers a nested block-reason nudge even before MIN_TURN_SECONDS.
+        run_nested("UserPromptSubmit", "codex", {"session_id": "s1", "prompt": "排查部署问题"})
+        for _ in range(4):
+            run_nested("PostToolUse", "codex", {"session_id": "s1", "tool_name": "Bash"})
+        self.assertEqual(
+            run_nested("Stop", "codex", {"session_id": "s1", "stop_hook_active": True}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="9999"),
+            {},
+        )
+        self.assertEqual(
+            run_nested("Stop", "codex", {"session_id": "s1", "agent_id": "sub1"}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="9999"),
+            {},
+        )
+        nudge = run_nested("Stop", "codex", {"session_id": "s1"}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="9999")
+        self.assertEqual(nudge.get("decision"), "block")
+        self.assertIn("【记忆沉淀检查】", nudge.get("reason", ""))
+        # Cooldown suppresses an immediate repeat.
+        self.assertEqual(run_nested("Stop", "codex", {"session_id": "s1"}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="0"), {})
+
+        # Disconnect restores both files without touching unrelated settings or foreign hooks.
+        self.cli("disconnect", "claude")
+        self.cli("disconnect", "codex")
+        self.assertEqual(
+            json.loads(claude_settings.read_text(encoding="utf-8")),
+            {"theme": "dark", "hooks": {"Stop": [foreign_hook], "PreToolUse": [{"hooks": []}]}},
+        )
+        self.assertEqual(
+            json.loads(codex_hooks.read_text(encoding="utf-8")),
+            {"hooks": {"SessionStart": [foreign_hook]}},
+        )
+
+        # If we created ~/.codex/hooks.json from scratch, disconnect removes it cleanly.
+        codex_hooks.unlink()
+        self.cli("connect", "codex")
+        self.assertTrue(codex_hooks.is_file())
+        self.cli("disconnect", "codex")
+        self.assertFalse(codex_hooks.exists())
+
     def test_audit_log_hooks_and_dashboard(self):
         def mcp_session(*calls):
             lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
