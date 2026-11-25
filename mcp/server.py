@@ -2001,7 +2001,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search keywords, phrase, or temporal cue."},
-                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
+                "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "compact": {"type": "boolean", "default": False, "description": "For initial lookup, omit duplicate routing and bookkeeping fields. Keeps qualified refs, trust, read-only flag, match evidence, updated_at and citation hints."},
                 "limit": {"type": "integer", "default": 10},
@@ -2016,7 +2016,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
+                "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
                 "sort": {"type": "string", "enum": ["updated", "created", "layer"], "default": "updated"},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for all mounted libraries, or a shared mount id)."},
@@ -2048,7 +2048,7 @@ TOOLS = [
                 "title": {"type": "string", "description": "Single-line human-readable title."},
                 "description": {"type": "string", "description": "Concise single-line retrieval cue."},
                 "body": {"type": "string", "description": "Markdown body with conditions, evidence, and dates. Do not include frontmatter or the H1 title; the server writes both (a leading frontmatter block is stripped)."},
-                "topic_type": {"type": "string", "enum": ["", "user", "feedback", "project", "reference"], "default": ""},
+                "topic_type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "default": ""},
                 "user_managed": {"type": "boolean", "default": False, "description": "Only set true when the user explicitly requests changing user-managed/ in the personal library."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'). Shared libraries must be mounted rw and allow the chosen layer."},
                 "expected_updated_at": {"type": "string", "default": "", "description": "The updated_at you based your edit on. The write is rejected if the entry changed since then, so a parallel session's edit is not lost."},
@@ -2077,7 +2077,7 @@ TOOLS = [
             "properties": {
                 "version": {"type": "string", "description": "A 'version' value returned by memory_history."},
                 "name": {"type": "string", "default": "", "description": "Entry slug, only needed when the version cannot tell."},
-                "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": "", "description": "Target layer, only needed when the entry no longer exists."},
+                "layer": {"type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"], "default": "", "description": "Target layer, only needed when the entry no longer exists."},
                 "dry_run": {"type": "boolean", "default": False, "description": "Return the saved content without writing it back."},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal')."},
             },
