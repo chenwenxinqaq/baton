@@ -805,6 +805,51 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("disconnect", "codex")
         self.assertFalse(codex_hooks.exists())
 
+    def test_session_start_digest_prioritizes_recent_l3_and_lists_shared_mounts(self):
+        # Create 8 L3 entries and make the last one the newest on disk.
+        body_file = self.home / "proj-body.md"
+        for idx in range(8):
+            body_file.write_text(f"项目 {idx:02d} 正文。\n", encoding="utf-8")
+            self.cli(
+                "write",
+                "--layer",
+                "L3",
+                "--name",
+                f"proj-{idx:02d}",
+                "--title",
+                f"项目条目 {idx:02d}",
+                "--description",
+                f"这是第 {idx:02d} 个项目摘要",
+                "--body-file",
+                str(body_file),
+            )
+        base_ts = 1_700_000_000
+        for idx in range(8):
+            p = self.library / "projects" / f"proj-{idx:02d}.md"
+            os.utime(p, (base_ts + idx * 100, base_ts + idx * 100))
+        shared_dir = self.home / "shared-team"
+        self.cli("init", "--path", str(shared_dir), "--shared")
+        self.cli("mount", "add", "team-notes", "--path", str(shared_dir), "--mode", "ro")
+        out = subprocess.check_output(
+            [
+                sys.executable,
+                str(CODE / "scripts/cursor_hook.py"),
+                "SessionStart",
+                "--client",
+                "codex",
+                "--memory-root",
+                str(self.library),
+            ],
+            input=json.dumps({"session_id": "s-digest"}),
+            env=self.environment(),
+            cwd=self.home,
+            text=True,
+        )
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("team-notes(ro,", ctx)
+        self.assertIn("projects/proj-07.md", ctx)
+        self.assertNotIn("projects/proj-00.md", ctx)
+
     def test_audit_log_hooks_and_dashboard(self):
         def mcp_session(*calls):
             lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",

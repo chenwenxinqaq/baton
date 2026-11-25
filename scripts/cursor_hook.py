@@ -31,7 +31,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_log  # noqa: E402
-from library_paths import global_state_dir  # noqa: E402
+from library_paths import global_state_dir, resolve_libraries  # noqa: E402
 
 NUDGE_MARKER = "【记忆沉淀检查】"
 CHECKPOINT_MARKER = "【阶段记忆提醒】"
@@ -109,21 +109,33 @@ def prune_state(max_age=14 * 86400):
         pass
 
 
+INDEX_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+
+
+def _trim_line(text, limit=136):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def index_digest(memory_root, max_lines_per_layer=6):
-    """Return compact lines from MEMORY.md for L0/L1/L2/L3 (titles + one-line descriptions)."""
-    index = Path(memory_root) / "MEMORY.md"
+    """Return compact lines from MEMORY.md for L0/L1/L2/L3, prioritizing recently active L1/L3 entries."""
+    root = Path(memory_root)
+    index = root / "MEMORY.md"
     try:
         text = index.read_text(encoding="utf-8")
     except OSError:
         return []
     wanted = {
-        "L0": ("约束", max_lines_per_layer),
-        "L1": ("方法", min(4, max_lines_per_layer)),
-        "L2": ("偏好", max_lines_per_layer),
-        "L3": ("项目", max_lines_per_layer),
+        "L0": ("约束", max_lines_per_layer, False),
+        "L1": ("方法", min(4, max_lines_per_layer), True),
+        "L2": ("偏好", max_lines_per_layer, False),
+        "L3": ("项目", max_lines_per_layer, True),
     }
-    out, current, counts = [], None, {}
-    for line in text.splitlines():
+    buckets = {layer: [] for layer in wanted}
+    current = None
+    for order, line in enumerate(text.splitlines()):
         header = re.match(r"^##\s+.*?\b(L[0-4])\b", line)
         if header:
             current = header.group(1)
@@ -132,11 +144,48 @@ def index_digest(memory_root, max_lines_per_layer=6):
             current = None
             continue
         if current in wanted and line.lstrip().startswith("- "):
-            label, limit = wanted[current]
-            counts[current] = counts.get(current, 0) + 1
-            if counts[current] <= limit:
-                out.append(f"[{current}{label}] {line.lstrip()[2:].strip()[:140]}")
+            content = line.lstrip()[2:].strip()
+            mtime = 0.0
+            if wanted[current][2]:
+                match = INDEX_LINK_RE.search(content)
+                if match:
+                    rel = match.group(1).strip()
+                    try:
+                        target = (root / rel).resolve()
+                        if target.is_relative_to(root.resolve()) and target.is_file():
+                            mtime = target.stat().st_mtime
+                    except OSError:
+                        mtime = 0.0
+            buckets[current].append((mtime, order, content))
+    out = []
+    for layer in ("L0", "L1", "L2", "L3"):
+        label, limit, sort_recent = wanted[layer]
+        rows = buckets[layer]
+        if sort_recent and len(rows) > limit:
+            rows = sorted(rows, key=lambda item: (-item[0], item[1]))[:limit]
+        else:
+            rows = rows[:limit]
+        for _, _, content in rows:
+            out.append(f"[{layer}{label}] {_trim_line(content)}")
     return out
+
+
+def _shared_libraries_summary(memory_root):
+    """Return a concise one-line summary of mounted shared libraries, if any exist on disk."""
+    issues = []
+    try:
+        libs = resolve_libraries(primary_root=memory_root, issues=issues)
+    except Exception:
+        return ""
+    shared = []
+    for item in libs[1:]:
+        path = item.get("path")
+        if path and Path(path).is_dir():
+            layers = "/".join(item.get("layers") or [])
+            shared.append(f"{item['id']}({item.get('mode', 'ro')},{layers})")
+    if not shared:
+        return ""
+    return f"- 已挂载共享库：{'、'.join(shared[:4])}；跨库检索请传 library='*'。"
 
 
 def build_context(memory_root):
@@ -147,6 +196,9 @@ def build_context(memory_root):
         "- 核实根因、踩坑、方法、偏好或项目进展后及时 memory_upsert（已有条目局部补充可用 mode='append' 或 section='小节名'）；最终回复前再查一次是否遗漏。",
         "- 不要把一次性过程、密钥、凭据写入记忆。",
     ]
+    shared_note = _shared_libraries_summary(memory_root)
+    if shared_note:
+        lines.append(shared_note)
     digest = index_digest(memory_root)
     if digest:
         lines.append("当前库索引摘录：")
