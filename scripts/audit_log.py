@@ -23,6 +23,7 @@ MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
 READ_TOOLS = {"memory_search", "memory_list", "memory_read", "memory_history", "memory_lint"}
 WRITE_TOOLS = {"memory_upsert", "memory_archive", "memory_restore"}
+TOOL_SOURCES = frozenset({"mcp", "cli"})
 MAX_AUDIT_REFS = 20
 CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]")
 REMOTE_URL_WITH_USERINFO_RE = re.compile(
@@ -253,7 +254,7 @@ def search_reads(events):
     next search and within FOLLOW_WINDOW_SECONDS. The read refs are returned
     in read order and may include refs the search did not return.
     """
-    calls = [e for e in events if e.get("source") == "mcp" and e.get("ok", True)]
+    calls = [e for e in events if e.get("source") in TOOL_SOURCES and e.get("ok", True)]
     for i, e in enumerate(calls):
         if e.get("tool") != "memory_search":
             continue
@@ -284,7 +285,7 @@ def usage_stats(events):
     its next search and within FOLLOW_WINDOW_SECONDS. Events without a
     ``tokens`` field (older log lines) are excluded from the token totals.
     """
-    calls = [e for e in events if e.get("source") == "mcp" and e.get("ok", True)]
+    calls = [e for e in events if e.get("source") in TOOL_SOURCES and e.get("ok", True)]
     by_tool = {}
     for e in calls:
         if "tokens" not in e:
@@ -381,7 +382,7 @@ def summarize(now=None, home=None, days=7):
     now = now or time.time()
     today0 = _day_start(now)
     events = read_events(since=now - days * 86400, home=home)
-    tool_events = [e for e in events if e.get("source") == "mcp"]
+    tool_events = [e for e in events if e.get("source") in TOOL_SOURCES]
 
     clients = {}
     for e in tool_events:
@@ -442,7 +443,7 @@ def summarize(now=None, home=None, days=7):
         day_end = day_start + 86400
         dt = datetime.fromtimestamp(day_start)
         day_events = [e for e in events if day_start <= float(e.get("t", 0)) < day_end]
-        day_mcp = [e for e in day_events if e.get("source") == "mcp"]
+        day_mcp = [e for e in day_events if e.get("source") in TOOL_SOURCES]
         daily.append(
             {
                 "date": dt.strftime("%m-%d"),

@@ -170,6 +170,29 @@ class ToolCallAuditSizeTests(unittest.TestCase):
             self.assertEqual(events[-2]["mode"], "replace")
             self.assertEqual(events[-1]["mode"], "append")
 
+    def test_cli_source_events_count_in_usage_stats_and_summarize(self):
+        now = 1_800_000_000.0
+        events = [
+            {"t": now - 60, "source": "cli", "client": "Codex", "tool": "memory_search", "ok": True,
+             "query": "发版", "hits": 1, "refs": ["projects/release.md"], "tokens": 60, "bytes": 180},
+            {"t": now - 50, "source": "cli", "client": "Codex", "tool": "memory_read", "ok": True,
+             "ref": "projects/release.md", "tokens": 120, "bytes": 360},
+            {"t": now - 40, "source": "cli", "client": "Codex", "tool": "memory_upsert", "ok": True,
+             "ref": "projects/release.md", "mode": "append", "ms": 38, "tokens": 45, "bytes": 135},
+        ]
+        stats = audit_log.usage_stats(events)
+        self.assertEqual(stats["searches"], 1)
+        self.assertEqual(stats["read_rate"], 1.0)
+        self.assertEqual(stats["write_pipeline"]["writes"], 1)
+        self.assertEqual(stats["write_pipeline"]["append_writes"], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(audit_log, "read_events", return_value=events):
+                summary = audit_log.summarize(now=now, home=tmp, days=7)
+        self.assertEqual(summary["writes_today"], 1)
+        self.assertEqual(summary["reads_today"], 2)
+        self.assertEqual(summary["daily"][-1]["writes"], 1)
+        self.assertEqual(summary["daily"][-1]["reads"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

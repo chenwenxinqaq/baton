@@ -850,6 +850,43 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertIn("projects/proj-07.md", ctx)
         self.assertNotIn("projects/proj-00.md", ctx)
 
+    def test_cli_inline_body_and_audit_logging(self):
+        env = self.environment()
+        env["CODEX_THREAD_ID"] = "thread-cli-test"
+        created = json.loads(subprocess.check_output(
+            [
+                sys.executable, str(CODE / "scripts/memoryctl.py"), "write",
+                "--layer", "L3", "--name", "cli-note", "--title", "命令行写入测试",
+                "--description", "验证 --body 与审计记录",
+                "--body", "PRIVATE-CLI-BODY-TEXT",
+            ],
+            env=env, cwd=self.home, text=True,
+        ))
+        self.assertEqual(created["ref"], "projects/cli-note.md")
+        self.assertTrue(created["indexed"])
+        hits = json.loads(subprocess.check_output(
+            [sys.executable, str(CODE / "scripts/memoryctl.py"), "search", "命令行写入", "--compact"],
+            env=env, cwd=self.home, text=True,
+        ))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["ref"], "projects/cli-note.md")
+        self.assertNotIn("path", hits[0])
+        audit_text = (self.home / ".local/state/unified-memory/global/audit.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
+        self.assertEqual([e["source"] for e in events[-2:]], ["cli", "cli"])
+        self.assertEqual([e["client"] for e in events[-2:]], ["Codex", "Codex"])
+        self.assertEqual([e["tool"] for e in events[-2:]], ["memory_upsert", "memory_search"])
+        self.assertNotIn("PRIVATE-CLI-BODY-TEXT", audit_text)
+        # Rejects ambiguous both --body and --body-file.
+        bad = subprocess.run(
+            [
+                sys.executable, str(CODE / "scripts/memoryctl.py"), "write",
+                "--layer", "L3", "--name", "cli-note", "--body", "a", "--body-file", "-",
+            ],
+            input="b", env=env, cwd=self.home, text=True, capture_output=True,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+
     def test_audit_log_hooks_and_dashboard(self):
         def mcp_session(*calls):
             lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",

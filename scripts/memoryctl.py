@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
+import time
 
 
 from library_paths import (
@@ -32,6 +33,7 @@ from library_paths import (
     validate_library_path,
     validate_mount_id,
 )
+import audit_log
 import sync_git
 
 
@@ -2340,6 +2342,85 @@ def _parse_bool_flag(val):
     raise argparse.ArgumentTypeError(f"Expected true/false, got: {val}")
 
 
+CLI_TOOL_NAMES = {
+    "list": "memory_list",
+    "search": "memory_search",
+    "read": "memory_read",
+    "write": "memory_upsert",
+    "lint": "memory_lint",
+}
+
+
+def _detect_cli_client():
+    configured = os.environ.get("UNIFIED_MEMORY_CLIENT", "").strip()
+    if configured:
+        return audit_log.normalize_client(configured)
+    if any(os.environ.get(k) for k in ("CODEX_THREAD_ID", "CODEX_SHELL", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE")):
+        return "Codex"
+    if any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE", "CLAUDE_CODE_ENTRYPOINT")):
+        return "Claude Code"
+    if any(os.environ.get(k) for k in ("CURSOR_AGENT", "CURSOR_TRACE_ID")):
+        return "Cursor"
+    if any(os.environ.get(k) for k in ("DSH_SESSION", "DSH_CLI")):
+        return "DeepSeek Harness"
+    return "CLI"
+
+
+def _record_cli_audit(command, args, data, ok, ms, output_text="", error=""):
+    tool = CLI_TOOL_NAMES.get(command)
+    if not tool:
+        return
+    try:
+        ev = {
+            "source": "cli",
+            "client": _detect_cli_client(),
+            "tool": tool,
+            "ok": ok,
+            "ms": ms,
+            "library": getattr(args, "library", None),
+        }
+        if command == "search":
+            ev["query"] = str(getattr(args, "query", ""))[:120]
+        if getattr(args, "layer", ""):
+            ev["layer"] = args.layer
+        if not ok:
+            ev["error"] = str(error)[:160]
+            audit_log.record(ev)
+            return
+        if output_text:
+            ev["bytes"] = len(output_text.encode("utf-8"))
+            ev["tokens"] = audit_log.estimate_tokens(output_text)
+        if command == "search" and isinstance(data, list):
+            ev["hits"] = len(data)
+            ev["refs"] = [h.get("ref") for h in data[: audit_log.MAX_AUDIT_REFS] if isinstance(h, dict) and h.get("ref")]
+        elif command == "list" and isinstance(data, list):
+            ev["hits"] = len(data)
+        elif isinstance(data, dict):
+            if command == "read" and isinstance(data.get("entries"), list):
+                refs = [
+                    e.get("ref") or e.get("path")
+                    for e in data["entries"]
+                    if isinstance(e, dict) and (e.get("ref") or e.get("path"))
+                ]
+                ev["refs"] = refs[: audit_log.MAX_AUDIT_REFS]
+                ev["hits"] = len(refs)
+                libs = {e.get("library") for e in data["entries"] if isinstance(e, dict) and e.get("library")}
+                if len(libs) == 1:
+                    ev["library"] = next(iter(libs))
+            else:
+                ev["ref"] = data.get("ref") or data.get("path") or data.get("to")
+                ev["library"] = data.get("library") or ev.get("library")
+                if command == "write":
+                    ev["action"] = data.get("status") or data.get("action")
+                    if data.get("mode"):
+                        ev["mode"] = data.get("mode")
+                    if data.get("section_action"):
+                        ev["section_action"] = data.get("section_action")
+        audit_log.record(ev)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2359,6 +2440,7 @@ def main():
         if command == "search":
             item.add_argument("query")
             item.add_argument("--limit", type=int, default=10)
+            item.add_argument("--compact", action="store_true", help="Omit duplicate routing/bookkeeping fields.")
         if command == "read":
             item.add_argument("paths", nargs="+", help="One or more relative paths (optionally prefixed with '<library>:').")
             item.add_argument("--section", default="", help="Read only this '## ' section.")
@@ -2372,7 +2454,8 @@ def main():
             item.add_argument("--section", default="", help="Target a single '## ' section to replace, append, or create in place.")
             item.add_argument("--verified-at", default=None, help="Optional YYYY-MM-DD verification date (empty string clears).")
             item.add_argument("--valid-until", default=None, help="Optional YYYY-MM-DD expiration date (empty string clears).")
-            item.add_argument("--body-file", required=True, help="UTF-8 Markdown file, or - for standard input.")
+            item.add_argument("--body", default=None, help="Inline UTF-8 Markdown body text (alternative to --body-file).")
+            item.add_argument("--body-file", default=None, help="UTF-8 Markdown file, or - for standard input.")
 
     p_init = sub.add_parser("init", help="Initialize an empty private or shared library.")
     p_init.add_argument("--path", help="Optional target library path (defaults to UNIFIED_MEMORY_ROOT).")
@@ -2481,7 +2564,8 @@ def main():
 
     if args.command in {"list", "search", "read", "write", "lint"}:
         sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
-        from server import WorkspaceStore, compact_list_entry
+        from server import WorkspaceStore, compact_list_entry, compact_search_hit
+        started = time.monotonic()
         try:
             store = WorkspaceStore(MEMORY_ROOT)
             if args.command == "list":
@@ -2497,6 +2581,8 @@ def main():
             elif args.command == "search":
                 result = store.search(args.query, library=args.library or "*", layer=args.layer,
                                       include_archived=args.archived, limit=args.limit)
+                if args.compact:
+                    result = [compact_search_hit(item) for item in result]
             elif args.command == "lint":
                 result = store.lint(stale_days=args.stale_days, library=args.library or "personal")
             elif args.command == "read":
@@ -2515,7 +2601,14 @@ def main():
                         outline=args.outline,
                     )
             else:
-                body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
+                if args.body is not None and args.body_file is not None:
+                    raise ValueError("Pass either --body or --body-file, not both.")
+                if args.body is None and args.body_file is None:
+                    raise ValueError("Provide either --body or --body-file.")
+                if args.body is not None:
+                    body = args.body
+                else:
+                    body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
                 result = store.upsert_entry(
                     args.layer,
                     args.name,
@@ -2529,8 +2622,13 @@ def main():
                     valid_until=args.valid_until,
                 )
         except (ValueError, OSError) as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            _record_cli_audit(args.command, args, None, False, elapsed_ms, error=str(exc))
             parser.exit(1, f"{exc}\n")
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        output_text = json.dumps(result, ensure_ascii=False, indent=2)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _record_cli_audit(args.command, args, result, True, elapsed_ms, output_text=output_text)
+        print(output_text)
     elif args.command == "init":
         print(json.dumps(initialize_library(target_root=args.path, shared=args.shared), ensure_ascii=False, indent=2))
     elif args.command == "rebuild-index":
@@ -2657,9 +2755,6 @@ def main():
         report = run_doctor(fix=args.fix)
         print(json.dumps(report, ensure_ascii=False, indent=2))
     elif args.command == "usage":
-        import audit_log
-        import time
-
         since = time.time() - args.days * 86400
         report = audit_log.usage_stats(audit_log.read_events(since=since))
         report["days"] = args.days
