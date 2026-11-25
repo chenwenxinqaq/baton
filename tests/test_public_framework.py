@@ -27,9 +27,16 @@ class PublicFrameworkTests(unittest.TestCase):
         self.cli("init")
 
     def environment(self, root=None):
-        return {**os.environ, "HOME": str(self.home), "DSH_HOME": str(self.home / ".dsh"),
-                "UNIFIED_MEMORY_ROOT": str(root or self.library),
-                "PYTHONDONTWRITEBYTECODE": "1"}
+        env = dict(os.environ)
+        env.pop("CLAUDE_DESKTOP_CONFIG", None)
+        env.pop("XDG_CONFIG_HOME", None)
+        env.update({
+            "HOME": str(self.home),
+            "DSH_HOME": str(self.home / ".dsh"),
+            "UNIFIED_MEMORY_ROOT": str(root or self.library),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return env
 
     def cli(self, *args, root=None):
         output = subprocess.check_output([sys.executable, str(CODE / "scripts/memoryctl.py"), *args],
@@ -75,7 +82,18 @@ class PublicFrameworkTests(unittest.TestCase):
         config.write_text(original, encoding="utf-8")
         self.cli("connect", "all")
         report = self.cli("doctor")
-        self.assertEqual([a["state"] for a in report["agents"]], ["managed"] * 6)
+        self.assertEqual(
+            {a["id"]: a["state"] for a in report["agents"]},
+            {
+                "claude": "managed",
+                "claude-desktop": "managed",
+                "codex": "managed",
+                "cursor": "managed",
+                "workbuddy": "managed",
+                "antigravity": "managed",
+                "deepseek": "managed",
+            },
+        )
         launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
         self.assertIn(str(launcher), config.read_text())  # clients never point at the source tree / app bundle
         self.assertNotIn(str(CODE / "mcp/server.py"), config.read_text())
@@ -253,6 +271,127 @@ class PublicFrameworkTests(unittest.TestCase):
                 self.assertIn("MCP 配置格式无效", error.exception.read().decode())
             finally:
                 manager.terminate()
+
+    def test_claude_desktop_one_click_connect_and_disconnect(self):
+        config = self.home / "Library/Application Support/Claude-3p/claude_desktop_config.json"
+        env = {**self.environment(), "CLAUDE_DESKTOP_CONFIG": str(config)}
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=env) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+                with urlopen(base + "/?view=clients", timeout=5) as response:
+                    page = response.read().decode()
+                self.assertIn("<strong>Claude Desktop</strong>", page)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+
+                def click(op):
+                    data = urlencode(dict(csrf=csrf, target="claude-desktop", op=op)).encode()
+                    with urlopen(Request(base + "/agent", data=data, headers={"Origin": base}), timeout=8) as response:
+                        self.assertIn("view=clients", response.geturl())
+                        return response.read().decode()
+
+                self.assertIn("Claude Desktop 配置已保存", click("connect"))
+                config_data = json.loads(config.read_text(encoding="utf-8"))
+                entry = config_data["mcpServers"]["unified-memory"]
+                self.assertEqual(entry["args"], ["--memory-root", str(self.library.resolve())])
+                self.assertEqual(entry["env"], {"UNIFIED_MEMORY_CLIENT": "Claude Desktop"})
+
+                requests = [
+                    {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "claude-ai"},
+                                                                 "protocolVersion": "2025-06-18", "capabilities": {}}},
+                    {"method": "notifications/initialized"},
+                    {"id": 2, "method": "tools/list"},
+                    {"id": 3, "method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": "测试"}}},
+                ]
+                run_env = {**env, **entry["env"]}
+                result = subprocess.check_output([entry["command"], *entry["args"]], env=run_env, text=True,
+                    input="".join(json.dumps({"jsonrpc": "2.0", **req}) + "\n" for req in requests))
+                results = {r["id"]: r["result"] for r in map(json.loads, result.splitlines())}
+                self.assertIn("memory_search", {t["name"] for t in results[2]["tools"]})
+                self.assertFalse(results[3].get("isError", False))
+                events = next(self.home.rglob("audit.jsonl")).read_text(encoding="utf-8").splitlines()
+                self.assertEqual(json.loads(events[-1])["client"], "Claude Desktop")
+
+                # Also verify clientInfo.name="claude-ai" maps to Claude Desktop without UNIFIED_MEMORY_CLIENT.
+                fallback_env = {k: v for k, v in env.items() if k != "UNIFIED_MEMORY_CLIENT"}
+                subprocess.check_output(
+                    [entry["command"], *entry["args"]],
+                    env=fallback_env,
+                    text=True,
+                    input="".join(json.dumps({"jsonrpc": "2.0", **req}) + "\n" for req in requests),
+                )
+                events = next(self.home.rglob("audit.jsonl")).read_text(encoding="utf-8").splitlines()
+                self.assertEqual(json.loads(events[-1])["client"], "Claude Desktop")
+
+                listed = json.loads(subprocess.check_output(
+                    [sys.executable, str(CODE / "scripts/memoryctl.py"), "agent", "list"],
+                    env=env, cwd=self.home, text=True))
+                desktop = next(a for a in listed["agents"] if a["id"] == "claude-desktop")
+                self.assertEqual((desktop["state"], set(desktop["components"])), ("managed", {"mcp"}))
+
+                click("disconnect")
+                self.assertFalse(config.exists())
+
+                # Reconnect and change --memory-root; disconnect should still recognize our launcher entry.
+                click("connect")
+                drifted = json.loads(config.read_text(encoding="utf-8"))
+                drifted["mcpServers"]["unified-memory"]["args"] = ["--memory-root", str(self.other.resolve())]
+                config.write_text(json.dumps(drifted), encoding="utf-8")
+                click("disconnect")
+                self.assertFalse(config.exists())
+
+                own = {"command": "my-own-server", "args": []}
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text(json.dumps({"mcpServers": {"unified-memory": own}}), encoding="utf-8")
+                click("disconnect")
+                self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["unified-memory"], own)
+            finally:
+                manager.terminate()
+
+        sample = self.home / "claude-desktop-note.md"
+        sample.write_text("Claude Desktop 文件导入样本", encoding="utf-8")
+        self.assertEqual(self.cli("import-memory", "claude-desktop", "--file", str(sample))["added"], 1)
+
+        from unittest.mock import patch
+        sys.path.insert(0, str(CODE / "scripts"))
+        import memoryctl
+        support = self.home / "darwin-home" / "Library" / "Application Support"
+        (support / "Claude-3p").mkdir(parents=True)
+        with patch.object(memoryctl.sys, "platform", "darwin"), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_DESKTOP_CONFIG", None)
+            self.assertEqual(
+                memoryctl._claude_desktop_config_path(self.home / "darwin-home"),
+                support / "Claude-3p" / "claude_desktop_config.json",
+            )
+            (support / "Claude").mkdir(parents=True)
+            std_cfg = support / "Claude" / "claude_desktop_config.json"
+            tp_cfg = support / "Claude-3p" / "claude_desktop_config.json"
+            std_cfg.write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                memoryctl._claude_desktop_config_path(self.home / "darwin-home"),
+                std_cfg,
+            )
+            # When both config files exist, prefer the more recently modified config file rather than dir mtime.
+            tp_cfg.write_text("{}", encoding="utf-8")
+            os.utime(std_cfg, (1000, 1000))
+            os.utime(tp_cfg, (2000, 2000))
+            os.utime(support / "Claude", (3000, 3000))
+            self.assertEqual(
+                memoryctl._claude_desktop_config_path(self.home / "darwin-home"),
+                tp_cfg,
+            )
+            # Passing an explicit home ignores CLAUDE_DESKTOP_CONFIG env override.
+            os.environ["CLAUDE_DESKTOP_CONFIG"] = str(self.home / "elsewhere.json")
+            self.assertEqual(
+                memoryctl.agent_specs(home=self.home / "darwin-home")["claude-desktop"]["mcp_path"],
+                tp_cfg,
+            )
+            # Restore pinning keeps inspect/disconnect bound to the originally connected config path.
+            spec = memoryctl.agent_specs(home=self.home / "darwin-home")["claude-desktop"]
+            self.assertEqual(
+                memoryctl._agent_mcp_path("claude-desktop", spec, {"mcp_path": str(std_cfg)}),
+                std_cfg,
+            )
 
     def test_codex_import_review_and_classification(self):
         from urllib.error import HTTPError

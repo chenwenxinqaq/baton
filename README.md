@@ -106,6 +106,10 @@ python3 manager/manager.py
 
 在「客户端接入」的 DeepSeek Harness 卡片点「接入」，或运行 `umem connect deepseek`。应用通过官方 `@deepseek-ai/dsh-mcp-client` 把本地记忆服务加到 `~/.dsh/cordis.patch.yml`，已有插件配置会保留。Harness 使用自定义 `DSH_HOME` 时，请用同一个环境变量运行 `umem connect deepseek` 和 `umem disconnect deepseek`。重启 Harness 后，在新会话输入「用 Unified Memory 搜索我的记忆」，回到「读写动态」核对调用。可从同一卡片断开。 [DeepSeek Harness 官方记忆 MCP 指南](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/mcp-memory.zh.md)
 
+### Claude Desktop
+
+使用 Claude 桌面版（包括标准版 `Claude` 与 `Claude-3p`）时，打开 Unified Memory 的「客户端接入」，在 Claude Desktop 一行点「接入」，或运行 `umem connect claude-desktop`。应用会将 `unified-memory` 合并到 `claude_desktop_config.json`（macOS 自动识别 `~/Library/Application Support/Claude/` 或 `Claude-3p/`，也可用 `CLAUDE_DESKTOP_CONFIG` 显式指定路径），已有配置会保留。重启 Claude Desktop 后，在新会话中即可使用 Unified Memory，可从同一行断开。
+
 ### WorkBuddy 和其他客户端
 
 使用腾讯 WorkBuddy 桌面版时，打开 Unified Memory 的「客户端接入」，在 WorkBuddy 一行点「接入」。应用将 `unified_memory` 合并到用户级 `~/.workbuddy/mcp.json`，其他项目也能使用。命令行等价操作为 `umem connect workbuddy`。在 WorkBuddy 会话中输入「用 unified_memory 搜索我的记忆」，即可在「读写动态」核对实际调用。可从同一行断开。[WorkBuddy 官方 MCP 配置说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/MCP-Guide)

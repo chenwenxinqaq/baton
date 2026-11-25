@@ -15,6 +15,7 @@ from library_paths import _atomic_write_json, library_state_dir
 
 CLIENTS = {
     "claude": "Claude Code",
+    "claude-desktop": "Claude Desktop",
     "codex": "Codex",
     "cursor": "Cursor",
     "workbuddy": "WorkBuddy",
@@ -22,7 +23,7 @@ CLIENTS = {
     "deepseek": "DeepSeek Harness",
 }
 AUTOMATIC_CLIENTS = frozenset({"claude", "codex", "antigravity"})
-IMPORT_ID = re.compile(r"([a-z]+)-import-[0-9a-f]{32}")
+IMPORT_ID = re.compile(r"([a-z]+(?:-[a-z]+)*)-import-[0-9a-f]{32}")
 THREAD_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
 MAX_TEXT = 120_000
 

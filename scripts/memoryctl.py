@@ -571,10 +571,66 @@ def scan_stray_agent_memories(home=None):
     return stray
 
 
+def _claude_desktop_config_path(home, *, use_env=True):
+    """Resolve Claude Desktop's claude_desktop_config.json (standard or 3p build)."""
+    if use_env:
+        override = os.environ.get("CLAUDE_DESKTOP_CONFIG")
+        if override:
+            return Path(override).expanduser()
+    if sys.platform == "darwin":
+        support = home / "Library" / "Application Support"
+        standard_dir = support / "Claude"
+        third_party_dir = support / "Claude-3p"
+        standard_cfg = standard_dir / "claude_desktop_config.json"
+        third_party_cfg = third_party_dir / "claude_desktop_config.json"
+        if third_party_cfg.is_file() and not standard_cfg.is_file():
+            return third_party_cfg
+        if standard_cfg.is_file() and not third_party_cfg.is_file():
+            return standard_cfg
+        if standard_cfg.is_file() and third_party_cfg.is_file():
+            try:
+                if third_party_cfg.stat().st_mtime > standard_cfg.stat().st_mtime:
+                    return third_party_cfg
+            except OSError:
+                pass
+            return standard_cfg
+        if third_party_dir.is_dir() and not standard_dir.is_dir():
+            return third_party_cfg
+        if standard_dir.is_dir() and third_party_dir.is_dir():
+            try:
+                if third_party_dir.stat().st_mtime > standard_dir.stat().st_mtime:
+                    return third_party_cfg
+            except OSError:
+                pass
+        return standard_cfg
+    xdg_env = os.environ.get("XDG_CONFIG_HOME") if use_env else None
+    xdg_config = Path(xdg_env or home / ".config").expanduser()
+    return xdg_config / "Claude" / "claude_desktop_config.json"
+
+
+def _agent_mcp_path(agent_id, spec, restore):
+    """Keep Claude Desktop bound to the connected config path unless overridden via env."""
+    if agent_id == "claude-desktop" and not spec.get("mcp_path_override"):
+        saved = restore.get("mcp_path")
+        if saved:
+            return Path(saved)
+    return spec["mcp_path"]
+
+
 def agent_specs(home=None):
     """Return per-agent paths and detection rules."""
+    use_env = home is None
     home = home or Path.home()
     dsh_home = Path(os.environ.get("DSH_HOME") or home / ".dsh").expanduser()
+    claude_desktop_mcp = _claude_desktop_config_path(home, use_env=use_env)
+    claude_desktop_detect = [claude_desktop_mcp.parent]
+    if sys.platform == "darwin":
+        claude_desktop_detect.extend([
+            home / "Library" / "Application Support" / "Claude",
+            home / "Library" / "Application Support" / "Claude-3p",
+            home / "Applications" / "Claude.app",
+            Path("/Applications/Claude.app"),
+        ])
     return {
         "claude": {
             "name": "Claude Code",
@@ -585,6 +641,16 @@ def agent_specs(home=None):
             "mcp_path": home / ".claude.json",
             "mcp_key": "unified-memory",
             "skills_dir": home / ".claude" / "skills",
+        },
+        "claude-desktop": {
+            "name": "Claude Desktop",
+            "mode": "files",
+            "detect_paths": claude_desktop_detect,
+            "mcp_type": "json",
+            "mcp_path": claude_desktop_mcp,
+            "mcp_path_override": bool(use_env and os.environ.get("CLAUDE_DESKTOP_CONFIG")),
+            "mcp_env": {"UNIFIED_MEMORY_CLIENT": "Claude Desktop"},
+            "mcp_key": "unified-memory",
         },
         "codex": {
             "name": "Codex",
@@ -1170,7 +1236,7 @@ def inspect_agent(agent_id, spec):
     else:
         inst_state = "missing"
 
-    mcp_path = spec["mcp_path"]
+    mcp_path = _agent_mcp_path(agent_id, spec, restore)
     exp_cmd, exp_args = desired_mcp_args()
     if spec.get("mode") == "dsh_patch":
         try:
@@ -1321,7 +1387,7 @@ def connect_agent(agent_id, spec, dry_run=False):
             return {"id": agent_id, "state": "managed", "changes": changes or ["already up to date"]}
 
         inst_path = spec.get("instructions")
-        mcp_path = spec["mcp_path"]
+        mcp_path = _agent_mcp_path(agent_id, spec, restore)
 
         if inst_path is not None:
             if inst_path.is_symlink():
@@ -1351,9 +1417,11 @@ def connect_agent(agent_id, spec, dry_run=False):
         # 2. MCP config
         if spec["mcp_type"] == "json":
             data = read_json_mcp(mcp_path)
-            if agent_id == "workbuddy" and "mcp_had_previous" not in restore:
+            if agent_id in {"workbuddy", "claude-desktop"} and "mcp_had_previous" not in restore:
                 restore["mcp_file_existed"] = mcp_path.exists()
                 restore["mcp_servers_existed"] = "mcpServers" in data
+            if agent_id == "claude-desktop":
+                restore["mcp_path"] = str(mcp_path)
             servers = data.setdefault("mcpServers", {})
             desired = desired_json_mcp(spec)
             if "mcp_had_previous" not in restore:
@@ -1443,7 +1511,7 @@ def disconnect_agent(agent_id, spec, force=False):
             return {"id": agent_id, "state": "unmanaged", "changes": changes or ["nothing to remove"]}
 
         inst_path = spec.get("instructions")
-        mcp_path = spec["mcp_path"]
+        mcp_path = _agent_mcp_path(agent_id, spec, restore)
 
         if inst_path is not None and inst_path.is_file() and not inst_path.is_symlink():
             text = inst_path.read_text(encoding="utf-8")

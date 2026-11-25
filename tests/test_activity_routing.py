@@ -61,6 +61,14 @@ class ActivityRoutingTests(unittest.TestCase):
         legacy = _ref_link("projects/legacy.md", key="team-mymem")
         self.assertIn("library=team-mymem", legacy)
 
+    def test_normalize_client_distinguishes_claude_desktop_from_claude_code(self):
+        self.assertEqual(audit_log.normalize_client("claude-ai"), "Claude Desktop")
+        self.assertEqual(audit_log.normalize_client("claude-desktop"), "Claude Desktop")
+        self.assertEqual(audit_log.normalize_client("Claude Desktop"), "Claude Desktop")
+        self.assertEqual(audit_log.normalize_client("claude-code"), "Claude Code")
+        self.assertEqual(audit_log.normalize_client("Claude"), "Claude Code")
+        self.assertEqual(audit_log.normalize_client("workbuddy"), "WorkBuddy")
+
 
 if __name__ == "__main__":
     unittest.main()

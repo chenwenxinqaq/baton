@@ -1799,6 +1799,7 @@ def render_native_import_button(token, client):
 
 
 IMPORT_INSTRUCTIONS = {
+    "claude-desktop": "可在 Claude Desktop 中复制要保留的记忆或项目说明，或选择已导出的 Markdown 文件。",
     "cursor": "从 Cursor 的记忆管理页复制已保存的记忆，或选择希望导入的 .mdc 规则。",
     "workbuddy": "可在 WorkBuddy「设置 → 记忆与进化」复制要保留的条目，或选择工作空间的 MEMORY.md。",
     "deepseek": "选择已有的记忆文件，或粘贴想保留的内容。",
@@ -3743,6 +3744,7 @@ class Handler(BaseHTTPRequestHandler):
             "restored": "手记已恢复生效。",
             "version_restored": "历史版本已恢复为当前内容（原内容已另存为新备份）。",
             "connected": "客户端配置已保存，可在读写动态查看实际调用。",
+            "claude-desktop_connected": "Claude Desktop 配置已保存。请重启 Claude Desktop 并在新会话中试用 Unified Memory。",
             "workbuddy_connected": "WorkBuddy 配置已保存。如果当前会话还看不到记忆工具，请重新打开 WorkBuddy 会话。",
             "deepseek_connected": "DeepSeek Harness 配置已保存。重启 Harness 后，在新会话中试用 Unified Memory。",
             "disconnected": "客户端接入已干净移除，原备份已还原。",
@@ -4284,7 +4286,7 @@ class Handler(BaseHTTPRequestHandler):
                 if op == "connect":
                     for aid, spec in targets:
                         memoryctl.connect_agent(aid, spec)
-                    notice = f"{target}_connected" if target in {"workbuddy", "deepseek"} else "connected"
+                    notice = f"{target}_connected" if target in {"claude-desktop", "workbuddy", "deepseek"} else "connected"
                 elif op == "disconnect":
                     for aid, spec in targets:
                         memoryctl.disconnect_agent(aid, spec)

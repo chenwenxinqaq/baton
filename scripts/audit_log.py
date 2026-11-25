@@ -122,6 +122,8 @@ def normalize_client(name):
         return "Cursor"
     if "codex" in low:
         return "Codex"
+    if "claude desktop" in low or "claude-desktop" in low or "claude-ai" in low:
+        return "Claude Desktop"
     if "claude" in low:
         return "Claude Code"
     if "gemini" in low or "antigravity" in low or "agy" in low:
