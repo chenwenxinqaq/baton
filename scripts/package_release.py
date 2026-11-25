@@ -40,6 +40,7 @@ PUBLIC_FILES = (
     "scripts/async_sync.py",
     "scripts/audit_log.py",
     "scripts/cursor_hook.py",
+    "scripts/secret_guard.py",
     "skills/unified-memory/SKILL.md",
     "templates/entry.md",
     "templates/incident.md",

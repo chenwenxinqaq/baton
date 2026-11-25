@@ -15,6 +15,11 @@ read differently from the entry's own summary.
 import re
 import time
 
+try:
+    import secret_guard
+except ImportError:  # pragma: no cover - package import fallback
+    from . import secret_guard
+
 DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
 FRONTMATTER_LEFTOVER_RE = re.compile(r"^---\s*$", re.MULTILINE)
 WORD_RE = re.compile(r"[a-z0-9]{3,}")
@@ -71,6 +76,13 @@ def lint_entries(entries, index=None, now=None, stale_days=STALE_DAYS):
                 "duplicate-frontmatter", "error", ref,
                 "正文里还留着一段 frontmatter（多余的 --- 分隔块）",
                 "重新 upsert 这篇，body 只写正文",
+            ))
+        leaks = secret_guard.find_secrets(entry.get("title", ""), entry.get("description", ""), body)
+        if leaks:
+            findings.append(_finding(
+                "secret-leak", "error", ref,
+                f"检测到疑似明文凭据：{secret_guard.format_findings(leaks)}",
+                "把凭据移到系统钥匙串或 0600 私有文件，正文只保留位置说明并重新保存",
             ))
         if not (entry.get("description") or "").strip():
             findings.append(_finding(

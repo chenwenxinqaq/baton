@@ -46,6 +46,7 @@ from library_paths import (
 )
 import audit_log  # noqa: E402
 import memory_import  # noqa: E402
+import secret_guard  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
 from async_sync import AsyncSyncScheduler  # noqa: E402
@@ -906,6 +907,10 @@ class Library:
 
     def save(self, entry):
         self._ensure_writable(layer=entry.layer, user_managed=True)
+        try:
+            secret_guard.ensure_no_secrets(entry.title, entry.description, entry.body)
+        except ValueError as exc:
+            raise InvalidEntry(str(exc)) from exc
         path = self.path(entry.name)
         with self.write_lock():
             if entry.revision:
@@ -967,6 +972,10 @@ def validate_common_fields(layer, title, description, body):
         raise InvalidEntry(f"检索摘要须为单行且不超过 {MAX_DESC_CHARS} 个字符。")
     if not body.strip() or len(body) > MAX_BODY_CHARS:
         raise InvalidEntry(f"正文不能为空且不超过 {MAX_BODY_CHARS:,} 个字符。")
+    try:
+        secret_guard.ensure_no_secrets(title, description, body)
+    except ValueError as exc:
+        raise InvalidEntry(str(exc)) from exc
 
 
 def hidden(name, value):
@@ -2528,6 +2537,7 @@ def _usage_section(today, week):
 
 
 _LINT_CHECK_LABELS = {
+    "secret-leak": "包含疑似明文凭据",
     "duplicate-frontmatter": "正文里混进了 frontmatter",
     "index-missing": "不在索引里",
     "index-orphan": "索引指向了不存在的文件",

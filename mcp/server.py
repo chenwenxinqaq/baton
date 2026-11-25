@@ -28,6 +28,7 @@ from library_paths import (
 )
 import audit_log
 import memory_lint
+import secret_guard
 import sync_git
 from async_sync import AsyncSyncScheduler
 
@@ -1246,6 +1247,7 @@ class MemoryStore:
             raise ValueError("description must be a single line.")
         if not body:
             raise ValueError("body must not be empty.")
+        secret_guard.ensure_no_secrets(title, description, body)
 
         resolved_type = topic_type or LAYER_DEFAULT_TYPE[layer]
         allowed_types = ALLOWED_LAYER_TYPES[layer] if user_managed else VALID_TOPIC_TYPES
