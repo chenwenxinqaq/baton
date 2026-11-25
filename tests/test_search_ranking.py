@@ -239,6 +239,14 @@ class MatchStrengthTests(unittest.TestCase):
                     "stale": stale,
                     "axis": "update",
                 }])
+        cases = search_eval.load_cases_from_rows([{
+            "query": "release version",
+            "relevant": ["methods/current.md"],
+            "stale": None,
+            "axis": "update",
+        }])
+        self.assertEqual(len(cases), 1)
+        self.assertNotIn("stale", cases[0])
 
 
 class CompactSearchTests(unittest.TestCase):

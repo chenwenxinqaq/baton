@@ -79,7 +79,7 @@ def load_cases_from_rows(raw, library="*"):
             query, relevant = row.get("query", ""), row.get("relevant") or []
             lib = row.get("library") or library
             axis = row.get("axis") or ""
-            stale = row.get("stale", [])
+            stale = [] if row.get("stale") is None else row.get("stale")
         else:
             query, relevant = row[0], list(row[1])
             lib = row[2] if len(row) > 2 else library
