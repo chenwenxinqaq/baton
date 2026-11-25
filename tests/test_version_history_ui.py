@@ -389,6 +389,41 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertEqual(captured["status"], 400)
         self.assertIn("error", captured["payload"])
 
+    def test_inline_code_memory_refs_and_root_relative_links_are_clickable(self):
+        import manager as manager_mod
+
+        self._write("Docker 缓存清理步骤。")
+        self.library.save(
+            manager_mod.Entry(
+                name="my-note",
+                title="个人手记",
+                description="说明",
+                entry_type="user",
+                layer="L2",
+                status="active",
+                body="个人手记正文",
+            )
+        )
+        _, topics = self.library.read_index()
+        md = (
+            "参见 `methods/docker-cache.md`、`user-managed/my-note.md`、`MEMORY.md`，"
+            "以及不存在的 `methods/missing.md` 和 [直接引用](methods/docker-cache.md)。"
+        )
+        rendered = manager_mod.render_markdown_html(
+            md,
+            "projects/caller.md",
+            self.library.root,
+            topics,
+            {"library": "primary"},
+        )
+        self.assertIn('class="inline-code-link"', rendered)
+        self.assertIn("topic=methods%2Fdocker-cache.md#detail-title", rendered)
+        self.assertIn("entry=my-note#detail-title", rendered)
+        self.assertIn("view=index#detail-title", rendered)
+        # Non-existent path must stay plain code, not a broken link.
+        self.assertIn('<code class="inline-code">methods/missing.md</code>', rendered)
+        self.assertNotIn("topic=methods%2Fmissing.md", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

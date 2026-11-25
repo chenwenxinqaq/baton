@@ -998,6 +998,18 @@
     border: 1px solid var(--line);
     color: var(--text);
   }
+  .inline-code-link {
+    text-decoration: none;
+  }
+  .inline-code-link .inline-code {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--line));
+    transition: background-color 140ms ease, border-color 140ms ease;
+  }
+  .inline-code-link:hover .inline-code {
+    background: var(--primary-soft);
+    border-color: var(--primary);
+  }
 
   .code-block, .markdown-raw {
     white-space: pre-wrap;

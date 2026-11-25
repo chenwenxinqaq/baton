@@ -1396,14 +1396,23 @@ def render_delete_dialog_html(token, library_key, scope, target_id, display_path
 
 
 def format_inline_md(text, base_rel_dir, root, topics, link_params):
-    """Safely render inline code, bold, and links (rewriting internal .md links)."""
+    """Safely render inline code, bold, and links (rewriting internal .md refs)."""
     parts = []
     last = 0
     for m in INLINE_TOKEN_RE.finditer(text):
         parts.append(escape(text[last : m.start()]))
         code_tok, bold_tok, _, link_label, link_href = m.groups()
         if code_tok:
-            parts.append(f'<code class="inline-code">{escape(code_tok[1:-1])}</code>')
+            code_inner = code_tok[1:-1]
+            app_url, tip = _resolve_internal_md_url(code_inner, base_rel_dir, root, topics, link_params)
+            if app_url:
+                title_attr = f' title="{escape(tip)}"' if tip else ""
+                parts.append(
+                    f'<a class="inline-code-link" href="{escape(app_url)}"{title_attr}>'
+                    f'<code class="inline-code">{escape(code_inner)}</code></a>'
+                )
+            else:
+                parts.append(f'<code class="inline-code">{escape(code_inner)}</code>')
         elif bold_tok:
             parts.append(f"<strong>{escape(bold_tok[2:-2])}</strong>")
         else:
@@ -1413,48 +1422,68 @@ def format_inline_md(text, base_rel_dir, root, topics, link_params):
     return "".join(parts)
 
 
+def _resolve_internal_md_url(ref_text, base_rel_dir, root, topics, link_params):
+    """Resolve a relative or library-root Markdown ref into an in-app URL and tooltip."""
+    raw = (ref_text or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return "", ""
+    parsed = urlsplit(raw)
+    clean_path = unquote(parsed.path)
+    if parsed.scheme or clean_path.startswith("/") or not clean_path or not clean_path.lower().endswith(".md"):
+        return "", ""
+    root_resolved = Path(root).resolve()
+    candidates = [root / base_rel_dir / clean_path]
+    if str(base_rel_dir) not in ("", "."):
+        candidates.append(root / clean_path)
+    for unnorm in candidates:
+        resolved = unnorm.resolve()
+        if resolved.suffix.lower() != ".md" or not resolved.is_file():
+            continue
+        norm_logical = Path(os.path.normpath(unnorm))
+        if norm_logical.is_relative_to(root / "skills"):
+            rel_skill = norm_logical.relative_to(root / "skills")
+            parts = rel_skill.parts
+            if len(parts) >= 2:
+                sk_folder = parts[0]
+                sub_doc = "/".join(parts[1:])
+                owner = link_params.get("skill", "")
+                if owner:
+                    import memoryctl
+
+                    resources = memoryctl.resource_catalog(root / "skills").get(owner, [])
+                    if sk_folder in resources:
+                        sub_doc = "../" + "/".join(parts)
+                        sk_folder = owner
+                sk_params = {
+                    "library": link_params["library"],
+                    "tab": "skills",
+                    "skill": sk_folder,
+                    "doc": "" if sub_doc == "SKILL.md" else sub_doc,
+                }
+                return query(**sk_params) + "#detail-title", f"打开技能文档 {sk_folder}/{sub_doc}"
+        if resolved.is_relative_to(root_resolved):
+            rel_posix = resolved.relative_to(root_resolved).as_posix()
+            if rel_posix == "MEMORY.md":
+                return query(library=link_params["library"], view="index") + "#detail-title", "打开 MEMORY.md"
+            if rel_posix in topics:
+                mem_params = {k: v for k, v in link_params.items() if k != "tab"}
+                topic_obj = topics[rel_posix]
+                tip = f"打开 {topic_obj.title}" if getattr(topic_obj, "title", "") else f"打开 {rel_posix}"
+                return query(**mem_params, topic=rel_posix) + "#detail-title", tip
+            if rel_posix.startswith("user-managed/") and len(Path(rel_posix).parts) == 2:
+                mem_params = {k: v for k, v in link_params.items() if k != "tab"}
+                return query(**mem_params, entry=Path(rel_posix).stem) + "#detail-title", f"打开手记 {rel_posix}"
+    return "", ""
+
+
 def render_md_link(label, href, base_rel_dir, root, topics, link_params):
     """Rewrite intra-library and intra-skill Markdown links into clickable in-app URLs."""
     safe_label = escape(label)
     if href.startswith(("https://", "http://")):
         return f'<a href="{escape(href)}" target="_blank" rel="noopener noreferrer">{safe_label} ↗</a>'
-    parsed = urlsplit(href)
-    clean_path = unquote(parsed.path)
-    if not parsed.scheme and not clean_path.startswith("/") and clean_path:
-        unnorm = root / base_rel_dir / clean_path
-        resolved = unnorm.resolve()
-        if resolved.suffix.lower() == ".md" and resolved.is_file():
-            norm_logical = Path(os.path.normpath(unnorm))
-            if norm_logical.is_relative_to(root / "skills"):
-                rel_skill = norm_logical.relative_to(root / "skills")
-                parts = rel_skill.parts
-                if len(parts) >= 2:
-                    sk_folder = parts[0]
-                    sub_doc = "/".join(parts[1:])
-                    owner = link_params.get("skill", "")
-                    if owner:
-                        import memoryctl
-
-                        resources = memoryctl.resource_catalog(root / "skills").get(owner, [])
-                        if sk_folder in resources:
-                            sub_doc = "../" + "/".join(parts)
-                            sk_folder = owner
-                    sk_params = {
-                        "library": link_params["library"],
-                        "tab": "skills",
-                        "skill": sk_folder,
-                        "doc": "" if sub_doc == "SKILL.md" else sub_doc,
-                    }
-                    return f'<a href="{escape(query(**sk_params))}#detail-title">{safe_label}</a>'
-            if resolved.is_relative_to(root):
-                rel_posix = resolved.relative_to(root).as_posix()
-                if rel_posix == "MEMORY.md":
-                    app_url = query(library=link_params["library"], view="index") + "#detail-title"
-                    return f'<a href="{escape(app_url)}">{safe_label}</a>'
-                if rel_posix in topics:
-                    mem_params = {k: v for k, v in link_params.items() if k != "tab"}
-                    app_url = query(**mem_params, topic=rel_posix) + "#detail-title"
-                    return f'<a href="{escape(app_url)}">{safe_label}</a>'
+    app_url, _ = _resolve_internal_md_url(href, base_rel_dir, root, topics, link_params)
+    if app_url:
+        return f'<a href="{escape(app_url)}">{safe_label}</a>'
     return f'<span class="local-ref" title="{escape(href)}">{safe_label}</span>'
 
 
