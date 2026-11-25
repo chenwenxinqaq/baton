@@ -19,7 +19,10 @@ The "axis" field follows LongMemEval (arXiv 2410.10813): "extraction" (default),
 "temporal" (queries with time cues), and "abstention" (the answer is not in
 memory, so "relevant" is empty). An abstention case passes when no hit has
 match="full"; it reports how often search would tempt the agent with a
-confident-looking wrong entry.
+confident-looking wrong entry. Update cases may include a ``stale`` list of
+refs; their freshness score passes only when a current relevant ref is
+returned and precedes every stale ref in the top-k. This measures retrieval,
+not whether an agent answers correctly or updates the content at a stable ref.
 """
 
 import argparse
@@ -66,20 +69,34 @@ def load_cases(path, library="*"):
 def load_cases_from_rows(raw, library="*"):
     """Normalize case rows; rows with no relevant refs are abstention cases."""
     cases = []
-    for row in raw:
+    for i, row in enumerate(raw, 1):
         if isinstance(row, dict):
             query, relevant = row.get("query", ""), row.get("relevant") or []
             lib = row.get("library") or library
             axis = row.get("axis") or ""
+            stale = row.get("stale", [])
         else:
             query, relevant = row[0], list(row[1])
             lib = row[2] if len(row) > 2 else library
             axis = row[3] if len(row) > 3 else ""
+            stale = []
         query = (query or "").strip()
         axis = axis or ("extraction" if relevant else "abstention")
+        if not isinstance(stale, list) or not all(isinstance(ref, str) and ref.strip() for ref in stale):
+            raise ValueError(f"Case {i}: stale must be a list of entry refs.")
+        if stale and (axis != "update" or not relevant or set(stale).intersection(relevant)):
+            raise ValueError(f"Case {i}: stale refs require an update case and must be distinct from relevant refs.")
         if not query or (not relevant and axis != "abstention"):
             continue
-        cases.append({"query": query, "library": lib, "relevant": list(relevant), "axis": axis})
+        case = {
+            "query": query,
+            "library": lib,
+            "relevant": list(relevant),
+            "axis": axis,
+        }
+        if stale:
+            case["stale"] = stale
+        cases.append(case)
     return cases
 
 
@@ -90,6 +107,7 @@ def evaluate(store, cases, rankers=RANKERS, limit=10):
     abstain = []
     for case in cases:
         ranks = {}
+        stale_ranks = {}
         try:
             for ranker in rankers:
                 hits = store.search(case["query"], limit=limit, library=case["library"], ranker=ranker)
@@ -99,32 +117,53 @@ def evaluate(store, cases, rankers=RANKERS, limit=10):
                     continue
                 refs = [h.get("ref") for h in hits]
                 found = [refs.index(r) + 1 for r in case["relevant"] if r in refs]
-                ranks[ranker] = min(found) if found else None
+                current_rank = min(found) if found else None
+                ranks[ranker] = current_rank
+                if case.get("stale"):
+                    stale_ranks[ranker] = next(
+                        (i for i, ref in enumerate(refs, 1) if ref in case["stale"]), None
+                    )
         except ValueError:
             report["skipped"] += 1
             continue
-        (abstain if not case["relevant"] else usable).append((case, ranks))
-        report["details"].append({**case, "ranks": ranks})
+        detail = {**case, "ranks": ranks}
+        if stale_ranks:
+            detail["stale_ranks"] = stale_ranks
+        (usable if case["relevant"] else abstain).append(detail)
+        report["details"].append(detail)
     for ranker in rankers:
-        report["rankers"][ranker] = _metrics([r[ranker] for _, r in usable])
+        report["rankers"][ranker] = _metrics([c["ranks"][ranker] for c in usable])
         if abstain:
             report["rankers"][ranker]["abstention"] = round(
-                sum(1 for _, r in abstain if r[ranker]) / len(abstain), 3)
-    axes = sorted({case.get("axis", "extraction") for case, _ in usable})
-    if len(axes) > 1 or abstain:
+                sum(1 for c in abstain if c["ranks"][ranker]) / len(abstain), 3)
+    axes = sorted({c.get("axis", "extraction") for c in usable})
+    update_cases = [c for c in usable if c.get("stale_ranks")]
+    if len(axes) > 1 or abstain or "update" in axes:
         report["axes"] = {
-            axis: {ranker: _metrics([r[ranker] for c, r in usable if c.get("axis", "extraction") == axis])
+            axis: {ranker: _metrics([c["ranks"][ranker] for c in usable if c.get("axis", "extraction") == axis])
                    for ranker in rankers}
             for axis in axes
         }
+        if update_cases:
+            for ranker in rankers:
+                passes = sum(_ranks_before_stale(c["ranks"][ranker], c["stale_ranks"][ranker])
+                             for c in update_cases)
+                report["axes"]["update"][ranker].update(
+                    freshness=round(passes / len(update_cases), 3),
+                    freshness_cases=len(update_cases),
+                )
         if abstain:
             report["axes"]["abstention"] = {
-                ranker: {"pass": round(sum(1 for _, r in abstain if r[ranker]) / len(abstain), 3),
+                ranker: {"pass": round(sum(1 for c in abstain if c["ranks"][ranker]) / len(abstain), 3),
                          "cases": len(abstain)}
                 for ranker in rankers
             }
     report["evaluated"] = len(usable) + len(abstain)
     return report
+
+
+def _ranks_before_stale(current, stale):
+    return current is not None and (stale is None or current < stale)
 
 
 def _metrics(best):

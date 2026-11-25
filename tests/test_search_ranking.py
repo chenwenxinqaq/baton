@@ -171,6 +171,45 @@ class MatchStrengthTests(unittest.TestCase):
         self.assertEqual(report["axes"]["update"]["legacy"]["hit@1"], 1.0)
         self.assertEqual(report["axes"]["abstention"]["legacy"], {"pass": 0.5, "cases": 2})
 
+    def test_update_cases_report_current_over_stale_rank(self):
+        cases = search_eval.load_cases_from_rows([{
+            "query": "docker 缓存",
+            "relevant": ["methods/docker-build-cache-fix.md"],
+            "stale": ["methods/python-release.md"],
+            "axis": "update",
+        }])
+
+        class _Wrap:
+            def search(self, query, limit=10, library="personal", ranker=None):
+                return [{"ref": ref} for ref in self.refs[:limit]]
+
+        current, stale = cases[0]["relevant"][0], cases[0]["stale"][0]
+        for refs, expected in (
+            ([current, stale], 1.0),
+            ([stale, current], 0.0),
+            ([current], 1.0),
+            ([stale], 0.0),
+            ([], 0.0),
+        ):
+            with self.subTest(refs=refs):
+                wrapper = _Wrap()
+                wrapper.refs = refs
+                report = search_eval.evaluate(wrapper, cases, rankers=("legacy",))
+                self.assertEqual(report["details"][0]["stale_ranks"]["legacy"],
+                                 refs.index(stale) + 1 if stale in refs else None)
+                self.assertEqual(report["axes"]["update"]["legacy"]["freshness"], expected)
+                self.assertEqual(report["axes"]["update"]["legacy"]["freshness_cases"], 1)
+
+    def test_update_cases_reject_overlapping_and_malformed_stale_refs(self):
+        for stale in ("methods/current.md", ["methods/current.md"]):
+            with self.subTest(stale=stale), self.assertRaises(ValueError):
+                search_eval.load_cases_from_rows([{
+                    "query": "release version",
+                    "relevant": ["methods/current.md"],
+                    "stale": stale,
+                    "axis": "update",
+                }])
+
 
 class ProcedurePhraseTests(unittest.TestCase):
     def setUp(self):

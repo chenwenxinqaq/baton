@@ -99,6 +99,15 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   Nothing in the literature; it came from the user's question of whether the
   memory saves tokens or just injects noise. It measures returned tokens, how
   often a search result is actually read, and at which rank.
+- **Knowledge-update checks** (`scripts/search_eval.py`, `axis: "update"`).
+  A hand-labelled case can mark outdated refs with `stale`. `freshness` is
+  the fraction of those cases where a current ref is returned ahead of every
+  stale ref in the top-k. On four local queries about two changed facts,
+  fixed-point and hybrid ranked the current ref first in all four; BM25F
+  promoted older snapshots in two. That is a regression signal, not a
+  full LongMemEval score. A separate end-to-end store test checks the
+  in-place case: search and read show the new conclusion at the same ref,
+  while history still exposes the replaced content.
 
 ## What we tried and rejected
 
@@ -119,13 +128,9 @@ inject into it small, which is why reads are progressive and §0 is tiny.
 
 - Recall-oriented eval. `see_also` adds entries no hit@k metric rewards, so its
   value is still judged by hand on sample queries, not measured.
-- LongMemEval (2410.10813) knowledge-update axis still has no labelled cases:
-  does a search find the newest version of a changed fact. `search_eval.py`
-  accepts an `axis` field and reports each axis separately; extraction,
-  abstention and temporal are covered (5 temporal cases, legacy hit@1 1.0 and
-  MRR 1.0, while bm25f drops to 0.4 and hybrid to 0.8 — a third reason the
-  legacy ranker stays the default). An entry is overwritten in place, so this
-  axis mostly tests whether a stale snapshot was ever updated, not retrieval.
+- Broader knowledge-update evaluation: these cases check retrieval order and
+  in-place replacement, not whether an agent recognizes and applies a new
+  fact on its own or answers historical questions correctly.
 - A curation pass for shared libraries: triage a candidate as new / update /
   disputed / no-material before writing, with `draft` / `stable` /
   `needs-update` status, from the LLM-wiki projects and Zep's invalidation.
