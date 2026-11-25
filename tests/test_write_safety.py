@@ -141,6 +141,25 @@ class WriteSafetyTests(unittest.TestCase):
         res = self._write("docker-cache", LONG + "再补充。")
         self.assertNotIn("related", res)
 
+    def test_check_expected_updated_handles_missing_old_meta(self):
+        first = self._write("docker-cache", LONG)
+        target = self.store.root / first["path"]
+        _, fallback_ts, _, _ = mcp_server.file_timestamps(target, {})
+        mcp_server.MemoryStore._check_expected_updated(fallback_ts, old_meta=None, target=target)
+        with self.assertRaisesRegex(ValueError, "Entry changed since you read it"):
+            mcp_server.MemoryStore._check_expected_updated("2020-01-01T00:00:00+08:00", old_meta=None, target=target)
+
+    def test_tool_schemas_keep_defaults_valid_against_enums(self):
+        for tool in mcp_server.TOOLS:
+            props = tool["inputSchema"].get("properties", {})
+            for prop_name, schema in props.items():
+                if "enum" not in schema:
+                    continue
+                with self.subTest(tool=tool["name"], prop=prop_name):
+                    self.assertTrue(all(val != "" for val in schema["enum"]))
+                    if "default" in schema:
+                        self.assertIn(schema["default"], schema["enum"])
+
 
 if __name__ == "__main__":
     unittest.main()
