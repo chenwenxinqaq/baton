@@ -2369,6 +2369,8 @@ def _audit_event(name, args, data, ok, ms, error="", result=None):
             ev["library"] = data.get("library") or ev.get("library")
             if name in ("memory_upsert", "memory_archive", "memory_restore"):
                 ev["action"] = data.get("status") or data.get("action")
+            if name == "memory_upsert" and data.get("mode"):
+                ev["mode"] = data.get("mode")
     return ev
 
 

@@ -744,6 +744,48 @@ class PublicFrameworkTests(unittest.TestCase):
         # Cooldown suppresses an immediate repeat.
         self.assertEqual(run_nested("Stop", "codex", {"session_id": "s1"}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="0"), {})
 
+        # Mid-turn PostToolUse emits a non-blocking checkpoint after sustained work without a write.
+        run_nested("UserPromptSubmit", "codex", {"session_id": "s2", "prompt": "长任务排查"})
+        checkpoint = {}
+        for _ in range(3):
+            checkpoint = run_nested(
+                "PostToolUse",
+                "codex",
+                {"session_id": "s2", "tool_name": "Bash"},
+                UNIFIED_MEMORY_CHECKPOINT_TOOLS="3",
+            )
+        self.assertEqual(checkpoint.get("hookSpecificOutput", {}).get("hookEventName"), "PostToolUse")
+        self.assertIn("【阶段记忆提醒】", checkpoint.get("hookSpecificOutput", {}).get("additionalContext", ""))
+        # A memory write resets tools_since_write so immediate work doesn't re-trigger checkpoint or Stop.
+        run_nested("PostToolUse", "codex", {"session_id": "s2", "tool_name": "mcp__unified_memory__memory_upsert"})
+        write_event = {"source": "mcp", "client": "Codex", "tool": "memory_upsert", "ok": True}
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; sys.path.insert(0, {str(CODE / 'scripts')!r}); import audit_log; audit_log.record({write_event!r})",
+            ],
+            env=self.environment(),
+            cwd=self.home,
+        )
+        self.assertEqual(
+            run_nested("Stop", "codex", {"session_id": "s2"}, UNIFIED_MEMORY_NUDGE_MIN_SECONDS="0", UNIFIED_MEMORY_NUDGE_COOLDOWN="0"),
+            {},
+        )
+        # Substantial post-write work in the same long turn re-enables Stop reminder instead of staying silent forever.
+        for _ in range(2):
+            run_nested("PostToolUse", "codex", {"session_id": "s2", "tool_name": "Bash"}, UNIFIED_MEMORY_CHECKPOINT_TOOLS="99")
+        post_write_nudge = run_nested(
+            "Stop",
+            "codex",
+            {"session_id": "s2"},
+            UNIFIED_MEMORY_NUDGE_MIN_SECONDS="0",
+            UNIFIED_MEMORY_NUDGE_COOLDOWN="0",
+            UNIFIED_MEMORY_POST_WRITE_MIN_TOOLS="2",
+        )
+        self.assertEqual(post_write_nudge.get("decision"), "block")
+        self.assertIn("【记忆沉淀检查】", post_write_nudge.get("reason", ""))
+
         # Disconnect restores both files without touching unrelated settings or foreign hooks.
         self.cli("disconnect", "claude")
         self.cli("disconnect", "codex")

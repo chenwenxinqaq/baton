@@ -128,6 +128,48 @@ class ToolCallAuditSizeTests(unittest.TestCase):
             self.assertEqual(daily[-2]["writes"], 1)
             self.assertEqual(daily[-2]["nudges"], 1)
 
+    def test_write_pipeline_telemetry_tracks_append_mode_conversions_and_latency(self):
+        events = [
+            {"t": 100.0, "source": "hook", "client": "Codex", "event": "checkpoint", "tool_calls": 12},
+            {"t": 200.0, "source": "hook", "client": "Codex", "event": "nudge", "turn_seconds": 120},
+            {"t": 260.0, "source": "mcp", "client": "Codex", "tool": "memory_upsert", "mode": "append", "ok": True, "ms": 42},
+            {"t": 500.0, "source": "hook", "client": "Codex", "event": "nudge", "turn_seconds": 150},
+            {"t": 900.0, "source": "mcp", "client": "Claude Code", "tool": "memory_upsert", "mode": "replace", "ok": True, "ms": 2500},
+        ]
+        stats = audit_log.usage_stats(events)
+        pipeline = stats["write_pipeline"]
+        self.assertEqual(pipeline["writes"], 2)
+        self.assertEqual(pipeline["append_writes"], 1)
+        self.assertEqual(pipeline["checkpoints"], 1)
+        self.assertEqual(pipeline["nudges"], 2)
+        self.assertEqual(pipeline["nudge_conversions"], 1)
+        self.assertEqual(pipeline["nudge_conversion_rate"], 0.5)
+        self.assertEqual(pipeline["write_p95_ms"], 2500)
+        self.assertEqual(pipeline["slow_writes"], 1)
+
+    def test_memory_upsert_audit_event_records_append_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "lib"
+            root.mkdir()
+            (root / "MEMORY.md").write_text("# Unified Memory\n\n## L0\n\n## L1\n\n## L2\n\n## L3\n\n## L4\n", encoding="utf-8")
+            for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
+                (root / folder).mkdir()
+            events = []
+            with mock.patch.object(mcp_server.audit_log, "record", side_effect=lambda event, **_: events.append(event) or True):
+                store = mcp_server.MemoryStore(root)
+                mcp_server.handle_tool_call(
+                    store,
+                    "memory_upsert",
+                    {"layer": "L3", "name": "proj", "title": "项目进展", "description": "摘要", "body": "初始正文"},
+                )
+                mcp_server.handle_tool_call(
+                    store,
+                    "memory_upsert",
+                    {"layer": "L3", "name": "proj", "body": "- 2026-11-26：追加记录", "mode": "append"},
+                )
+            self.assertEqual(events[-2]["mode"], "replace")
+            self.assertEqual(events[-1]["mode"], "append")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -215,10 +215,25 @@ def read_events(since=None, home=None):
 
 def has_write_since(since, home=None, client=None):
     """True if a successful write happened since `since` (optionally only by one client)."""
-    return any(
-        e.get("tool") in WRITE_TOOLS and e.get("ok", True) and (client is None or e.get("client") == client)
-        for e in read_events(since=since, home=home)
-    )
+    return latest_write_time(since, home=home, client=client) is not None
+
+
+def latest_write_time(since, home=None, client=None):
+    """Return the latest timestamp of a successful write since `since`, or None."""
+    latest = None
+    for e in read_events(since=since, home=home):
+        if (
+            e.get("tool") in WRITE_TOOLS
+            and e.get("ok", True)
+            and (client is None or e.get("client") == client)
+        ):
+            try:
+                ts = float(e.get("t", 0))
+            except (TypeError, ValueError):
+                continue
+            if latest is None or ts > latest:
+                latest = ts
+    return latest
 
 
 def _day_start(now):
@@ -227,6 +242,8 @@ def _day_start(now):
 
 
 FOLLOW_WINDOW_SECONDS = 30 * 60
+NUDGE_FOLLOW_WINDOW_SECONDS = 10 * 60
+SLOW_WRITE_MS = 2000
 
 
 def search_reads(events):
@@ -293,6 +310,39 @@ def usage_stats(events):
             rank_counter[refs.index(ref) + 1] += 1
 
     sessions = [e for e in events if e.get("source") == "hook" and e.get("event") == "sessionStart" and "tokens" in e]
+
+    writes = [e for e in calls if e.get("tool") in WRITE_TOOLS]
+    append_writes = sum(1 for e in writes if e.get("tool") == "memory_upsert" and e.get("mode") == "append")
+    write_ms = sorted(int(e["ms"]) for e in writes if isinstance(e.get("ms"), (int, float)) and e["ms"] >= 0)
+    write_p95_ms = None
+    if write_ms:
+        idx = min(len(write_ms) - 1, max(0, int(round(0.95 * (len(write_ms) - 1)))))
+        write_p95_ms = write_ms[idx]
+    slow_writes = sum(1 for ms in write_ms if ms >= SLOW_WRITE_MS)
+
+    nudges = [e for e in events if e.get("source") == "hook" and e.get("event") == "nudge"]
+    checkpoints = [e for e in events if e.get("source") == "hook" and e.get("event") == "checkpoint"]
+    nudge_conversions = 0
+    for nudge in nudges:
+        nt = float(nudge.get("t") or 0)
+        nclient = nudge.get("client")
+        if any(
+            w.get("client") == nclient
+            and nt <= float(w.get("t") or 0) <= nt + NUDGE_FOLLOW_WINDOW_SECONDS
+            for w in writes
+        ):
+            nudge_conversions += 1
+
+    write_pipeline = {
+        "writes": len(writes),
+        "append_writes": append_writes,
+        "nudges": len(nudges),
+        "checkpoints": len(checkpoints),
+        "nudge_conversions": nudge_conversions,
+        "nudge_conversion_rate": round(nudge_conversions / len(nudges), 3) if nudges else None,
+        "write_p95_ms": write_p95_ms,
+        "slow_writes": slow_writes,
+    }
     return {
         "tokens_total": sum(item["tokens"] for item in by_tool.values()),
         "by_tool": by_tool,
@@ -304,6 +354,7 @@ def usage_stats(events):
         "read_ranks": {str(rank): count for rank, count in sorted(rank_counter.items())},
         "session_injections": len(sessions),
         "session_injection_tokens": sum(int(e.get("tokens") or 0) for e in sessions),
+        "write_pipeline": write_pipeline,
     }
 
 
@@ -380,6 +431,9 @@ def summarize(now=None, home=None, days=7):
     )
 
     nudges_today = sum(1 for e in events if e.get("source") == "hook" and e.get("event") == "nudge" and e.get("t", 0) >= today0)
+    checkpoints_today = sum(
+        1 for e in events if e.get("source") == "hook" and e.get("event") == "checkpoint" and e.get("t", 0) >= today0
+    )
     sessions_today = sum(1 for e in events if e.get("source") == "hook" and e.get("event") == "sessionStart" and e.get("t", 0) >= today0)
 
     daily = []
@@ -396,6 +450,7 @@ def summarize(now=None, home=None, days=7):
                 "reads": sum(1 for e in day_mcp if e.get("tool") in READ_TOOLS and e.get("ok", True)),
                 "writes": sum(1 for e in day_mcp if e.get("tool") in WRITE_TOOLS and e.get("ok", True)),
                 "nudges": sum(1 for e in day_events if e.get("source") == "hook" and e.get("event") == "nudge"),
+                "checkpoints": sum(1 for e in day_events if e.get("source") == "hook" and e.get("event") == "checkpoint"),
                 "errors": sum(1 for e in day_mcp if e.get("ok") is False),
             }
         )
@@ -410,6 +465,7 @@ def summarize(now=None, home=None, days=7):
         "recent_queries": recent_queries,
         "empty_searches_today": empty_searches_today,
         "nudges_today": nudges_today,
+        "checkpoints_today": checkpoints_today,
         "sessions_today": sessions_today,
         "total_events": len(events),
         "usage_today": usage_stats([e for e in events if e.get("t", 0) >= today0]),
