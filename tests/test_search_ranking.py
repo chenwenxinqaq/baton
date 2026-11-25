@@ -172,5 +172,37 @@ class MatchStrengthTests(unittest.TestCase):
         self.assertEqual(report["axes"]["abstention"]["legacy"], {"pass": 0.5, "cases": 2})
 
 
+class ProcedurePhraseTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = _store(Path(tmp.name), "personal")
+        _write(self.store, "L1", "packaging", "桌面版打包步骤", "生成安装包", "先构建应用。")
+
+    def test_title_variant_recovers_missing_phrase_without_claiming_exact_match(self):
+        _write(self.store, "L3", "questions", "会议记录", "未验证的想法", "有人问打包方法。")
+        for query in ("打包方法", "打包流程"):
+            with self.subTest(query=query):
+                hit = self.store.search(query, ranker="legacy")[0]
+                self.assertEqual(hit["ref"], "methods/packaging.md")
+                self.assertEqual(hit["match"], "fuzzy")
+                self.assertEqual(hit["matched_phrase"], "打包步骤")
+                self.assertNotIn("see_also", hit)
+        literal = self.store.search("打包步骤", ranker="legacy")[0]
+        self.assertEqual(literal["match"], "full")
+        self.assertNotIn("matched_phrase", literal)
+
+    def test_literal_title_beats_variant(self):
+        _write(self.store, "L1", "packaging-flow", "打包流程", "新版规范", "后台签名。")
+        hits = self.store.search("打包流程", ranker="legacy")
+        self.assertEqual([h["ref"] for h in hits], ["methods/packaging-flow.md", "methods/packaging.md"])
+
+    def test_variants_require_the_same_topic_in_the_title(self):
+        _write(self.store, "L3", "notes", "工作记录", "没有结论", "提到备份步骤。")
+        for query in ("备份流程", "打包部署流程", "方法"):
+            with self.subTest(query=query):
+                self.assertFalse(any("matched_phrase" in h for h in self.store.search(query)))
+
+
 if __name__ == "__main__":
     unittest.main()

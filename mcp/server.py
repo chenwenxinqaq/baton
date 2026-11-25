@@ -70,6 +70,7 @@ CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 # compounds are listed: 地/得/在/对/过 are excluded because 地址, 得到, 在线,
 # 对齐, 过期 are real terms in these libraries.
 CJK_PARTICLE_RE = re.compile(r"[的吗呢吧嘛呀啦啊哦哈]+")
+PROCEDURE_SUFFIXES = ("步骤", "方法", "流程")
 ALNUM_RUN_RE = re.compile(r"[a-z0-9_.-]{2,}")
 WORD_RUN_RE = re.compile(r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?")
 WORD_PART_RE = re.compile(r"[a-z0-9]+")
@@ -400,6 +401,16 @@ def build_query_features(query):
     return raw_terms, subtokens
 
 
+def procedure_phrase_variants(query):
+    """Keep the intact topic of a standalone Chinese procedure phrase."""
+    if len(query) < 4 or not CJK_RUN_RE.fullmatch(query):
+        return ()
+    topic, suffix = query[:-2], query[-2:]
+    if suffix not in PROCEDURE_SUFFIXES:
+        return ()
+    return tuple(topic + other for other in PROCEDURE_SUFFIXES if other != suffix)
+
+
 def search_ranker(ranker=None):
     """Return the ranker name to use; unknown values fall back to the default."""
     chosen = (ranker or os.environ.get("UNIFIED_MEMORY_SEARCH_RANKER") or SEARCH_RANKERS[0]).strip().lower()
@@ -516,9 +527,10 @@ def match_strength(raw_terms, matched):
 
     "full" means every query word appears in the entry. "partial" means only
     some do. "fuzzy" means no whole word matched and the hit came from CJK
-    bigrams or alphanumeric fragments. LongMemEval (arXiv 2410.10813) scores
-    abstention: when memory lacks the answer, the agent should say so instead
-    of using the closest entry. Weak matches are the signal for that.
+    bigrams, alphanumeric fragments, or a related phrase. LongMemEval
+    (arXiv 2410.10813) scores abstention: when memory lacks the answer, the
+    agent should say so instead of using the closest entry. Weak matches are
+    the signal for that.
     """
     terms = set(raw_terms)
     whole = terms & set(matched)
@@ -907,7 +919,8 @@ class MemoryStore:
     def search(self, query, layer="", include_archived=False, limit=10, ranker=None):
         """Search entries by query terms, CJK bigrams, and temporal recency cues.
 
-        ``score_fields`` decides which entries match. ``ranker`` decides their
+        ``score_fields`` decides literal and fragment matches; a related
+        procedure title can supply a weak fallback. ``ranker`` decides result
         order: "legacy" (default, fixed field points), "hybrid" (field points
         plus weighted BM25F), or "bm25f"; overridable with
         UNIFIED_MEMORY_SEARCH_RANKER.
@@ -955,6 +968,7 @@ class MemoryStore:
 
         effective_q = residual_query if (has_temporal_cue and residual_query) else q_stripped
         raw_terms, subtokens = build_query_features(effective_q)
+        procedure_variants = procedure_phrase_variants(effective_q)
         now_ep = datetime.now().astimezone().timestamp()
 
         bm25 = []
@@ -974,16 +988,24 @@ class MemoryStore:
 
         results = []
         for pos, item in enumerate(all_items):
+            title_cf = item["title"].casefold()
             score, matched = score_fields(
                 raw_terms,
                 subtokens,
                 item["name"].casefold(),
-                item["title"].casefold(),
+                title_cf,
                 item["description"].casefold(),
                 item["body"].casefold(),
             )
+            matched_phrase = ""
             if score == 0:
-                continue
+                # A complete variant in a title provides better evidence than
+                # scattered bigrams, but is weaker than a literal title hit.
+                # Do not accept a variant from a passing mention in the body.
+                matched_phrase = next((v for v in procedure_variants if v in title_cf), "")
+                if not matched_phrase:
+                    continue
+                score, matched = 4, [matched_phrase]
             legacy_score = score
             if bm25:
                 # Substring-only matches (e.g. "dock") have no BM25 term hit; keep them last.
@@ -1010,6 +1032,7 @@ class MemoryStore:
                 {
                     "score": score,
                     "match": match_strength(raw_terms, matched),
+                    **({"matched_phrase": matched_phrase} if matched_phrase else {}),
                     **self._result_metadata(),
                     "ref": self._entry_ref(item["path"]),
                     "path": item["path"],
@@ -1948,7 +1971,7 @@ TOOLS = [
     },
     {
         "name": "memory_search",
-        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly. Each hit has match=full (every space-separated query word found), partial (some words) or fuzzy (only fragments). Check the snippet before relying on partial or fuzzy hits, and say memory has no answer when none fits instead of using the closest entry. The best hit may carry see_also: entries it cites that this search did not return; read one when the answer needs the cited detail.",
+        "description": "Search the personal library by default; pass library='*' or 'all' to search personal plus mounted shared libraries, or pass a mount id explicitly. Each hit has match=full (every space-separated query word found), partial (some words) or fuzzy (fragments or a title variant shown as matched_phrase). Check the snippet before relying on partial or fuzzy hits, and say memory has no answer when none fits instead of using the closest entry. The best hit may carry see_also: entries it cites that this search did not return; read one when the answer needs the cited detail.",
         "inputSchema": {
             "type": "object",
             "properties": {

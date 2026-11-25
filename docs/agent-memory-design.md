@@ -83,8 +83,18 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   closest entry. A ranked list always has a top hit, so the agent needs a cue
   for how much of the query that hit covers. `scripts/search_eval.py` scores
   abstention cases (empty `relevant`) as passing when no hit is `full`; 8 such
-  queries on the real library all pass. Unspaced Chinese queries are a single
-  word, so they only ever match `fuzzy`.
+  queries on the real library all pass. An unspaced Chinese query is one term:
+  it gets `full` only if the whole phrase was found.
+- **Scoped procedure phrase recall** (`procedure_phrase_variants` and
+  `matched_phrase`). For a standalone Chinese phrase ending in 步骤/方法/流程,
+  search can also match the same intact topic with one of the other endings,
+  but only in an entry's title. It keeps this fallback `fuzzy` and shows the
+  exact title phrase it matched. On the local personal and shared libraries,
+  the default ranker now finds the intended procedure first for four labelled
+  variants (打包方法 / 打包流程 / 排查方法 / 排查流程), up from zero in the top 10.
+  All 53 existing labelled cases have unchanged relevant ranks or abstention
+  verdicts across the three rankers. This does not conflate different topics
+  such as 打包 and 构建.
 - **Usage metrics** (`scripts/audit_log.py` `usage_stats`, `memoryctl usage`).
   Nothing in the literature; it came from the user's question of whether the
   memory saves tokens or just injects noise. It measures returned tokens, how
@@ -98,8 +108,8 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   vague queries hybrid demoted the right entry (IDF promotes an entry that only
   shares one rare term; length normalization favours very short entries). Kept
   as opt-in via `UNIFIED_MEMORY_SEARCH_RANKER`; see
-  `mcp/server.py` `SEARCH_RANKERS` and `scripts/search_eval.py`. The remaining
-  recall gap is synonyms, which needs embeddings plus fusion, not weight tuning.
+  `mcp/server.py` `SEARCH_RANKERS` and `scripts/search_eval.py`. Broader semantic
+  recall, beyond the scoped procedure variants above, remains open.
 - **A raw/ ingest layer and a knowledge graph.** Both the LLM-wiki pattern and
   HippoRAG assume a corpus being ingested. Our libraries are written by agents a
   few entries at a time, so the raw layer would be empty and the graph would
