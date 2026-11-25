@@ -63,6 +63,13 @@ INDEX_LINK_RE = re.compile(
     r"^\s*[-*+]\s+\[(.+?)\]\((?:<([^>]+)>|([^\s()]+))\)(?:\s+[—–-]\s+(.+))?$"
 )
 CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+# Chinese has no spaces, so queries are matched by overlapping bigrams. These
+# function particles carry no topic, and bigrams that straddle one (的打 in
+# 桌面版的打包) match unrelated entries while pushing up the number of bigrams a
+# real match has to reach. Only particles that do not appear inside technical
+# compounds are listed: 地/得/在/对/过 are excluded because 地址, 得到, 在线,
+# 对齐, 过期 are real terms in these libraries.
+CJK_PARTICLE_RE = re.compile(r"[的吗呢吧嘛呀啦啊哦哈]+")
 ALNUM_RUN_RE = re.compile(r"[a-z0-9_.-]{2,}")
 WORD_RUN_RE = re.compile(r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?")
 WORD_PART_RE = re.compile(r"[a-z0-9]+")
@@ -362,6 +369,11 @@ def atomic_write(path, content):
             staged.unlink(missing_ok=True)
 
 
+def cjk_chunks(cjk_run):
+    """Split a Chinese run at function particles, keeping pieces of 2+ chars."""
+    return [part for part in CJK_PARTICLE_RE.split(cjk_run) if len(part) > 1]
+
+
 def build_query_features(query):
     """Extract whitespace terms plus CJK bigrams/subtokens for partial phrase recall."""
     q_cf = query.strip().casefold()
@@ -373,17 +385,18 @@ def build_query_features(query):
             if run not in seen:
                 seen.add(run)
                 subtokens.append(run)
-        for cjk in CJK_RUN_RE.findall(term):
-            if len(cjk) == 2:
-                if cjk not in seen:
-                    seen.add(cjk)
-                    subtokens.append(cjk)
-            else:
-                for idx in range(len(cjk) - 1):
-                    bg = cjk[idx : idx + 2]
-                    if bg not in seen:
-                        seen.add(bg)
-                        subtokens.append(bg)
+        for run in CJK_RUN_RE.findall(term):
+            for cjk in cjk_chunks(run):
+                if len(cjk) == 2:
+                    if cjk not in seen:
+                        seen.add(cjk)
+                        subtokens.append(cjk)
+                else:
+                    for idx in range(len(cjk) - 1):
+                        bg = cjk[idx : idx + 2]
+                        if bg not in seen:
+                            seen.add(bg)
+                            subtokens.append(bg)
     return raw_terms, subtokens
 
 
@@ -406,7 +419,8 @@ def search_tokens(text_cf):
             tokens.append(run)
         tokens.extend(part for part in parts if len(part) > 1)
     for run in CJK_RUN_RE.findall(text_cf):
-        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+        for chunk in cjk_chunks(run):
+            tokens.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
     return tokens
 
 

@@ -31,6 +31,22 @@ class SearchTokensTests(unittest.TestCase):
     def test_single_letter_parts_dropped(self):
         self.assertEqual(mcp_server.search_tokens("a b-c lb"), ["b-c", "lb"])
 
+    def test_particles_split_cjk_runs(self):
+        # 的 is a grammatical particle: 版的/的打 would match unrelated entries.
+        self.assertEqual(
+            mcp_server.cjk_chunks("桌面版的打包方法"), ["桌面版", "打包方法"]
+        )
+        self.assertNotIn("版的", mcp_server.search_tokens("桌面版的打包"))
+        self.assertEqual(
+            mcp_server.build_query_features("桌面版的打包方法")[1],
+            ["桌面", "面版", "打包", "包方", "方法"],
+        )
+
+    def test_particles_inside_real_terms_are_kept(self):
+        # 地址/了解 are real terms here, so 地 and 了 are not separators.
+        for term in ("地址编码", "了解打包"):
+            self.assertIn(term[:2], mcp_server.build_query_features(term)[1])
+
 
 class Bm25fScoresTests(unittest.TestCase):
     def test_title_match_beats_body_match(self):
