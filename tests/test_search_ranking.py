@@ -171,6 +171,36 @@ class MatchStrengthTests(unittest.TestCase):
         self.assertEqual(report["axes"]["update"]["legacy"]["hit@1"], 1.0)
         self.assertEqual(report["axes"]["abstention"]["legacy"], {"pass": 0.5, "cases": 2})
 
+    def test_one_hop_credits_only_new_distinct_required_sources(self):
+        class Results:
+            def search(self, query, **kwargs):
+                if query == "empty":
+                    return []
+                return [{"ref": "a", "see_also": [{"ref": r} for r in ("a", "b", "b", "unused")]},
+                        {"ref": "other:b"}]
+
+        cases = search_eval.load_cases_from_rows([
+            {"query": "pair", "axis": "evidence", "relevant": ["a", "b"]},
+            {"query": "empty", "axis": "evidence", "relevant": ["a", "other:b"]},
+            ["alternatives", ["a", "b"]],
+        ])
+        report = search_eval.evaluate(Results(), cases, rankers=("legacy",))
+        summary = report["one_hop"]["legacy"]
+        self.assertEqual(summary["evidence"], {"cases": 2, "required": 4, "direct": 1, "gained": 1,
+                                               "complete_direct": 0, "complete_with_links": 1})
+        self.assertEqual(summary["extra_refs"], 4)
+        self.assertEqual(summary["cases_with_links"], 2)
+        self.assertGreater(summary["extra_tokens_est"], 0)
+        self.assertEqual(report["details"][1]["one_hop"]["legacy"]["extra_tokens_est"], 0)
+        self.assertNotIn("required", report["details"][2]["one_hop"]["legacy"])
+        # see_also pointers are not themselves ranked hits.
+        self.assertEqual(report["details"][0]["ranks"]["legacy"], 1)
+
+    def test_evidence_axis_validates_required_sources(self):
+        for refs in ([], ["a"], ["a", "a"], "ab", ["a", 3]):
+            with self.subTest(refs=refs), self.assertRaisesRegex(ValueError, "distinct required refs"):
+                search_eval.load_cases_from_rows([{"query": "q", "axis": "evidence", "relevant": refs}])
+
     def test_update_cases_report_current_over_stale_rank(self):
         cases = search_eval.load_cases_from_rows([{
             "query": "docker 缓存",

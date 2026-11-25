@@ -113,6 +113,31 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   in-place case: search and read show the new conclusion at the same ref,
   while history still exposes the replaced content.
 
+## Does following a citation repay its context cost?
+
+`python3 scripts/search_eval.py --memory-root <root> --cases <private.json> --limit 10`
+now reports `one_hop` per ranker. Use `{"query":"...", "axis":"evidence",
+"relevant":["methods/a.md", "projects/b.md"]}` when an answer needs **both**
+refs (ordinary `relevant` refs may be alternatives). We compare the *same*
+returned hits before and after including `see_also`; linked refs never get a
+rank. The cost is the estimated token difference between MCP search-result
+texts, not the cost of opening an entry, model billing, or a correctness score.
+
+On six local two-source questions, labelled before replay (12 required refs):
+
+| Direct limit, default ranker | Required refs: direct → with links | Questions with both refs | Extra search tokens, all six |
+| --- | --- | --- | --- |
+| 1 | 4 → 6 | 0 → 1 | 148 |
+| 3 | 7 → 8 | 2 → 3 | 116 |
+| 10 | 8 → 9 | 3 → 4 | 116 |
+
+At limit 10 only two searches actually returned hints. The 61 existing
+single-answer/alternative/abstention cases cost 795 extra estimated tokens
+across 11 searches with hints; their labels do **not** establish whether those
+hints are useful. This small, purpose-built set supports keeping optional
+one-hop hints, not expanding roots or hop count by default. If a compound
+question is still missing a source, search its missing subject explicitly.
+
 ## What we tried and rejected
 
 - **BM25F / hybrid ranking as the default.** Implemented and measured against a
@@ -130,8 +155,6 @@ inject into it small, which is why reads are progressive and §0 is tiny.
 
 ## Open ideas from the reading list
 
-- Recall-oriented eval. `see_also` adds entries no hit@k metric rewards, so its
-  value is still judged by hand on sample queries, not measured.
 - Broader knowledge-update evaluation: these cases check retrieval order and
   in-place replacement, not whether an agent recognizes and applies a new
   fact on its own or answers historical questions correctly.

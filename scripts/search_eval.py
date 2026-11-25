@@ -23,6 +23,11 @@ confident-looking wrong entry. Update cases may include a ``stale`` list of
 refs; their freshness score passes only when a current relevant ref is
 returned and precedes every stale ref in the top-k. This measures retrieval,
 not whether an agent answers correctly or updates the content at a stable ref.
+
+With axis="evidence", all labelled refs are needed (not alternatives). The
+one_hop comparison counts how many are reachable directly and with the actual
+see_also pointers on the returned hits. For every axis it also measures the
+extra search-result tokens, excluding any subsequent reads.
 """
 
 import argparse
@@ -86,6 +91,10 @@ def load_cases_from_rows(raw, library="*"):
             raise ValueError(f"Case {i}: stale must be a list of entry refs.")
         if stale and (axis != "update" or not relevant or set(stale).intersection(relevant)):
             raise ValueError(f"Case {i}: stale refs require an update case and must be distinct from relevant refs.")
+        if axis == "evidence" and (not isinstance(relevant, list) or
+                                   not all(isinstance(r, str) and r.strip() for r in relevant) or
+                                   len(set(relevant)) < 2):
+            raise ValueError(f"Case {i}: evidence requires at least two distinct required refs.")
         if not query or (not relevant and axis != "abstention"):
             continue
         case = {
@@ -100,6 +109,37 @@ def load_cases_from_rows(raw, library="*"):
     return cases
 
 
+def _one_hop(hits, required):
+    direct = {hit["ref"] for hit in hits if hit.get("ref")}
+    linked = {link["ref"] for hit in hits for link in hit.get("see_also", []) if link.get("ref")} - direct
+    overhead = 0
+    if any("see_also" in hit for hit in hits):
+        # Keep the same JSON formatting and estimator as the MCP text payload.
+        without = [{k: v for k, v in hit.items() if k != "see_also"} for hit in hits]
+        def tokens(data):
+            return audit_log.estimate_tokens(json.dumps(data, ensure_ascii=False, indent=2))
+        overhead = tokens(hits) - tokens(without)
+    result = {"extra_refs": len(linked), "extra_tokens_est": overhead}
+    if required:
+        result.update(required=len(required), direct=len(required & direct), gained=len(required & linked))
+    return result
+
+
+def _hop_summary(rows):
+    out = {"cases": len(rows), "cases_with_links": sum(r["extra_refs"] > 0 for r in rows),
+           "extra_refs": sum(r["extra_refs"] for r in rows),
+           "extra_tokens_est": sum(r["extra_tokens_est"] for r in rows)}
+    labelled = [r for r in rows if "required" in r]
+    if labelled:
+        out["evidence"] = {
+            "cases": len(labelled), "required": sum(r["required"] for r in labelled),
+            "direct": sum(r["direct"] for r in labelled), "gained": sum(r["gained"] for r in labelled),
+            "complete_direct": sum(r["direct"] == r["required"] for r in labelled),
+            "complete_with_links": sum(r["direct"] + r["gained"] == r["required"] for r in labelled),
+        }
+    return out
+
+
 def evaluate(store, cases, rankers=RANKERS, limit=10):
     """Rerun each case with every ranker; return per-ranker metrics and per-case ranks."""
     report = {"cases": len(cases), "skipped": 0, "rankers": {}, "details": []}
@@ -108,9 +148,12 @@ def evaluate(store, cases, rankers=RANKERS, limit=10):
     for case in cases:
         ranks = {}
         stale_ranks = {}
+        hops = {}
+        required = set(case["relevant"]) if case.get("axis") == "evidence" else set()
         try:
             for ranker in rankers:
                 hits = store.search(case["query"], limit=limit, library=case["library"], ranker=ranker)
+                hops[ranker] = _one_hop(hits, required)
                 if not case["relevant"]:
                     # Abstention: pass when nothing looks like a confident answer.
                     ranks[ranker] = not any(h.get("match") == "full" for h in hits)
@@ -126,7 +169,7 @@ def evaluate(store, cases, rankers=RANKERS, limit=10):
         except ValueError:
             report["skipped"] += 1
             continue
-        detail = {**case, "ranks": ranks}
+        detail = {**case, "ranks": ranks, "one_hop": hops}
         if stale_ranks:
             detail["stale_ranks"] = stale_ranks
         (usable if case["relevant"] else abstain).append(detail)
@@ -136,6 +179,7 @@ def evaluate(store, cases, rankers=RANKERS, limit=10):
         if abstain:
             report["rankers"][ranker]["abstention"] = round(
                 sum(1 for c in abstain if c["ranks"][ranker]) / len(abstain), 3)
+    report["one_hop"] = {r: _hop_summary([c["one_hop"][r] for c in report["details"]]) for r in rankers}
     axes = sorted({c.get("axis", "extraction") for c in usable})
     update_cases = [c for c in usable if c.get("stale_ranks")]
     if len(axes) > 1 or abstain or "update" in axes:
