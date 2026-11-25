@@ -526,6 +526,29 @@ class Library:
         dest = self.trash_dir / f"{stamp}-{safe_slug}-{secrets.token_hex(2)}.md"
         shutil.copy2(src_path, dest)
 
+    def topic_versions(self, slug, limit=8):
+        """List saved previous versions of one entry.
+
+        The MCP server and this UI share one trash directory per library
+        (``library_state_dir``), so both see every backup the other made.
+        """
+        if not mcp_server.NAME_RE.fullmatch(slug or ""):
+            return []
+        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
+        try:
+            return store.entry_history(slug, limit=limit).get("versions", [])
+        except (ValueError, OSError):
+            return []
+
+    def restore_version(self, version):
+        """Put a saved version back as the current entry; returns its path."""
+        if self.is_readonly:
+            raise InvalidEntry("该库为只读挂载，无法恢复历史版本。")
+        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
+        # restore_entry takes the shared write lock itself, so do not wrap it.
+        result = store.restore_entry(version)
+        return result.get("path", "")
+
     def read_markdown(self, path, resource_roots=()):
         resolved = path.resolve(strict=True)
         allowed = resolved.is_relative_to(self.root) or any(resolved.is_relative_to(r) for r in resource_roots)
@@ -1396,6 +1419,43 @@ def render_card_time_html(created_at, updated_at, sort_by, now_dt):
         f'<time class="{cls}" datetime="{escape(iso_attr)}" '
         f'data-ts="{escape(iso_attr)}" data-mode="{mode}">{escape(rel_txt)}{suffix}</time>'
     )
+
+
+VERSION_REASONS = {"update": "编辑前备份", "layer-change": "换层前备份", "archive": "归档前备份"}
+
+
+def render_topic_versions_html(token, library_key, slug, versions, readonly):
+    """List previous versions of one entry, with a restore button per version.
+
+    The agent tools memory_history / memory_restore read the same backups, so
+    people and agents recover an entry the same way.
+    """
+    if not versions:
+        return ""
+    rows = []
+    for row in versions:
+        saved = str(row.get("saved_at") or "").replace("T", " ")
+        reason = VERSION_REASONS.get(row.get("reason"), "备份")
+        chars = row.get("chars") or 0
+        action = ""
+        if not readonly:
+            action = f"""
+              <form method="post" action="/restore_version#feedback" aria-label="恢复 {escape(saved)} 的版本">
+                {hidden("csrf", token)}{hidden("library", library_key)}
+                {hidden("version", str(row.get("version") or ""))}{hidden("slug", slug)}
+                <button class="btn btn-ghost btn-compact" type="submit">恢复此版本</button>
+              </form>"""
+        rows.append(
+            f'<li><span class="version-when">{escape(saved)}</span>'
+            f'<span class="meta-chip">{escape(reason)}</span>'
+            f'<span class="version-size">{chars} 字</span>{action}</li>'
+        )
+    return f"""
+      <section class="detail-block" aria-labelledby="versions-title">
+        <h2 class="block-title" id="versions-title">历史版本</h2>
+        <p class="block-hint">每次编辑、换层或归档前都会在本机备份一份。恢复会先备份当前版本，因此两个方向都不会丢内容。</p>
+        <ul class="version-list">{"".join(rows)}</ul>
+      </section>"""
 
 
 def render_detail_timestamps_html(path_str, created_at, updated_at, now_dt, status_note=""):
@@ -3419,7 +3479,10 @@ def render(
                     skip_h1=t_entry.title,
                 )
             )
-            reader = summary_html + body_html
+            slug = Path(t_entry.path).stem
+            reader = summary_html + body_html + render_topic_versions_html(
+                token, key, slug, library.topic_versions(slug), library.is_readonly
+            )
         except (ValueError, OSError) as exc:
             heading = "无法读取条目"
             error = error or topic_read_error(
@@ -3672,6 +3735,7 @@ class Handler(BaseHTTPRequestHandler):
             "deleted": "记忆条目已移除（已在本机回收站保留安全备份）。",
             "archived": "手记已归档。",
             "restored": "手记已恢复生效。",
+            "version_restored": "历史版本已恢复为当前内容（原内容已另存为新备份）。",
             "connected": "客户端配置已保存，可在读写动态查看实际调用。",
             "workbuddy_connected": "WorkBuddy 配置已保存。如果当前会话还看不到记忆工具，请重新打开 WorkBuddy 会话。",
             "deepseek_connected": "DeepSeek Harness 配置已保存。重启 Harness 后，在新会话中试用 Unified Memory。",
@@ -3737,6 +3801,7 @@ class Handler(BaseHTTPRequestHandler):
             "/mount_update",
             "/mount_remove",
             "/resolve_conflict",
+            "/restore_version",
             "/share_topic",
             "/memory_import",
         }
@@ -3793,6 +3858,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/archive_topic":
             self.handle_archive_topic(fields)
+            return
+        if self.path == "/restore_version":
+            self.handle_restore_version(fields)
             return
         if self.path == "/delete":
             self.handle_delete(fields)
@@ -4305,6 +4373,38 @@ class Handler(BaseHTTPRequestHandler):
             return
         loc = query(library=key, topic=new_rel, notice="topic_archived")
         self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def handle_restore_version(self, fields):
+        """Put one saved version back as the current entry."""
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.server.libraries[key]
+        slug = fields.get("slug", "")
+        topic_path = ""
+        try:
+            topic_path = library.restore_version(fields.get("version", ""))
+        except (InvalidEntry, ValueError, OSError) as exc:
+            self.page(
+                HTTPStatus.BAD_REQUEST,
+                key=key,
+                topic_path=self._slug_topic_path(library, slug),
+                error=f"恢复失败：{exc}",
+            )
+            return
+        loc = query(library=key, topic=topic_path, notice="version_restored")
+        self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    @staticmethod
+    def _slug_topic_path(library, slug):
+        """Best-effort current path of an entry slug, for error redirects."""
+        if not mcp_server.NAME_RE.fullmatch(slug or ""):
+            return ""
+        for folder in mcp_server.LAYER_DIRS.values():
+            if (library.root / folder / f"{slug}.md").is_file():
+                return f"{folder}/{slug}.md"
+        return ""
 
     def handle_delete(self, fields):
         key = fields.get("library", "primary")
