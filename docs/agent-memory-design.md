@@ -65,6 +65,15 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   84 of 143 entries carry at least one citation (175 edges), and a query like
   "docker inspect 卡死" gains the generic hang-diagnosis procedure that shares no
   query term.
+- **Particle-aware Chinese queries** (`mcp/server.py` `cjk_chunks`). Chinese
+  queries are matched by overlapping bigrams, so 桌面版的打包方法 used to emit
+  版的 and 的打 — bigrams that carry no topic, match unrelated entries, and raise
+  the number of bigrams a genuine match must reach (`score_fields` needs half of
+  them). Query runs are now split at 的吗呢吧嘛呀啦啊哦哈 only; 地/得/在/对/过 stay
+  because 地址, 得到, 在线, 对齐, 过期 are real terms in these libraries. On the
+  real libraries "最新的共享库同步问题" went from ranking an unrelated archive entry
+  first to ranking `projects/unified-memory-shared-architecture.md` first, and the
+  48-case labelled set is unchanged (legacy hit@1 0.975, MRR 0.981).
 - **Match strength** (`match` = `full` / `partial` / `fuzzy` / `recent` on each
   search hit, `mcp/server.py` `match_strength`). LongMemEval (2410.10813) scores
   abstention: an agent should say "not in memory" instead of answering from the
