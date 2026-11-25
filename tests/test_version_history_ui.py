@@ -299,6 +299,64 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertIn('class="desk-sources"', html_out)
         self.assertNotIn("<details", html_out)
 
+    def test_markdown_toc_code_copy_expired_badge_and_live_preview(self):
+        import types
+        import manager as manager_mod
+
+        md = (
+            "## 背景\n\n说明。\n\n"
+            "## 构建命令\n\n```bash\necho hello\n```\n\n"
+            "## 验证清单\n\n- 全部通过\n"
+        )
+        rendered = manager_mod.render_markdown_html(
+            md,
+            "methods/demo.md",
+            self.root,
+            {},
+            {"library": "primary"},
+        )
+        self.assertIn('class="doc-toc"', rendered)
+        self.assertIn('href="#sec-1"', rendered)
+        self.assertIn('id="sec-2"', rendered)
+        self.assertIn('class="code-wrap"', rendered)
+        self.assertIn('class="code-lang">bash</span>', rendered)
+        self.assertIn("data-copy-code", rendered)
+
+        self.store.upsert_entry(
+            "L3",
+            "expiring-card",
+            "即将过期的卡片",
+            "测试列表过期标记",
+            "正文内容。",
+            verified_at="2020-01-01",
+            valid_until="2020-01-02",
+        )
+        lib = manager_mod.Library(self.root, "个人库")
+        topic = lib.read_topic("projects/expiring-card.md")
+        card_html = manager_mod.entry_link(topic, "/?topic=projects/expiring-card.md", False, False)
+        self.assertIn("entry-tag-expired", card_html)
+        self.assertIn("已过期", card_html)
+
+        captured = {}
+        handler = manager_mod.Handler.__new__(manager_mod.Handler)
+        handler.server = types.SimpleNamespace(libraries={"primary": lib})
+        handler.respond_json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        fake_tok = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        handler.handle_preview_markdown(
+            {
+                "library": "primary",
+                "title": "预览草稿",
+                "description": "说明",
+                "body": f"## 小节\n\ntoken={fake_tok}\n",
+            }
+        )
+        self.assertEqual(captured["status"], 200)
+        self.assertIn("<h2", captured["payload"]["html"])
+        self.assertGreater(captured["payload"]["chars"], 0)
+        self.assertGreater(captured["payload"]["tokens"], 0)
+        self.assertIn("明文凭据", captured["payload"]["secret_warning"])
+
 
 if __name__ == "__main__":
     unittest.main()

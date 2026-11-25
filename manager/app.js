@@ -317,6 +317,125 @@
     });
   }
 
+  document.addEventListener("click", async (event) => {
+    const btn = event.target && event.target.closest ? event.target.closest("[data-copy-code]") : null;
+    if (!btn) return;
+    const wrap = btn.closest(".code-wrap");
+    const code = wrap && wrap.querySelector("pre code");
+    if (!code) return;
+    const orig = btn.dataset.origLabel || btn.textContent;
+    btn.dataset.origLabel = orig;
+    try {
+      await copyText(code.textContent ?? "");
+      btn.textContent = "已复制";
+    } catch {
+      btn.textContent = "复制失败";
+    }
+    window.setTimeout(() => {
+      btn.textContent = orig;
+    }, 1500);
+  });
+
+  // Live Markdown preview, char/token counter, and pre-save secret warning in the editor.
+  const editorBody = document.getElementById("body");
+  const editorPreview = document.getElementById("editor-preview");
+  const editorMetrics = document.getElementById("editor-metrics");
+  const editorSecretAlert = document.getElementById("editor-secret-alert");
+  const editorTabs = Array.from(document.querySelectorAll("[data-editor-tab]"));
+  if (editorBody && editorPreview && editorTabs.length) {
+    const form = editorBody.closest("form");
+    let previewSeq = 0;
+    let editorMode = "write";
+
+    function estimateLocalTokens(text) {
+      if (!text) return 0;
+      let ascii = 0;
+      for (let i = 0; i < text.length; i += 1) {
+        if (text.charCodeAt(i) < 128) ascii += 1;
+      }
+      const nonAscii = text.length - ascii;
+      return Math.max(1, Math.round(ascii / 4 + nonAscii / 1.5));
+    }
+
+    function updateEditorMetrics(chars, tokens) {
+      if (!editorMetrics) return;
+      const c = typeof chars === "number" ? chars : editorBody.value.length;
+      const t = typeof tokens === "number" ? tokens : estimateLocalTokens(editorBody.value);
+      editorMetrics.textContent = `${c} 字 · 约 ${t} tokens`;
+      editorMetrics.classList.toggle("is-long", c > 6000);
+    }
+
+    async function fetchPreview() {
+      if (!form) return;
+      const seq = ++previewSeq;
+      const data = new URLSearchParams();
+      const csrfInput = form.querySelector('input[name="csrf"]');
+      if (csrfInput) data.set("csrf", csrfInput.value);
+      const libInput = form.querySelector('input[name="library"]');
+      if (libInput) data.set("library", libInput.value);
+      const origTopic = form.querySelector('input[name="orig_topic"]');
+      if (origTopic) data.set("orig_topic", origTopic.value);
+      const titleInput = form.querySelector('input[name="title"]');
+      if (titleInput) data.set("title", titleInput.value);
+      const descInput = form.querySelector('input[name="description"]');
+      if (descInput) data.set("description", descInput.value);
+      data.set("body", editorBody.value);
+
+      editorPreview.textContent = "正在渲染预览…";
+      try {
+        const res = await fetch("/preview_markdown", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+          body: data.toString(),
+          credentials: "same-origin",
+        });
+        if (seq !== previewSeq) return;
+        if (!res.ok) {
+          editorPreview.textContent = "预览渲染失败，请回到编辑模式继续。";
+          return;
+        }
+        const payload = await res.json();
+        if (seq !== previewSeq) return;
+        editorPreview.innerHTML = payload.html || "";
+        updateEditorMetrics(payload.chars, payload.tokens);
+        if (editorSecretAlert) {
+          if (payload.secret_warning) {
+            editorSecretAlert.textContent = payload.secret_warning;
+            editorSecretAlert.hidden = false;
+          } else {
+            editorSecretAlert.textContent = "";
+            editorSecretAlert.hidden = true;
+          }
+        }
+      } catch {
+        if (seq === previewSeq) {
+          editorPreview.textContent = "预览请求失败，请回到编辑模式继续。";
+        }
+      }
+    }
+
+    function setEditorMode(mode) {
+      editorMode = mode === "preview" ? "preview" : "write";
+      for (const tab of editorTabs) {
+        tab.setAttribute("aria-selected", tab.dataset.editorTab === editorMode ? "true" : "false");
+      }
+      const showPreview = editorMode === "preview";
+      editorBody.hidden = showPreview;
+      editorPreview.hidden = !showPreview;
+      if (showPreview) {
+        fetchPreview();
+      } else {
+        editorBody.focus();
+      }
+    }
+
+    for (const tab of editorTabs) {
+      tab.addEventListener("click", () => setEditorMode(tab.dataset.editorTab));
+    }
+    editorBody.addEventListener("input", () => updateEditorMetrics());
+    updateEditorMetrics();
+  }
+
   // Quick command palette (Cmd/Ctrl+K) across all mounted libraries + quick actions.
   let paletteDialog = null;
   let paletteInput = null;

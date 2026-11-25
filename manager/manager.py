@@ -1268,10 +1268,21 @@ def render_memory_editor_html(
             </div>
           </div>
           <div class="field">
-            <label for="body">正文（Markdown） <span class="required">必填</span></label>
+            <div class="editor-field-head">
+              <label for="body">正文（Markdown） <span class="required">必填</span></label>
+              <div class="editor-tools">
+                <span id="editor-metrics" class="editor-metrics" aria-live="polite"></span>
+                <div class="editor-tabs" role="tablist" aria-label="编辑器视图">
+                  <button type="button" class="editor-tab" role="tab" aria-selected="true" data-editor-tab="write">编辑</button>
+                  <button type="button" class="editor-tab" role="tab" aria-selected="false" data-editor-tab="preview">预览</button>
+                </div>
+              </div>
+            </div>
+            <div id="editor-secret-alert" class="editor-secret-alert" role="alert" hidden></div>
             <textarea class="auto-grow-textarea" id="body" name="body" rows="18" maxlength="{MAX_BODY_CHARS}"
                       aria-describedby="body-help"
                       placeholder="记录已验证结论、适用条件、证据路径与失效边界…" required>{escape(body)}</textarea>
+            <div id="editor-preview" class="editor-preview" hidden></div>
             <span id="body-help" class="field-hint">支持标准 Markdown 与库内相对链接；严禁写入明文密码、Cookie 或 Token。</span>
           </div>
           <div class="form-actions">
@@ -1408,12 +1419,13 @@ def split_table_row(line):
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_h1=""):
-    """Render safe structured HTML from Markdown (headings, lists, tables, code blocks)."""
+def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_h1="", include_toc=True):
+    """Render safe structured HTML from Markdown (headings, TOC, lists, tables, code blocks)."""
     _, body = mcp_server.parse_frontmatter(md_text)
     base_dir = Path(rel_doc_path).parent
     lines = body.splitlines()
     blocks = []
+    headings = []
     idx = 0
     skipped_first_h1 = False
 
@@ -1426,6 +1438,7 @@ def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_
             continue
 
         if stripped.startswith("```"):
+            fence_lang = stripped[3:].strip().split()[0][:24] if len(stripped) > 3 and stripped[3:].strip() else ""
             idx += 1
             code_lines = []
             while idx < len(lines) and not lines[idx].strip().startswith("```"):
@@ -1433,7 +1446,14 @@ def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_
                 idx += 1
             if idx < len(lines):
                 idx += 1
-            blocks.append(f'<pre class="code-block"><code>{escape(chr(10).join(code_lines))}</code></pre>')
+            lang_html = f'<span class="code-lang">{escape(fence_lang)}</span>' if fence_lang else '<span class="code-lang">code</span>'
+            blocks.append(
+                '<div class="code-wrap">'
+                f'<div class="code-bar">{lang_html}'
+                '<button type="button" class="code-copy" data-copy-code>复制</button></div>'
+                f'<pre class="code-block"><code>{escape(chr(10).join(code_lines))}</code></pre>'
+                "</div>"
+            )
             continue
 
         if stripped.startswith("#"):
@@ -1445,7 +1465,12 @@ def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_
                     idx += 1
                     continue
                 tag = f"h{min(max(hashes, 2), 4)}"
-                blocks.append(f"<{tag}>{format_inline_md(htext, base_dir, root, topics, link_params)}</{tag}>")
+                sec_id = f"sec-{len(headings) + 1}"
+                if tag in ("h2", "h3"):
+                    headings.append((tag, sec_id, htext))
+                    blocks.append(f'<{tag} id="{sec_id}">{format_inline_md(htext, base_dir, root, topics, link_params)}</{tag}>')
+                else:
+                    blocks.append(f"<{tag}>{format_inline_md(htext, base_dir, root, topics, link_params)}</{tag}>")
                 idx += 1
                 continue
 
@@ -1516,7 +1541,19 @@ def render_markdown_html(md_text, rel_doc_path, root, topics, link_params, skip_
             idx += 1
         blocks.append(f"<p>{format_inline_md(' '.join(para_lines), base_dir, root, topics, link_params)}</p>")
 
-    return f'<article class="prose">{"".join(blocks)}</article>'
+    toc_html = ""
+    if include_toc and len(headings) >= 3:
+        toc_items = "".join(
+            f'<a class="doc-toc-link doc-toc-{tag}" href="#{sec_id}">{escape(htext)}</a>'
+            for tag, sec_id, htext in headings[:18]
+        )
+        toc_html = (
+            '<nav class="doc-toc" aria-label="正文目录">'
+            '<span class="doc-toc-label">目录</span>'
+            f'<div class="doc-toc-links">{toc_items}</div>'
+            "</nav>"
+        )
+    return f'{toc_html}<article class="prose">{"".join(blocks)}</article>'
 
 
 def render_card_time_html(created_at, updated_at, sort_by, now_dt):
@@ -1649,6 +1686,12 @@ def entry_link(item, href, is_user, selected, sort_by="updated", now_dt=None):
     current = CUR_ATTR if selected else ""
     badge = f'<span class="layer-badge layer-{item.layer}">{item.layer}</span>'
     user_tag = '<span class="entry-tag-user">手记</span>' if is_user else ""
+    expired = (
+        bool(getattr(item, "valid_until", ""))
+        and item.layer != "L4"
+        and mcp_server.is_date_expired(item.valid_until, today=now_dt.date())
+    )
+    expired_tag = '<span class="entry-tag-expired">已过期</span>' if expired else ""
     time_html = render_card_time_html(item.created_at, item.updated_at, sort_by, now_dt)
     summary = f'<p class="entry-desc">{escape(item.description)}</p>' if item.description else ""
     return f"""
@@ -1657,6 +1700,7 @@ def entry_link(item, href, is_user, selected, sort_by="updated", now_dt=None):
           {badge}
           <strong class="entry-title">{escape(item.title)}</strong>
           {user_tag}
+          {expired_tag}
           {time_html}
         </div>
         {summary}
@@ -4130,6 +4174,7 @@ class Handler(BaseHTTPRequestHandler):
             "/save_index",
             "/archive_topic",
             "/verify_topic",
+            "/preview_markdown",
             "/delete",
             "/archive",
             "/restore",
@@ -4204,6 +4249,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/verify_topic":
             self.handle_verify_topic(fields)
+            return
+        if self.path == "/preview_markdown":
+            self.handle_preview_markdown(fields)
             return
         if self.path == "/restore_version":
             self.handle_restore_version(fields)
@@ -4836,6 +4884,48 @@ class Handler(BaseHTTPRequestHandler):
         else:
             loc = query(library=key, topic=new_rel, notice="topic_verified")
         self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
+
+    def handle_preview_markdown(self, fields):
+        """Render Markdown editor draft safely and flag suspected plaintext secrets before save."""
+        key = fields.get("library", "primary")
+        if key not in self.server.libraries:
+            key = "primary"
+        library = self.server.libraries[key]
+        body = fields.get("body", "")
+        title = fields.get("title", "").strip()
+        description = fields.get("description", "").strip()
+        try:
+            _, topics = library.read_index()
+        except (InvalidEntry, OSError):
+            topics = {}
+        html_out = (
+            render_markdown_html(
+                body,
+                fields.get("orig_topic", "") or "MEMORY.md",
+                library.root,
+                topics,
+                dict(library=key),
+                skip_h1=title,
+                include_toc=False,
+            )
+            if body.strip()
+            else '<p class="empty">正文为空，输入 Markdown 内容后即可实时预览。</p>'
+        )
+        findings = secret_guard.find_secrets(title, description, body)
+        secret_warning = (
+            f"检测到疑似明文凭据（{secret_guard.format_findings(findings)}），保存前请先脱敏或改写为凭据位置说明。"
+            if findings
+            else ""
+        )
+        self.respond_json(
+            HTTPStatus.OK,
+            {
+                "html": html_out,
+                "chars": len(body),
+                "tokens": audit_log.estimate_tokens(body),
+                "secret_warning": secret_warning,
+            },
+        )
 
     def handle_restore_version(self, fields):
         """Put one saved version back as the current entry."""
