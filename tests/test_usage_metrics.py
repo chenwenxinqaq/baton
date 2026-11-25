@@ -58,6 +58,36 @@ class UsageStatsTests(unittest.TestCase):
         self.assertEqual(stats["tokens_total"], 0)
         self.assertIsNone(stats["read_rate"])
 
+    def test_batch_memory_read_counts_all_read_refs(self):
+        events = [
+            self.ev(0, "memory_search", hits=3, refs=["a.md", "b.md", "c.md"], tokens=300, bytes=900),
+            self.ev(1, "memory_read", refs=["a.md", "c.md"], hits=2, tokens=400, bytes=1200),
+        ]
+        stats = audit_log.usage_stats(events)
+        self.assertEqual(stats["results_read"], 2)
+        self.assertEqual(stats["read_rate"], round(2 / 3, 3))
+        self.assertEqual(stats["read_ranks"], {"1": 1, "3": 1})
+        self.assertEqual(stats["searches_without_read"], 0)
+
+    def test_batch_memory_read_audit_event_records_refs_without_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "lib"
+            root.mkdir()
+            (root / "MEMORY.md").write_text("# Unified Memory\n\n## L0\n\n## L1\n\n## L2\n\n## L3\n\n## L4\n", encoding="utf-8")
+            for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
+                (root / folder).mkdir()
+            events = []
+            with mock.patch.object(mcp_server.audit_log, "record", side_effect=lambda event, **_: events.append(event) or True):
+                store = mcp_server.MemoryStore(root)
+                store.upsert_entry("L1", "one", "条目一", "摘要一", "机密正文一")
+                store.upsert_entry("L1", "two", "条目二", "摘要二", "机密正文二")
+                mcp_server.handle_tool_call(store, "memory_read", {"paths": ["methods/one.md", "methods/two.md"]})
+            read_ev = events[-1]
+            self.assertEqual(read_ev["tool"], "memory_read")
+            self.assertEqual(read_ev["refs"], ["methods/one.md", "methods/two.md"])
+            self.assertEqual(read_ev["hits"], 2)
+            self.assertNotIn("机密正文", json.dumps(events, ensure_ascii=False))
+
 
 class ToolCallAuditSizeTests(unittest.TestCase):
     def test_tool_call_records_size_of_returned_text(self):

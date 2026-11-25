@@ -142,3 +142,53 @@ class EntryLinkTests(unittest.TestCase):
         hits = self.store.search("索引 条目")
         self.assertEqual(hits[0]["path"], "projects/hub.md")
         self.assertEqual(len(hits[0]["see_also"]), mcp_server.SEE_ALSO_LIMIT)
+
+
+class BatchReadTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        self.store = _store(self.base, "personal")
+        self.store.upsert_entry("L1", "one", "条目一", "摘要一", "第一条正文。")
+        self.store.upsert_entry("L2", "two", "条目二", "摘要二", "第二条正文。")
+
+    def test_batch_read_dedupes_and_returns_partial_errors(self):
+        res = self.store.read_entries(["methods/one.md", "preferences/two.md", "methods/one.md", "methods/missing.md"])
+        self.assertEqual(res["count"], 2)
+        self.assertEqual([e["path"] for e in res["entries"]], ["methods/one.md", "preferences/two.md"])
+        self.assertEqual(len(res["errors"]), 1)
+        self.assertEqual(res["errors"][0]["path"], "methods/missing.md")
+
+    def test_batch_read_tool_dispatch_and_validation(self):
+        out, data = mcp_server._handle_tool_call(
+            self.store,
+            "memory_read",
+            {"paths": ["methods/one.md", "preferences/two.md"]},
+        )
+        self.assertEqual(data["count"], 2)
+        self.assertIn("第一条正文", out["content"][0]["text"])
+        self.assertIn("第二条正文", out["content"][0]["text"])
+
+        with self.assertRaisesRegex(ValueError, "not both"):
+            mcp_server._handle_tool_call(
+                self.store,
+                "memory_read",
+                {"path": "methods/one.md", "paths": ["preferences/two.md"]},
+            )
+        with self.assertRaisesRegex(ValueError, "requires 'path' or"):
+            mcp_server._handle_tool_call(self.store, "memory_read", {})
+        with self.assertRaisesRegex(ValueError, f"At most {mcp_server.MAX_BATCH_READ}"):
+            self.store.read_entries([f"methods/n{i}.md" for i in range(mcp_server.MAX_BATCH_READ + 1)])
+        with self.assertRaisesRegex(ValueError, "Not a readable markdown file"):
+            self.store.read_entries(["methods/missing-a.md", "methods/missing-b.md"])
+
+    def test_batch_read_supports_cross_library_workspace_refs(self):
+        shared = _store(self.base, "team")
+        shared.upsert_entry("L1", "guide", "团队指南", "共享指南", "团队规范内容。")
+        ws = mcp_server.WorkspaceStore(self.store.root)
+        ws._stores = {"personal": self.store, "team": shared}
+        ws._load_stores = lambda: None
+        res = ws.read_entries(["methods/one.md", "team:methods/guide.md"])
+        self.assertEqual(res["count"], 2)
+        self.assertEqual([e["ref"] for e in res["entries"]], ["methods/one.md", "team:methods/guide.md"])

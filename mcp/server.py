@@ -270,6 +270,7 @@ OUTLINE_MIN_CHARS = 1200
 ENTRY_LINK_RE = re.compile(r"\b(constraints|methods|preferences|projects|archive|user-managed)/([A-Za-z0-9][A-Za-z0-9._-]*)\.md\b")
 MAX_ENTRY_LINKS = 5
 SEE_ALSO_LIMIT = 3
+MAX_BATCH_READ = 10
 
 
 def heading_line(preamble):
@@ -1192,6 +1193,32 @@ class MemoryStore:
             result["backlinks"] = backlinks
         return result
 
+    def read_entries(self, rel_paths, section="", outline=False):
+        """Read up to MAX_BATCH_READ Markdown entries in a single call."""
+        if not isinstance(rel_paths, (list, tuple)):
+            raise ValueError("paths must be a list of relative markdown paths.")
+        cleaned = []
+        for raw in rel_paths:
+            text = str(raw or "").strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        if not cleaned:
+            raise ValueError("paths must contain at least one relative markdown path.")
+        if len(cleaned) > MAX_BATCH_READ:
+            raise ValueError(f"At most {MAX_BATCH_READ} paths can be read in one batch.")
+        entries, errors = [], []
+        for path in cleaned:
+            try:
+                entries.append(self.read_entry(path, section=section, outline=outline))
+            except ValueError as exc:
+                errors.append({"path": path, "error": str(exc)})
+        if not entries and errors:
+            raise ValueError(errors[0]["error"])
+        result = {"count": len(entries), "entries": entries}
+        if errors:
+            result["errors"] = errors
+        return result
+
     def entry_links(self, rel_posix, body, limit=MAX_ENTRY_LINKS):
         """Entries this one cites, and entries that cite it.
 
@@ -1942,6 +1969,32 @@ class WorkspaceStore:
         store = self._resolve_single_store(target_lib or "personal")
         return store.read_entry(effective_path, section=section, outline=outline)
 
+    def read_entries(self, rel_paths, library="", section="", outline=False):
+        """Read up to MAX_BATCH_READ Markdown entries across personal or mounted libraries."""
+        if not isinstance(rel_paths, (list, tuple)):
+            raise ValueError("paths must be a list of relative markdown paths.")
+        cleaned = []
+        for raw in rel_paths:
+            text = str(raw or "").strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        if not cleaned:
+            raise ValueError("paths must contain at least one relative markdown path.")
+        if len(cleaned) > MAX_BATCH_READ:
+            raise ValueError(f"At most {MAX_BATCH_READ} paths can be read in one batch.")
+        entries, errors = [], []
+        for path in cleaned:
+            try:
+                entries.append(self.read_entry(path, library=library, section=section, outline=outline))
+            except ValueError as exc:
+                errors.append({"path": path, "error": str(exc)})
+        if not entries and errors:
+            raise ValueError(errors[0]["error"])
+        result = {"count": len(entries), "entries": entries}
+        if errors:
+            result["errors"] = errors
+        return result
+
     def upsert_entry(self, layer, name, title, description, body, topic_type="", user_managed=False, library="personal",
                      expected_updated_at=""):
         store = self._resolve_single_store(library or "personal")
@@ -2028,16 +2081,20 @@ TOOLS = [
     },
     {
         "name": "memory_read",
-        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md'). Full reads of large entries also return a section outline; pass outline=true to get only that outline, or section='<title>' to read a single section instead of the whole file.",
+        "description": "Read one memory Markdown file via 'path' (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md'), or batch-read up to 10 files in one round-trip via 'paths'. Full reads of large entries also return a section outline; pass outline=true to get only that outline, or section='<title>' to read a single section instead of the whole file.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Relative path inside the memory library, optionally prefixed with '<library>:'."},
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": f"Batch read up to {MAX_BATCH_READ} relative paths (each optionally prefixed with '<library>:') in one call instead of 'path'.",
+                },
                 "library": {"type": "string", "default": "", "description": "Optional library id (defaults to 'personal' unless path has '<library>:' prefix)."},
                 "section": {"type": "string", "default": "", "description": "Read only this '## ' section (exact title, or a substring of it)."},
                 "outline": {"type": "boolean", "default": False, "description": "Return the section outline and the intro only, so you can pick one section to read."},
             },
-            "required": ["path"],
         },
     },
     {
@@ -2148,10 +2205,22 @@ def _audit_event(name, args, data, ok, ms, error="", result=None):
     elif name == "memory_list" and isinstance(data, list):
         ev["hits"] = len(data)
     elif isinstance(data, dict):
-        ev["ref"] = data.get("ref") or data.get("path") or data.get("to")
-        ev["library"] = data.get("library") or ev.get("library")
-        if name in ("memory_upsert", "memory_archive", "memory_restore"):
-            ev["action"] = data.get("status") or data.get("action")
+        if name == "memory_read" and isinstance(data.get("entries"), list):
+            refs = [
+                e.get("ref") or e.get("path")
+                for e in data["entries"]
+                if isinstance(e, dict) and (e.get("ref") or e.get("path"))
+            ]
+            ev["refs"] = refs[: audit_log.MAX_AUDIT_REFS]
+            ev["hits"] = len(refs)
+            libs = {e.get("library") for e in data["entries"] if isinstance(e, dict) and e.get("library")}
+            if len(libs) == 1:
+                ev["library"] = next(iter(libs))
+        else:
+            ev["ref"] = data.get("ref") or data.get("path") or data.get("to")
+            ev["library"] = data.get("library") or ev.get("library")
+            if name in ("memory_upsert", "memory_archive", "memory_restore"):
+                ev["action"] = data.get("status") or data.get("action")
     return ev
 
 
@@ -2217,7 +2286,16 @@ def _handle_tool_call(store, name, args):
         )
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "")
-        data = store.read_entry(args["path"], **kwargs)
+        has_path = bool(str(args.get("path") or "").strip())
+        has_paths = args.get("paths") is not None
+        if has_path and has_paths:
+            raise ValueError("Pass either 'path' or 'paths' to memory_read, not both.")
+        if has_paths:
+            data = store.read_entries(args["paths"], **kwargs)
+        elif has_path:
+            data = store.read_entry(args["path"], **kwargs)
+        else:
+            raise ValueError("memory_read requires 'path' or a non-empty 'paths' list.")
     elif name == "memory_upsert":
         kwargs = dict(
             layer=args["layer"],

@@ -247,8 +247,16 @@ def search_reads(events):
                 continue
             if later.get("t", 0) - e.get("t", 0) > FOLLOW_WINDOW_SECONDS or later.get("tool") == "memory_search":
                 break
-            if later.get("tool") == "memory_read" and later.get("ref") and later["ref"] not in read:
-                read.append(later["ref"])
+            if later.get("tool") == "memory_read":
+                later_refs = []
+                if later.get("ref"):
+                    later_refs.append(later["ref"])
+                for ref in later.get("refs") or []:
+                    if ref and ref not in later_refs:
+                        later_refs.append(ref)
+                for ref in later_refs:
+                    if ref not in read:
+                        read.append(ref)
         yield e, read
 
 
@@ -345,9 +353,15 @@ def summarize(now=None, home=None, days=7):
     for e in tool_events:
         if e.get("ok") is False:
             continue
-        if e.get("tool") == "memory_read" and e.get("ref"):
-            ref = e["ref"]
-            hit_counter[(_ref_library(e, ref), ref)] += 2
+        if e.get("tool") == "memory_read":
+            read_refs = []
+            if e.get("ref"):
+                read_refs.append(e["ref"])
+            for ref in e.get("refs") or []:
+                if ref and ref not in read_refs:
+                    read_refs.append(ref)
+            for ref in read_refs:
+                hit_counter[(_ref_library(e, ref), ref)] += 2
         elif e.get("tool") == "memory_search":
             for ref in e.get("refs") or []:
                 hit_counter[(_ref_library(e, ref), ref)] += 1

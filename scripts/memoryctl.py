@@ -2198,7 +2198,9 @@ def main():
             item.add_argument("query")
             item.add_argument("--limit", type=int, default=10)
         if command == "read":
-            item.add_argument("path")
+            item.add_argument("paths", nargs="+", help="One or more relative paths (optionally prefixed with '<library>:').")
+            item.add_argument("--section", default="", help="Read only this '## ' section.")
+            item.add_argument("--outline", action="store_true", help="Return only the intro and section outline.")
         if command == "write":
             item.add_argument("--layer", choices=ALL_LAYERS, required=True)
             item.add_argument("--name", required=True)
@@ -2324,7 +2326,20 @@ def main():
             elif args.command == "lint":
                 result = store.lint(stale_days=args.stale_days, library=args.library or "personal")
             elif args.command == "read":
-                result = store.read_entry(args.path, library=args.library or "")
+                if len(args.paths) == 1:
+                    result = store.read_entry(
+                        args.paths[0],
+                        library=args.library or "",
+                        section=args.section,
+                        outline=args.outline,
+                    )
+                else:
+                    result = store.read_entries(
+                        args.paths,
+                        library=args.library or "",
+                        section=args.section,
+                        outline=args.outline,
+                    )
             else:
                 body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
                 result = store.upsert_entry(args.layer, args.name, args.title, args.description, body,
