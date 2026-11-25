@@ -80,6 +80,22 @@ class EntryHistoryTests(unittest.TestCase):
         res = self.store.restore_entry(old_version)
         self.assertEqual(res["path"], "projects/docker-cache.md")
 
+    def test_search_returns_current_conclusion_not_saved_old_version(self):
+        self._write("旧结论：需要手工清理缓存。")
+        self._write("新结论：升级到 0.1.16 后不再需要手工清理缓存。")
+
+        hits = self.store.search("缓存结论")
+        self.assertEqual([hit["path"] for hit in hits], ["methods/docker-cache.md"])
+        current = self.store.read_entry("methods/docker-cache.md")["content"]
+        self.assertIn("升级到 0.1.16", current)
+        self.assertNotIn("旧结论：", current)
+
+        history = self.store.entry_history("docker-cache")
+        self.assertEqual(history["total_versions"], 1)
+        old_version = history["versions"][0]["version"]
+        preview = self.store.restore_entry(old_version, dry_run=True)
+        self.assertIn("旧结论", preview["content"])
+
     def test_unknown_version_is_rejected(self):
         with self.assertRaises(ValueError):
             self.store.restore_entry("../../etc/passwd")
