@@ -234,6 +234,19 @@ class LintStoreTests(unittest.TestCase):
         topic2 = lib.read_topic("projects/current-token-policy.md")
         self.assertEqual(topic2.verified_at, "2026-11-26")
         self.assertEqual(topic2.valid_until, "2099-12-31")
+        # read_index enriches verified_at/valid_until so entry cards can show expired badges.
+        _, indexed = lib.read_index()
+        self.assertEqual(indexed["projects/current-token-policy.md"].verified_at, "2026-11-26")
+        self.assertEqual(indexed["projects/current-token-policy.md"].valid_until, "2099-12-31")
+        self.assertEqual(indexed["projects/temp-token-policy.md"].valid_until, "2026-01-15")
+        expired_card = manager.entry_link(indexed["projects/temp-token-policy.md"], "/?topic=projects/temp-token-policy.md", False, False)
+        self.assertIn("entry-tag-expired", expired_card)
+        # Restoring an earlier backup restores its own verified_at/valid_until instead of keeping the overwritten dates.
+        versions = self.store.entry_history("current-token-policy")["versions"]
+        oldest_ver = versions[-1]["version"]
+        restored = self.store.restore_entry(oldest_ver)
+        self.assertEqual(restored["verified_at"], "2026-11-20")
+        self.assertEqual(restored["valid_until"], "2099-12-31")
 
         um = manager.Entry(
             name="entry-0123456789abcdef0123",

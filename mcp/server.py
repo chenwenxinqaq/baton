@@ -1863,8 +1863,10 @@ class MemoryStore:
             raise ValueError("Pass layer=L0..L4: this version does not record which layer it came from.")
         title = meta.get("title") or extract_title(body, slug)
         description = str(meta.get("description") or "").strip() or title
+        restored_verified_at = str(meta.get("verified_at") or "").strip()
+        restored_valid_until = str(meta.get("valid_until") or "").strip()
         if dry_run:
-            return {
+            preview = {
                 **self._result_metadata(),
                 "version": version,
                 "name": slug,
@@ -1875,6 +1877,11 @@ class MemoryStore:
                 "content": text,
                 "restored": False,
             }
+            if restored_verified_at:
+                preview["verified_at"] = restored_verified_at
+            if restored_valid_until:
+                preview["valid_until"] = restored_valid_until
+            return preview
         res = self.upsert_entry(
             layer=target_layer,
             name=slug,
@@ -1883,6 +1890,8 @@ class MemoryStore:
             body=body,
             topic_type=str(meta.get("type") or "").strip(),
             user_managed=user_managed,
+            verified_at=restored_verified_at,
+            valid_until=restored_valid_until,
         )
         res["restored"] = True
         res["restored_from"] = version

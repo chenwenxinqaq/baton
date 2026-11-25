@@ -229,6 +229,8 @@ class IndexedTopic:
     updated_at: str = ""
     created_epoch: float = 0.0
     updated_epoch: float = 0.0
+    verified_at: str = ""
+    valid_until: str = ""
 
 
 @dataclass(frozen=True)
@@ -634,6 +636,8 @@ class Library:
                         updated_at=upd_at,
                         created_epoch=cre_ep,
                         updated_epoch=upd_ep,
+                        verified_at=str(meta.get("verified_at") or "").strip(),
+                        valid_until=str(meta.get("valid_until") or "").strip(),
                     )
                     continue
                 except OSError:
