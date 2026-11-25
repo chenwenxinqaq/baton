@@ -106,10 +106,13 @@ inject into it small, which is why reads are progressive and §0 is tiny.
 
 - Recall-oriented eval. `see_also` adds entries no hit@k metric rewards, so its
   value is still judged by hand on sample queries, not measured.
-- LongMemEval (2410.10813) axes still without labelled cases: knowledge updates
-  (does the agent find the newest version of a changed fact) and temporal
-  reasoning. `search_eval.py` accepts an `axis` field for them and reports each
-  axis separately; abstention is already covered.
+- LongMemEval (2410.10813) knowledge-update axis still has no labelled cases:
+  does a search find the newest version of a changed fact. `search_eval.py`
+  accepts an `axis` field and reports each axis separately; extraction,
+  abstention and temporal are covered (5 temporal cases, legacy hit@1 1.0 and
+  MRR 1.0, while bm25f drops to 0.4 and hybrid to 0.8 — a third reason the
+  legacy ranker stays the default). An entry is overwritten in place, so this
+  axis mostly tests whether a stale snapshot was ever updated, not retrieval.
 - A curation pass for shared libraries: triage a candidate as new / update /
   disputed / no-material before writing, with `draft` / `stable` /
   `needs-update` status, from the LLM-wiki projects and Zep's invalidation.
