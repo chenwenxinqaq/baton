@@ -55,6 +55,16 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   separate "do the task" from "tidy what you learned". Lint is the offline pass:
   duplicate frontmatter, index drift, missing dates, stale snapshots, oversized
   entries, suspected duplicate topics.
+- **One-hop expansion** (`see_also` on the best search hit, `mcp/server.py`
+  `_attach_see_also`). HippoRAG (2405.14831) and *From RAG to Memory*
+  (2502.14802) argue that following associations recovers facts a single lookup
+  misses. The associations already exist as `methods/xxx.md` citations, so the
+  top hit now names up to 3 entries it cites that the query itself did not
+  return. Skipped when the top hit is only a `fuzzy` match, and in a
+  multi-library search only the overall best hit keeps it. On the real libraries
+  84 of 143 entries carry at least one citation (175 edges), and a query like
+  "docker inspect 卡死" gains the generic hang-diagnosis procedure that shares no
+  query term.
 - **Match strength** (`match` = `full` / `partial` / `fuzzy` / `recent` on each
   search hit, `mcp/server.py` `match_strength`). LongMemEval (2410.10813) scores
   abstention: an agent should say "not in memory" instead of answering from the
@@ -85,8 +95,8 @@ inject into it small, which is why reads are progressive and §0 is tiny.
 
 ## Open ideas from the reading list
 
-- One-hop expansion at search time (follow links of the top hit), from HippoRAG's
-  associativity argument. Needs an eval set that rewards recall, not just rank.
+- Recall-oriented eval. `see_also` adds entries no hit@k metric rewards, so its
+  value is still judged by hand on sample queries, not measured.
 - LongMemEval (2410.10813) axes still without labelled cases: knowledge updates
   (does the agent find the newest version of a changed fact) and temporal
   reasoning. `search_eval.py` accepts an `axis` field for them and reports each
