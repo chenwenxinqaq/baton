@@ -161,10 +161,11 @@ latency; extra round trips and a mistaken section choice can erase the benefit.
   as opt-in via `UNIFIED_MEMORY_SEARCH_RANKER`; see
   `mcp/server.py` `SEARCH_RANKERS` and `scripts/search_eval.py`. Broader semantic
   recall, beyond the scoped procedure variants above, remains open.
-- **A raw/ ingest layer and a knowledge graph.** Both the LLM-wiki pattern and
-  HippoRAG assume a corpus being ingested. Our libraries are written by agents a
-  few entries at a time, so the raw layer would be empty and the graph would
-  have fewer edges than the entries themselves.
+- **A separate ingest layer or graph service by default.** The Markdown corpus
+  already has explicit citations. The replay above gives us a cheap way to
+  follow and measure them without extracting entities or running a graph
+  service. It does not compare against Personalized PageRank or rule out a
+  graph for a different corpus.
 
 ## Open ideas from the reading list
 
