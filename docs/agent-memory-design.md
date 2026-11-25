@@ -151,6 +151,27 @@ reads retain navigation; all reads of a versioned entry retain `updated_at`.
 This measures retrieval payloads with known sections, not model accuracy or
 latency; extra round trips and a mistaken section choice can erase the benefit.
 
+### Include the search in the budget
+
+In a local same-session walkthrough, the reader selected the files and sections
+from the search hits and outlines, rather than receiving a gold section name.
+Across six lookups (limit 3), the same six searches plus one full read per
+selected file cost 9,325 estimated response tokens. The actual read path cost
+7,905: two lookups could use a named section; in three the requested outline
+returned the whole unsectioned entry, and one deliberately read the whole
+candidate to check a possible abstention. A topic match for a recurring
+schedule did not document a schedule. This is a diagnostic walkthrough, not
+an independently graded or blinded agent benchmark.
+
+Initial lookup can now request `memory_search(compact=true)`. It preserves hit
+order, qualified refs, trust, read-only state, match strength, variant phrase,
+title, summary, snippet, layer, status, update time and one-hop hints. It omits
+score and bookkeeping fields; the ordinary response is unchanged. On those
+same six searches this reduced search text from 3,693 to 2,660 estimated
+tokens, so the same search-and-read path cost 6,872 instead of 7,905. These
+are serialized tool result estimates, not model billing. An outline is not
+a promise of savings when the source has no Markdown sections.
+
 ## What we tried and rejected
 
 - **BM25F / hybrid ranking as the default.** Implemented and measured against a

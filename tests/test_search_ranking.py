@@ -241,6 +241,33 @@ class MatchStrengthTests(unittest.TestCase):
                 }])
 
 
+class CompactSearchTests(unittest.TestCase):
+    def test_search_projection_preserves_evidence_and_qualified_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(Path(tmp), "team")
+            _write(store, "L1", "recipe", "打包步骤", "生成包", "记录构建过程。")
+            _write(store, "L3", "handbook", "版本手册", "使用方式", "见 methods/recipe.md。")
+            store.role, store.mode = "shared", "ro"
+            for query, optional in (("版本手册", "see_also"), ("打包流程", "matched_phrase"),
+                                    ("最近进展", None)):
+                with self.subTest(query=query):
+                    def call(**kwargs):
+                        return mcp_server._handle_tool_call(store, "memory_search", {"query": query, **kwargs})[1]
+                    full, compact = call(), call(compact=True)
+                    self.assertEqual(full, call(compact=False))
+                    self.assertEqual([h["ref"] for h in full], [h["ref"] for h in compact])
+                    self.assertTrue(compact)
+                    for hit, small in zip(full, compact):
+                        self.assertTrue(small["ref"].startswith("team:"))
+                        self.assertEqual(small["trust"], "shared")
+                        self.assertTrue(small["read_only"])
+                        for key in ("title", "match", "snippet", "description", "updated_at", "layer", "status"):
+                            self.assertEqual(hit[key], small[key])
+                        self.assertNotIn("path", small)
+                    if optional:
+                        self.assertEqual(compact[0][optional], full[0][optional])
+
+
 class ProcedurePhraseTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

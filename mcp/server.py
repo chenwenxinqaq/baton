@@ -2003,6 +2003,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "Search keywords, phrase, or temporal cue."},
                 "layer": {"type": "string", "enum": ["", "L0", "L1", "L2", "L3", "L4"], "default": ""},
                 "include_archived": {"type": "boolean", "default": False},
+                "compact": {"type": "boolean", "default": False, "description": "For initial lookup, omit duplicate routing and bookkeeping fields. Keeps qualified refs, trust, read-only flag, match evidence, updated_at and citation hints."},
                 "limit": {"type": "integer", "default": 10},
                 "library": {"type": "string", "default": "personal", "description": "Target library id (defaults to 'personal'; use '*' or 'all' for all mounted libraries, or a shared mount id)."},
             },
@@ -2174,6 +2175,13 @@ def handle_tool_call(store, name, args):
     return result
 
 
+def compact_search_hit(hit):
+    """Project only after final ranking/merge: qualified ref is the read address."""
+    fields = ("ref", "trust", "read_only", "layer", "status", "updated_at", "match",
+              "matched_phrase", "title", "description", "snippet", "see_also")
+    return {key: hit[key] for key in fields if key in hit}
+
+
 def _handle_tool_call(store, name, args):
     """Dispatch an MCP tools/call invocation; return (mcp_result, raw_data)."""
     if name == "memory_libraries":
@@ -2188,6 +2196,8 @@ def _handle_tool_call(store, name, args):
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.search(**kwargs)
+        if args.get("compact") is True:
+            data = [compact_search_hit(hit) for hit in data]
     elif name == "memory_list":
         kwargs = dict(
             layer=args.get("layer", ""),
