@@ -2611,7 +2611,10 @@ def _ref_link(ref, key, event_library=""):
     selected_library = lib or str(event_library or "").strip() or key
     if selected_library == "personal":
         selected_library = "primary"
-    href = query(library=selected_library, topic=path) + "#detail-title"
+    if path.startswith("user-managed/") and path.endswith(".md"):
+        href = query(library=selected_library, entry=Path(path).stem) + "#detail-title"
+    else:
+        href = query(library=selected_library, topic=path) + "#detail-title"
     return f'<a href="{escape(href)}">{escape(ref)}</a>'
 
 
@@ -2790,13 +2793,14 @@ def _lint_section(key, root, token="", readonly=False, return_view=""):
             actions.append(f'<a class="btn btn-ghost btn-compact" href="{escape(edit_href)}">{btn_label}</a>')
         action_html = f'<span class="lint-actions">{"".join(actions)}</span>' if actions else ""
         rows.append(
-            f'<li><div class="lint-row-head"><span>{_ref_link(ref, key, report.get("library"))} '
+            f'<li><div class="lint-row-head"><span>{_ref_link(ref, key)} '
             f'<span class="{cls}">{escape(label)}</span></span>{action_html}</div>'
             f'<span class="act-meta">{escape(item["detail"])} → {escape(item["hint"])}</span></li>'
         )
     more = ""
     if len(findings) > 8:
-        more = f'<li class="act-meta">还有 {len(findings) - 8} 条，运行 <code>umem lint</code> 看全部</li>'
+        lint_cmd = "umem lint" if key == "primary" else f"umem lint --library {key}"
+        more = f'<li class="act-meta">还有 {len(findings) - 8} 条，运行 <code>{escape(lint_cmd)}</code> 看全部</li>'
     return (
         '<section class="activity-usage"><div class="usage-head"><h3>记忆库体检</h3>'
         f'<span class="usage-hint">{escape(chips)} {rebuild_btn}</span></div>'

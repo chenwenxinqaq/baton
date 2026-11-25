@@ -200,6 +200,12 @@ class VersionHistoryUITests(unittest.TestCase):
         ro_lint = manager_mod._lint_section("team", self.root, token="tok", readonly=True, return_view="activity")
         self.assertNotIn("/verify_topic", ro_lint)
         self.assertNotIn("/rebuild_index", ro_lint)
+        self.assertIn("library=team&amp;topic=projects%2Frollout-plan.md", ro_lint)
+        self.assertNotIn("library=primary&amp;topic=projects%2Frollout-plan.md", ro_lint)
+
+        user_link = manager_mod._ref_link("user-managed/personal-note.md", "team")
+        self.assertIn("library=team&amp;entry=personal-note", user_link)
+        self.assertNotIn("topic=user-managed", user_link)
 
     def test_quick_search_returns_recent_items_matches_and_actions(self):
         from types import SimpleNamespace
