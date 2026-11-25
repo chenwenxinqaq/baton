@@ -224,8 +224,8 @@ def _atomic_write(path, content):
 
 
 @contextmanager
-def _library_lock(root):
-    lock_path = library_state_dir(root) / "library.lock"
+def _state_lock(root, filename):
+    lock_path = library_state_dir(root) / filename
     if lock_path.parent.is_symlink() or lock_path.is_symlink():
         raise GitSyncError("本地同步状态目录不能是符号链接。")
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -243,6 +243,19 @@ def _library_lock(root):
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+@contextmanager
+def _library_lock(root):
+    with _state_lock(root, "library.lock"):
+        yield
+
+
+@contextmanager
+def _network_sync_lock(root):
+    """Serialize remote fetch/push operations without blocking local memory writes."""
+    with _state_lock(root, "sync-network.lock"):
+        yield
 
 
 def _parse_frontmatter(text):
@@ -1120,181 +1133,191 @@ def pull(root, remote="origin", branch="", mode="rw"):
     if not is_git_repo(root):
         raise GitSyncError(f"Not a Git repository: {root}")
 
-    with _library_lock(root):
-        br = branch or current_branch(root)
-        remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
-        if not remote_url:
-            raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
-        try:
-            validate_remote_url(remote_url)
-        except ValueError as exc:
-            raise GitSyncError(str(exc)) from exc
-        if _merge_in_progress(root):
-            raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
+    with _network_sync_lock(root):
+        with _library_lock(root):
+            br = branch or current_branch(root)
+            remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
+            if not remote_url:
+                raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
+            try:
+                validate_remote_url(remote_url)
+            except ValueError as exc:
+                raise GitSyncError(str(exc)) from exc
+            if _merge_in_progress(root):
+                raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
 
-        changes = _porcelain_changes(root)
-        seeds = _unmodified_seeds(root) if changes else []
-        if changes and seeds is None:
-            if mode == "ro":
-                raise GitSyncError(
-                    f"Read-only library '{root}' has local uncommitted changes; revert them before pulling."
-                )
-            auto_commit(root, "sync: local snapshot before pull")
-
+        # Run blocking network fetch outside _library_lock so local memory writes never stall.
         _run_git(root, "fetch", remote)
-        remote_ref = f"{remote}/{br}"
-        if _run_git(root, "rev-parse", "--verify", remote_ref, check=False).returncode != 0:
-            return {
-                "pulled": False,
-                "status": "remote_branch_missing",
-                "branch": br,
-                "remote": remote,
-                "conflicts": [],
-            }
 
-        if not _has_commits(root):
-            _checkout_initial_branch(root, br, remote_ref, seeds or [], mode)
+        with _library_lock(root):
+            current_remote = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
+            if current_remote != remote_url:
+                raise GitSyncError("同步期间仓库远端已变更，请重新同步。")
+            if _merge_in_progress(root):
+                raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
+
+            changes = _porcelain_changes(root)
+            seeds = _unmodified_seeds(root) if changes else []
+            if changes and seeds is None:
+                if mode == "ro":
+                    raise GitSyncError(
+                        f"Read-only library '{root}' has local uncommitted changes; revert them before pulling."
+                    )
+                auto_commit(root, "sync: local snapshot before pull")
+
+            remote_ref = f"{remote}/{br}"
+            if _run_git(root, "rev-parse", "--verify", remote_ref, check=False).returncode != 0:
+                return {
+                    "pulled": False,
+                    "status": "remote_branch_missing",
+                    "branch": br,
+                    "remote": remote,
+                    "conflicts": [],
+                }
+
+            if not _has_commits(root):
+                _checkout_initial_branch(root, br, remote_ref, seeds or [], mode)
+                return {
+                    "pulled": True,
+                    "status": "checked_out_remote",
+                    "branch": br,
+                    "remote": remote,
+                    "conflicts": [],
+                }
+
+            before_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
+            if mode == "ro":
+                ff = _run_git(root, "merge", "--ff-only", remote_ref, check=False)
+                if ff.returncode != 0:
+                    raise GitSyncError(
+                        f"Read-only library diverged from {remote_ref}; clean local commits before pulling."
+                    )
+                after_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
+                return {
+                    "pulled": after_rev != before_rev,
+                    "status": "fast_forward" if after_rev != before_rev else "up_to_date",
+                    "branch": br,
+                    "remote": remote,
+                    "conflicts": find_conflict_files(root),
+                }
+
+            merge = _run_git(root, "merge", "--no-edit", remote_ref, check=False)
+            if merge.returncode == 0:
+                after_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
+                return {
+                    "pulled": after_rev != before_rev,
+                    "status": "merged" if after_rev != before_rev else "up_to_date",
+                    "branch": br,
+                    "remote": remote,
+                    "conflicts": find_conflict_files(root),
+                }
+
+            # Resolve conflicts safely without losing either side or leaving the repo stuck in MERGING
+            unmerged = [
+                line.strip()
+                for line in _run_git(root, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()
+                if line.strip()
+            ]
+            if not unmerged:
+                detail = (merge.stderr or merge.stdout or "merge failed").strip()
+                raise _git_failure(f"git merge {remote_ref}", detail)
+
+            unsafe_unmerged = [rel for rel in unmerged if not _is_safe_sync_relpath(rel)]
+            if unsafe_unmerged:
+                _run_git(root, "merge", "--abort", check=False)
+                raise GitSyncError(
+                    "远端合并包含不在记忆 Markdown 允许列表中的文件，已中止合并："
+                    + ", ".join(_redact_remote_urls(rel) for rel in unsafe_unmerged[:5])
+                )
+            unsafe_paths = [
+                rel for rel in unmerged
+                if _safe_library_path(root, rel, allow_missing=True) is None
+            ]
+            if unsafe_paths:
+                _run_git(root, "merge", "--abort", check=False)
+                raise GitSyncError(
+                    "合并路径包含符号链接或越界路径，已中止合并："
+                    + ", ".join(_redact_remote_urls(rel) for rel in unsafe_paths[:5])
+                )
+
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            saved_conflicts = []
+            restored_remote = []
+            index_conflicted = False
+
+            try:
+                for rel in unmerged:
+                    if rel == "MEMORY.md":
+                        index_conflicted = True
+                        copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                        if not copy_rel:
+                            raise GitSyncError("无法保存远端 MEMORY.md 冲突副本，已停止自动合并。")
+                        saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "index"})
+                        _run_git(root, "checkout", "--ours", "MEMORY.md")
+                        continue
+                    # Keep local file at original path and preserve remote copy beside it
+                    has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
+                    has_theirs = _run_git(root, "show", f":3:{rel}", check=False).returncode == 0
+                    if has_ours and not has_theirs:
+                        # Remote deleted what we edited: keep our copy and ask, instead of silently resurrecting it.
+                        copy_rel = _extract_theirs_conflict_copy(root, rel, stamp, text=REMOTE_DELETED_TEXT)
+                        saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "remote_deleted"})
+                        _run_git(root, "checkout", "--ours", rel)
+                    elif has_theirs and not has_ours:
+                        # We deleted what the remote edited: never drop their edit; restore it and report.
+                        _run_git(root, "checkout", "--theirs", rel)
+                        restored_remote.append(rel)
+                    else:
+                        copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
+                        if copy_rel:
+                            saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "both_modified"})
+                        _run_git(root, "checkout", "--ours", rel)
+
+                # Deterministically rebuild MEMORY.md so additions from both sides are indexed cleanly
+                if index_conflicted or saved_conflicts or restored_remote:
+                    rebuild_index(root, lock=False)
+
+                _ensure_git_identity(root)
+                _ensure_gitignore(root)
+                _stage_allowed_paths(root)
+                still_unmerged = _git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z")
+                if still_unmerged:
+                    raise GitSyncError(
+                        "合并后仍有未解决冲突，已阻止自动提交：" + ", ".join(still_unmerged[:5])
+                    )
+                msg = (
+                    "sync: merge remote (auto-rebuilt MEMORY.md)"
+                    if not saved_conflicts
+                    else f"sync: merge remote ({len(saved_conflicts)} conflict copies preserved)"
+                )
+                _run_git(root, "commit", "--no-edit", "-m", msg)
+            except BaseException:
+                # Never leave the library MERGING: a later auto-commit would conclude the merge
+                # with conflict markers staged as resolved and push them.
+                _run_git(root, "merge", "--abort", check=False)
+                for conflict in saved_conflicts:
+                    copy = _safe_library_path(root, conflict.get("remote_copy") or "", allow_missing=True)
+                    if copy is not None and copy.is_file() and is_conflict_filename(copy.name):
+                        copy.unlink()
+                raise
+            blocking_conflicts = [
+                conflict for conflict in saved_conflicts
+                if conflict.get("kind") != "index"
+            ]
+            preserved_index_conflicts = [
+                conflict for conflict in saved_conflicts
+                if conflict.get("kind") == "index"
+            ]
             return {
                 "pulled": True,
-                "status": "checked_out_remote",
+                "status": "merged_with_conflicts" if saved_conflicts else "merged_index_rebuilt",
                 "branch": br,
                 "remote": remote,
-                "conflicts": [],
+                "index_rebuilt": index_conflicted,
+                "conflicts": blocking_conflicts,
+                "preserved_conflicts": preserved_index_conflicts,
+                "restored_remote": restored_remote,
             }
-
-        before_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
-        if mode == "ro":
-            ff = _run_git(root, "merge", "--ff-only", remote_ref, check=False)
-            if ff.returncode != 0:
-                raise GitSyncError(
-                    f"Read-only library diverged from {remote_ref}; clean local commits before pulling."
-                )
-            after_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
-            return {
-                "pulled": after_rev != before_rev,
-                "status": "fast_forward" if after_rev != before_rev else "up_to_date",
-                "branch": br,
-                "remote": remote,
-                "conflicts": find_conflict_files(root),
-            }
-
-        merge = _run_git(root, "merge", "--no-edit", remote_ref, check=False)
-        if merge.returncode == 0:
-            after_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
-            return {
-                "pulled": after_rev != before_rev,
-                "status": "merged" if after_rev != before_rev else "up_to_date",
-                "branch": br,
-                "remote": remote,
-                "conflicts": find_conflict_files(root),
-            }
-
-        # Resolve conflicts safely without losing either side or leaving the repo stuck in MERGING
-        unmerged = [
-            line.strip()
-            for line in _run_git(root, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()
-            if line.strip()
-        ]
-        if not unmerged:
-            detail = (merge.stderr or merge.stdout or "merge failed").strip()
-            raise _git_failure(f"git merge {remote_ref}", detail)
-
-        unsafe_unmerged = [rel for rel in unmerged if not _is_safe_sync_relpath(rel)]
-        if unsafe_unmerged:
-            _run_git(root, "merge", "--abort", check=False)
-            raise GitSyncError(
-                "远端合并包含不在记忆 Markdown 允许列表中的文件，已中止合并："
-                + ", ".join(_redact_remote_urls(rel) for rel in unsafe_unmerged[:5])
-            )
-        unsafe_paths = [
-            rel for rel in unmerged
-            if _safe_library_path(root, rel, allow_missing=True) is None
-        ]
-        if unsafe_paths:
-            _run_git(root, "merge", "--abort", check=False)
-            raise GitSyncError(
-                "合并路径包含符号链接或越界路径，已中止合并："
-                + ", ".join(_redact_remote_urls(rel) for rel in unsafe_paths[:5])
-            )
-
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        saved_conflicts = []
-        restored_remote = []
-        index_conflicted = False
-
-        try:
-            for rel in unmerged:
-                if rel == "MEMORY.md":
-                    index_conflicted = True
-                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
-                    if not copy_rel:
-                        raise GitSyncError("无法保存远端 MEMORY.md 冲突副本，已停止自动合并。")
-                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "index"})
-                    _run_git(root, "checkout", "--ours", "MEMORY.md")
-                    continue
-                # Keep local file at original path and preserve remote copy beside it
-                has_ours = _run_git(root, "show", f":2:{rel}", check=False).returncode == 0
-                has_theirs = _run_git(root, "show", f":3:{rel}", check=False).returncode == 0
-                if has_ours and not has_theirs:
-                    # Remote deleted what we edited: keep our copy and ask, instead of silently resurrecting it.
-                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp, text=REMOTE_DELETED_TEXT)
-                    saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "remote_deleted"})
-                    _run_git(root, "checkout", "--ours", rel)
-                elif has_theirs and not has_ours:
-                    # We deleted what the remote edited: never drop their edit; restore it and report.
-                    _run_git(root, "checkout", "--theirs", rel)
-                    restored_remote.append(rel)
-                else:
-                    copy_rel = _extract_theirs_conflict_copy(root, rel, stamp)
-                    if copy_rel:
-                        saved_conflicts.append({"original": rel, "remote_copy": copy_rel, "kind": "both_modified"})
-                    _run_git(root, "checkout", "--ours", rel)
-
-            # Deterministically rebuild MEMORY.md so additions from both sides are indexed cleanly
-            if index_conflicted or saved_conflicts or restored_remote:
-                rebuild_index(root, lock=False)
-
-            _ensure_git_identity(root)
-            _ensure_gitignore(root)
-            _stage_allowed_paths(root)
-            still_unmerged = _git_path_list(root, "diff", "--name-only", "--diff-filter=U", "-z")
-            if still_unmerged:
-                raise GitSyncError(
-                    "合并后仍有未解决冲突，已阻止自动提交：" + ", ".join(still_unmerged[:5])
-                )
-            msg = (
-                "sync: merge remote (auto-rebuilt MEMORY.md)"
-                if not saved_conflicts
-                else f"sync: merge remote ({len(saved_conflicts)} conflict copies preserved)"
-            )
-            _run_git(root, "commit", "--no-edit", "-m", msg)
-        except BaseException:
-            # Never leave the library MERGING: a later auto-commit would conclude the merge
-            # with conflict markers staged as resolved and push them.
-            _run_git(root, "merge", "--abort", check=False)
-            for conflict in saved_conflicts:
-                copy = _safe_library_path(root, conflict.get("remote_copy") or "", allow_missing=True)
-                if copy is not None and copy.is_file() and is_conflict_filename(copy.name):
-                    copy.unlink()
-            raise
-        blocking_conflicts = [
-            conflict for conflict in saved_conflicts
-            if conflict.get("kind") != "index"
-        ]
-        preserved_index_conflicts = [
-            conflict for conflict in saved_conflicts
-            if conflict.get("kind") == "index"
-        ]
-        return {
-            "pulled": True,
-            "status": "merged_with_conflicts" if saved_conflicts else "merged_index_rebuilt",
-            "branch": br,
-            "remote": remote,
-            "index_rebuilt": index_conflicted,
-            "conflicts": blocking_conflicts,
-            "preserved_conflicts": preserved_index_conflicts,
-            "restored_remote": restored_remote,
-        }
 
 
 def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
@@ -1305,32 +1328,44 @@ def push(root, remote="origin", branch="", mode="rw", *, browser_login=False):
     if not is_git_repo(root):
         raise GitSyncError(f"Not a Git repository: {root}")
 
-    with _library_lock(root):
-        br = branch or current_branch(root)
-        remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
-        if not remote_url:
-            raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
-        try:
-            validate_remote_url(remote_url)
-        except ValueError as exc:
-            raise GitSyncError(str(exc)) from exc
-        if _merge_in_progress(root):
-            raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
+    with _network_sync_lock(root):
+        with _library_lock(root):
+            br = branch or current_branch(root)
+            local_branch = current_branch(root)
+            remote_url = _run_git(root, "remote", "get-url", remote, check=False).stdout.strip()
+            if not remote_url:
+                raise GitSyncError(f"Git remote '{remote}' is not configured for {root}")
+            try:
+                validate_remote_url(remote_url)
+            except ValueError as exc:
+                raise GitSyncError(str(exc)) from exc
+            if _merge_in_progress(root):
+                raise GitSyncError(MERGE_IN_PROGRESS_MESSAGE)
 
-        existing_conflicts = find_conflict_files(root)
-        blocking_conflicts = [rel for rel in existing_conflicts if not _is_index_conflict_path(rel)]
-        if blocking_conflicts:
-            raise GitSyncError(
-                f"Unresolved conflict copies exist ({', '.join(blocking_conflicts)}); merge and remove them before pushing."
-            )
+            existing_conflicts = find_conflict_files(root)
+            blocking_conflicts = [rel for rel in existing_conflicts if not _is_index_conflict_path(rel)]
+            if blocking_conflicts:
+                raise GitSyncError(
+                    f"Unresolved conflict copies exist ({', '.join(blocking_conflicts)}); merge and remove them before pushing."
+                )
 
-        commit_res = auto_commit(root, "sync: commit local memory updates")
-        if not _has_commits(root):
-            return {"pushed": False, "status": "no_commits", "branch": br, "remote": remote}
+            commit_res = auto_commit(root, "sync: commit local memory updates")
+            if not _has_commits(root):
+                return {"pushed": False, "status": "no_commits", "branch": br, "remote": remote}
+            push_rev = _run_git(root, "rev-parse", "HEAD").stdout.strip()
+            interactive = browser_login and github_browser_login(remote_url)
 
-        interactive = browser_login and github_browser_login(remote_url)
-        _run_git(root, "push", "-u", remote, f"HEAD:{br}", browser_login=interactive,
+        # Push the captured commit outside _library_lock so local memory writes never stall on network I/O.
+        _run_git(root, "push", remote, f"{push_rev}:refs/heads/{br}", browser_login=interactive,
                  timeout=300 if interactive else None)
+
+        with _library_lock(root):
+            remote_ref = f"{remote}/{br}"
+            if (local_branch == br
+                    and _run_git(root, "rev-parse", "--verify", remote_ref, check=False).returncode == 0
+                    and _run_git(root, "rev-parse", "--abbrev-ref", f"{br}@{{upstream}}", check=False).returncode != 0):
+                _run_git(root, "branch", f"--set-upstream-to={remote_ref}", br, check=False)
+
         return {
             "pushed": True,
             "status": "pushed",

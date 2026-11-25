@@ -281,6 +281,57 @@ class SyncSecurityTests(unittest.TestCase):
             events = audit_log.read_events(home=home)
             self.assertEqual(events[0]["query"], "https://***@gitee.com/x")
 
+    def test_pull_and_push_do_not_hold_library_lock_during_network_git_calls(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            env = {
+                "HOME": str(base / "home"),
+                "UNIFIED_MEMORY_STATE_DIR": str(base / "state"),
+                "UNIFIED_MEMORY_CONFIG_DIR": str(base / "config"),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+            with mock.patch.dict(os.environ, env):
+                bare = base / "remote.git"
+                subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+                lib = base / "lib"
+                memoryctl.initialize_library(lib)
+                sync_git.ensure_repo(lib, remote_url=str(bare), branch="main")
+                sync_git.auto_commit(lib, "seed")
+
+                observed = {}
+                orig_run_git = sync_git._run_git
+
+                def spy_run_git(repo, *args, **kwargs):
+                    if args and args[0] in {"fetch", "push"}:
+                        lock_path = sync_git.library_state_dir(repo) / "library.lock"
+                        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            observed[args[0]] = "unlocked"
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        except BlockingIOError:
+                            observed[args[0]] = "locked"
+                        finally:
+                            os.close(fd)
+                    return orig_run_git(repo, *args, **kwargs)
+
+                with mock.patch.object(sync_git, "_run_git", side_effect=spy_run_git):
+                    pushed = sync_git.push(lib, branch="main")
+                    pulled = sync_git.pull(lib, branch="main")
+
+                self.assertTrue(pushed["pushed"])
+                self.assertEqual(observed.get("push"), "unlocked")
+                self.assertEqual(observed.get("fetch"), "unlocked")
+                self.assertEqual(pulled["status"], "up_to_date")
+                upstream = subprocess.run(
+                    ["git", "-C", str(lib), "rev-parse", "--abbrev-ref", "main@{upstream}"],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+                self.assertEqual(upstream, "origin/main")
+
 
 if __name__ == "__main__":
     unittest.main()
