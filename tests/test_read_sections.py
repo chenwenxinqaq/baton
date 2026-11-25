@@ -51,6 +51,8 @@ class ReadSectionTests(unittest.TestCase):
         res = self.store.read_entry("methods/guide.md", section="验证")
         self.assertTrue(res["partial"])
         self.assertEqual(res["section"], "验证")
+        self.assertNotIn("sections", res)  # Do not resend the outline with every section.
+        self.assertIn("updated_at", res)  # A selective read still carries its write guard.
         self.assertIn("跑测试", res["content"])
         self.assertNotIn("细节说明", res["content"])
         self.assertIn("# 部署手册", res["content"])

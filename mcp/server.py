@@ -1169,7 +1169,6 @@ class MemoryStore:
                 "section": picked["title"],
                 "partial": True,
                 "content": "\n\n".join(parts) + "\n",
-                "sections": section_outline(sections),
             }
         if outline:
             if not sections:
@@ -2025,7 +2024,7 @@ TOOLS = [
     },
     {
         "name": "memory_read",
-        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md'). Large entries also return a section outline; pass outline=true to get only that outline, or section='<title>' to read a single section instead of the whole file.",
+        "description": "Read a specific memory Markdown file by relative path (e.g. 'MEMORY.md', 'projects/example.md', or 'team-kb:methods/guide.md'). Full reads of large entries also return a section outline; pass outline=true to get only that outline, or section='<title>' to read a single section instead of the whole file.",
         "inputSchema": {
             "type": "object",
             "properties": {

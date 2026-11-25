@@ -138,6 +138,19 @@ hints are useful. This small, purpose-built set supports keeping optional
 one-hop hints, not expanding roots or hop count by default. If a compound
 question is still missing a source, search its missing subject explicitly.
 
+### Cost after opening a source
+
+A separate local check selected five factual questions about four structured
+entries. For each, the test reader knew which section to choose and checked
+two preselected evidence strings in both full and targeted responses. Five
+full MCP result texts cost 7,123 estimated tokens. Five outlines followed by
+five section reads cost 3,239 (55% less); with section names already known,
+the five reads alone cost 1,824. Selected sections no longer repeat the entire
+outline, saving 680 estimated tokens across those five reads. Full and outline
+reads retain navigation; all reads of a versioned entry retain `updated_at`.
+This measures retrieval payloads with known sections, not model accuracy or
+latency; extra round trips and a mistaken section choice can erase the benefit.
+
 ## What we tried and rejected
 
 - **BM25F / hybrid ranking as the default.** Implemented and measured against a
