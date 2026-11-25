@@ -55,14 +55,14 @@ NUDGE_MESSAGE = (
     f"{NUDGE_MARKER}请按 unified_memory 的 MEMORY.md §0 复查本轮对话："
     "是否产生了可跨会话复用的根因/踩坑/方法、用户长期偏好或约束、项目关键决策或进展？"
     "若有：先 memory_search 同主题，再用 memory_upsert 保存"
-    "（已有条目沿用原 name，局部补充可直接用 mode='append'）；"
+    "（已有条目沿用原 name，局部补充可用 mode='append' 或 section='小节名'）；"
     "若没有：只回复一句“本轮无需沉淀”，不要做其他操作。"
 )
 
 CHECKPOINT_MESSAGE = (
     f"{CHECKPOINT_MARKER}本轮已连续执行多步操作且近期尚未沉淀记忆。"
     "如果刚才已经确认了可跨会话复用的根因、踩坑、方法、长期偏好或关键项目决策，"
-    "可顺手调用 memory_upsert 保存（已有条目可直接用 mode='append' 增量追加），"
+    "可顺手调用 memory_upsert 保存（已有条目可用 mode='append' 或 section='小节名' 原地增量更新），"
     "若目前只是过程探索则忽略本提醒继续当前任务。"
 )
 
@@ -144,7 +144,7 @@ def build_context(memory_root):
         "【Unified Memory】本机跨 Agent 统一记忆库已通过 MCP 服务 `unified_memory` 接入"
         "（memory_search / memory_read / memory_upsert / memory_archive / memory_libraries）。",
         "- 任务开始、或涉及用户偏好/历史决策/项目背景时：先 memory_search(compact=true) 再用 memory_read(paths=...) 批量核对。",
-        "- 核实根因、踩坑、方法、偏好或项目进展后及时 memory_upsert（已有条目局部补充可直接用 mode='append'）；最终回复前再查一次是否遗漏。",
+        "- 核实根因、踩坑、方法、偏好或项目进展后及时 memory_upsert（已有条目局部补充可用 mode='append' 或 section='小节名'）；最终回复前再查一次是否遗漏。",
         "- 不要把一次性过程、密钥、凭据写入记忆。",
     ]
     digest = index_digest(memory_root)
