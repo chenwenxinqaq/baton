@@ -55,6 +55,14 @@ inject into it small, which is why reads are progressive and §0 is tiny.
   separate "do the task" from "tidy what you learned". Lint is the offline pass:
   duplicate frontmatter, index drift, missing dates, stale snapshots, oversized
   entries, suspected duplicate topics.
+- **Match strength** (`match` = `full` / `partial` / `fuzzy` / `recent` on each
+  search hit, `mcp/server.py` `match_strength`). LongMemEval (2410.10813) scores
+  abstention: an agent should say "not in memory" instead of answering from the
+  closest entry. A ranked list always has a top hit, so the agent needs a cue
+  for how much of the query that hit covers. `scripts/search_eval.py` scores
+  abstention cases (empty `relevant`) as passing when no hit is `full`; 8 such
+  queries on the real library all pass. Unspaced Chinese queries are a single
+  word, so they only ever match `fuzzy`.
 - **Usage metrics** (`scripts/audit_log.py` `usage_stats`, `memoryctl usage`).
   Nothing in the literature; it came from the user's question of whether the
   memory saves tokens or just injects noise. It measures returned tokens, how
@@ -79,9 +87,10 @@ inject into it small, which is why reads are progressive and §0 is tiny.
 
 - One-hop expansion at search time (follow links of the top hit), from HippoRAG's
   associativity argument. Needs an eval set that rewards recall, not just rank.
-- LongMemEval (2410.10813) axes we do not test yet: knowledge updates (does the
-  agent find the newest version of a changed fact), temporal reasoning, and
-  abstention (saying "not in memory" instead of returning the closest entry).
+- LongMemEval (2410.10813) axes still without labelled cases: knowledge updates
+  (does the agent find the newest version of a changed fact) and temporal
+  reasoning. `search_eval.py` accepts an `axis` field for them and reports each
+  axis separately; abstention is already covered.
 - A curation pass for shared libraries: triage a candidate as new / update /
   disputed / no-material before writing, with `draft` / `stable` /
   `needs-update` status, from the LLM-wiki projects and Zep's invalidation.
