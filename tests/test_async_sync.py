@@ -254,6 +254,76 @@ class AsyncSyncSchedulerTests(unittest.TestCase):
             persisted = json.loads(status_files[0].read_text(encoding="utf-8"))
             self.assertEqual(persisted["generation"], 1)
 
+    def test_stale_pending_recovery_and_external_result_recording(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            state = Path(tmp) / "state"
+            calls = []
+
+            scheduler = AsyncSyncScheduler(
+                lambda path, **kwargs: (calls.append(path), {"status": "ok"})[1],
+                debounce_seconds=0,
+                state_dir=state,
+            )
+            self.addCleanup(scheduler.shutdown)
+
+            # Simulate an orphaned pending status left by a dead worker PID.
+            status_path = scheduler._state_path(root.resolve())
+            async_sync._atomic_json(
+                status_path,
+                {
+                    "version": 1,
+                    "library": str(root.resolve()),
+                    "status": "pending",
+                    "generation": 1,
+                    "pid": 99999999,
+                    "updated_at": "2026-11-25T00:00:00+00:00",
+                    "reason": "orphaned write",
+                },
+            )
+            self.assertTrue(async_sync.is_stale_active(scheduler.status(root)))
+            recovered = scheduler.recover_stale(root, sync_config=self.config(), mode="rw")
+            self.assertIsNotNone(recovered)
+            final = scheduler.wait_for_idle(root, timeout=2)
+            self.assertEqual(final["status"], "success")
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(async_sync.is_stale_active(final))
+
+            # Manual CLI/UI sync result clears stale pending/error status cleanly.
+            recorded = async_sync.record_external_result(
+                root,
+                result={"status": "ok", "push": {"status": "pushed"}},
+                reason="manual sync",
+                state_dir=state,
+            )
+            self.assertEqual(recorded["status"], "success")
+            self.assertEqual(scheduler.status(root)["reason"], "manual sync")
+
+    def test_detached_sync_scheduler_spawns_worker_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "library"
+            root.mkdir()
+            state = Path(tmp) / "state"
+            spawned = []
+
+            def fake_spawn(cmd):
+                spawned.append(cmd)
+                return 424242
+
+            scheduler = async_sync.DetachedSyncScheduler(state_dir=state, spawn_fn=fake_spawn)
+            self.assertEqual(
+                scheduler.enqueue(root, sync_config=self.config(auto_push=False))["reason"],
+                "auto_push_disabled",
+            )
+            queued = scheduler.enqueue(root, sync_config=self.config(), reason="cli upsert")
+            self.assertTrue(queued["queued"])
+            self.assertEqual(queued["pid"], 424242)
+            self.assertEqual(len(spawned), 1)
+            self.assertIn("--root", spawned[0])
+            self.assertIn(str(root.resolve()), spawned[0])
+            self.assertEqual(scheduler.status(root)["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

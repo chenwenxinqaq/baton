@@ -1,6 +1,7 @@
 """Deterministic MEMORY.md index rebuilder and zero-dependency Git sync driver."""
 
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime
 import fcntl
 import getpass
@@ -13,10 +14,11 @@ import shutil
 import signal
 import sys
 import subprocess
+import threading
 import time
 from tempfile import NamedTemporaryFile
 from urllib.parse import unquote, urlsplit
-from urllib.request import getproxies, proxy_bypass
+from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass
 
 from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
 
@@ -639,16 +641,260 @@ def _network_url(root, args, env):
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _github_proxy_options(root, env):
-    """Supply macOS's static HTTPS proxy as a host-scoped Git default."""
+_PAC_CACHE_LOCK = threading.Lock()
+_PAC_SCRIPT_CACHE = {}  # url -> (fetched_monotonic, script_text)
+_PAC_CACHE_TTL = 300.0
+_PAC_MAX_BYTES = 256 * 1024
+_PAC_HOST_PORT_RE = re.compile(r"^(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):\d{1,5}$")
+_JSC_LIB = None
+_JSC_LOCK = threading.Lock()
+_PAC_PRELUDE = """
+function isPlainHostName(host) { return String(host || "").indexOf(".") === -1; }
+function dnsDomainIs(host, domain) {
+  var h = String(host || "").toLowerCase(), d = String(domain || "").toLowerCase();
+  return h.length >= d.length && h.slice(-d.length) === d;
+}
+function localHostOrDomainIs(host, hostdom) {
+  var h = String(host || "").toLowerCase(), d = String(hostdom || "").toLowerCase();
+  return h === d || d.indexOf(h + ".") === 0;
+}
+function shExpMatch(str, shexp) {
+  var re = new RegExp("^" + String(shexp || "").replace(/[.+^${}()|[\\]\\\\]/g, "\\\\$&").replace(/\\*/g, ".*").replace(/\\?/g, ".") + "$");
+  return re.test(String(str || ""));
+}
+function dnsDomainLevels(host) { return (String(host || "").match(/\\./g) || []).length; }
+function isResolvable(host) { return false; }
+function dnsResolve(host) { return ""; }
+function myIpAddress() { return "127.0.0.1"; }
+function isInNet(host, pattern, mask) { return false; }
+function weekdayRange() { return false; }
+function dateRange() { return false; }
+function timeRange() { return false; }
+"""
+
+
+def _parse_pac_result(raw):
+    """Parse a PAC FindProxyForURL string into a single curl/git proxy URL or ''."""
+    for part in str(raw or "").split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        tokens = item.split()
+        kind = tokens[0].upper()
+        if kind == "DIRECT":
+            return ""
+        if len(tokens) != 2:
+            continue
+        addr = tokens[1].strip()
+        if not _PAC_HOST_PORT_RE.fullmatch(addr):
+            continue
+        if kind in {"PROXY", "HTTP"}:
+            return f"http://{addr}"
+        if kind == "HTTPS":
+            return f"https://{addr}"
+        if kind in {"SOCKS", "SOCKS4"}:
+            return f"socks4a://{addr}"
+        if kind == "SOCKS5":
+            return f"socks5h://{addr}"
+    return ""
+
+
+def _macos_pac_url():
+    """Read the active macOS Proxy Auto-Config URL from scutil, if enabled."""
+    if sys.platform != "darwin":
+        return ""
+    try:
+        proc = subprocess.run(
+            ["scutil", "--proxy"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    text = proc.stdout or ""
+    if not re.search(r"\bProxyAutoConfigEnable\s*:\s*1\b", text):
+        return ""
+    match = re.search(r"\bProxyAutoConfigURLString\s*:\s*(\S+)", text)
+    if not match:
+        return ""
+    pac_url = match.group(1).strip()
+    parsed = urlsplit(pac_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return pac_url
+
+
+def _fetch_pac_script(pac_url):
+    """Fetch and cache a PAC script directly (bypassing proxies) with size and time bounds."""
+    now = time.monotonic()
+    with _PAC_CACHE_LOCK:
+        cached = _PAC_SCRIPT_CACHE.get(pac_url)
+        if cached is not None and (now - cached[0]) < _PAC_CACHE_TTL:
+            return cached[1]
+    opener = build_opener(ProxyHandler({}))
+    req = Request(pac_url, headers={"User-Agent": "UnifiedMemory"})
+    with opener.open(req, timeout=4) as resp:
+        data = resp.read(_PAC_MAX_BYTES + 1)
+    if len(data) > _PAC_MAX_BYTES:
+        return ""
+    script = data.decode("utf-8", errors="replace")
+    with _PAC_CACHE_LOCK:
+        if len(_PAC_SCRIPT_CACHE) > 8:
+            _PAC_SCRIPT_CACHE.clear()
+        _PAC_SCRIPT_CACHE[pac_url] = (time.monotonic(), script)
+    return script
+
+
+def _load_jsc():
+    global _JSC_LIB
+    with _JSC_LOCK:
+        if _JSC_LIB is not None:
+            return _JSC_LIB
+        lib = ctypes.CDLL("/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore")
+        lib.JSContextGroupCreate.restype = ctypes.c_void_p
+        lib.JSContextGroupRelease.argtypes = [ctypes.c_void_p]
+        if hasattr(lib, "JSContextGroupSetExecutionTimeLimit"):
+            lib.JSContextGroupSetExecutionTimeLimit.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+        lib.JSGlobalContextCreateInGroup.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.JSGlobalContextCreateInGroup.restype = ctypes.c_void_p
+        lib.JSGlobalContextRelease.argtypes = [ctypes.c_void_p]
+        lib.JSStringCreateWithUTF8CString.argtypes = [ctypes.c_char_p]
+        lib.JSStringCreateWithUTF8CString.restype = ctypes.c_void_p
+        lib.JSStringRelease.argtypes = [ctypes.c_void_p]
+        lib.JSEvaluateScript.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.JSEvaluateScript.restype = ctypes.c_void_p
+        lib.JSValueToStringCopy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.JSValueToStringCopy.restype = ctypes.c_void_p
+        lib.JSStringGetMaximumUTF8CStringSize.argtypes = [ctypes.c_void_p]
+        lib.JSStringGetMaximumUTF8CStringSize.restype = ctypes.c_size_t
+        lib.JSStringGetUTF8CString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.JSStringGetUTF8CString.restype = ctypes.c_size_t
+        _JSC_LIB = lib
+        return lib
+
+
+def _eval_pac_script(script, target_url, host):
+    """Evaluate a PAC script inside a sandboxed, time-limited JavaScriptCore context."""
+    if sys.platform != "darwin" or not script:
+        return ""
+    jsc = _load_jsc()
+    group = jsc.JSContextGroupCreate()
+    if not group:
+        return ""
+    ctx = None
+    try:
+        if hasattr(jsc, "JSContextGroupSetExecutionTimeLimit"):
+            jsc.JSContextGroupSetExecutionTimeLimit(group, 0.25, None, None)
+        ctx = jsc.JSGlobalContextCreateInGroup(group, None)
+        if not ctx:
+            return ""
+        call_expr = f"FindProxyForURL({json.dumps(target_url)}, {json.dumps(host)})"
+        last_val = None
+        for source in (_PAC_PRELUDE, script, call_expr):
+            js_src = jsc.JSStringCreateWithUTF8CString(source.encode("utf-8"))
+            exc = ctypes.c_void_p(None)
+            try:
+                last_val = jsc.JSEvaluateScript(ctx, js_src, None, None, 1, ctypes.byref(exc))
+            finally:
+                jsc.JSStringRelease(js_src)
+            if exc.value:
+                return ""
+        if not last_val:
+            return ""
+        res_str = jsc.JSValueToStringCopy(ctx, last_val, None)
+        if not res_str:
+            return ""
+        try:
+            max_size = jsc.JSStringGetMaximumUTF8CStringSize(res_str)
+            if max_size <= 0 or max_size > 4096:
+                return ""
+            buf = ctypes.create_string_buffer(max_size)
+            jsc.JSStringGetUTF8CString(res_str, buf, max_size)
+            return buf.value.decode("utf-8", errors="replace").strip()
+        finally:
+            jsc.JSStringRelease(res_str)
+    except Exception:
+        return ""
+    finally:
+        if ctx:
+            jsc.JSGlobalContextRelease(ctx)
+        jsc.JSContextGroupRelease(group)
+
+
+def _resolve_macos_pac_proxy(target_url, host):
+    """Resolve macOS PAC proxy for target_url/host, returning a proxy URL or ''."""
+    try:
+        pac_url = _macos_pac_url()
+        if not pac_url:
+            return ""
+        script = _fetch_pac_script(pac_url)
+        if not script:
+            return ""
+        raw = _eval_pac_script(script, target_url, host)
+        return _parse_pac_result(raw)
+    except Exception:
+        return ""
+
+
+def _macos_system_proxy(target_url, host):
+    """Return macOS static HTTPS proxy or PAC-resolved proxy for target_url/host."""
+    if sys.platform != "darwin" or not host or proxy_bypass(host):
+        return ""
+    proxy = getproxies().get("https")
+    if proxy:
+        return proxy
+    return _resolve_macos_pac_proxy(target_url, host)
+
+
+def resolve_system_proxy(target_url="https://github.com/", env=None):
+    """Resolve an HTTPS proxy URL from environment variables or macOS system/PAC settings."""
+    environ = os.environ if env is None else env
+    for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        if key in environ:
+            return str(environ.get(key) or "").strip()
+    parsed = urlsplit(str(target_url or ""))
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return ""
+    return _macos_system_proxy(target_url, parsed.hostname.lower())
+
+
+def _github_proxy_options(root, env, remote_url="https://github.com/"):
+    """Supply macOS's static or PAC-resolved HTTPS proxy as a host-scoped Git default."""
     if sys.platform != "darwin" or any(key.lower() in {"http_proxy", "https_proxy", "all_proxy"}
                                        for key in env):
         return []
-    proxy = getproxies().get("https")
-    if not proxy or proxy_bypass("github.com"):
+    try:
+        info = https_remote(remote_url)
+    except ValueError:
+        return []
+    if not info:
+        return []
+    host = info["host"].split(":", 1)[0]
+    url = f"{info['scope']}/"
+    proxy = _macos_system_proxy(url, host)
+    if not proxy:
         return []
     # Even an explicitly empty http.proxy means the user chose their own route.
-    url = "https://github.com/"
     configured = subprocess.run(["git", "config", "--get-urlmatch", "http.proxy", url],
                                 cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if configured.returncode != 1:
@@ -672,7 +918,7 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
             validate_remote_url(network_url)
         except ValueError as exc:
             raise GitSyncError(str(exc)) from exc
-        cmd += _github_proxy_options(root, env)
+        cmd += _github_proxy_options(root, env, network_url)
         cmd += _credential_options(network_url, browser_login, env)
         if timeout is None and not browser_login:
             timeout = NETWORK_TIMEOUT

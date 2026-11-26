@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Union
@@ -23,10 +25,49 @@ from library_paths import library_state_dir
 
 TERMINAL_STATES = frozenset({"success", "error", "conflict"})
 ACTIVE_STATES = frozenset({"pending", "running"})
+STALE_ACTIVE_SECONDS = 600
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def is_stale_active(payload: Any, *, now_epoch: Optional[float] = None) -> bool:
+    """Return True if a persisted pending/running status belongs to a dead or timed-out worker."""
+    if not isinstance(payload, dict):
+        return False
+    state = str(payload.get("status") or "").casefold()
+    if state not in ACTIVE_STATES:
+        return False
+    if "pid" in payload and payload.get("pid") is not None:
+        return not _pid_alive(payload.get("pid"))
+    updated_at = str(payload.get("updated_at") or "").strip()
+    if not updated_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        now_val = time.time() if now_epoch is None else float(now_epoch)
+        return (now_val - parsed.timestamp()) > STALE_ACTIVE_SECONDS
+    except (ValueError, OSError):
+        return True
 
 
 def _safe_text(value: Any, limit: int = 500) -> str:
@@ -178,6 +219,7 @@ class AsyncSyncScheduler:
             "status": state,
             "generation": job.generation,
             "attempt": job.attempts,
+            "pid": os.getpid(),
             "updated_at": _now(),
         }
         # Preserve useful lifecycle timestamps and the latest reason/result.
@@ -503,5 +545,220 @@ class AsyncSyncScheduler:
                     job.timer = None
 
 
+    def recover_stale(
+        self,
+        root: Union[Path, str],
+        *,
+        sync_config: Optional[Dict[str, Any]],
+        mode: str = "rw",
+    ) -> Optional[Dict[str, Any]]:
+        """Re-enqueue a library whose persisted pending/running worker died before finishing."""
+        current = self.status(root)
+        if not is_stale_active(current):
+            return None
+        reason = str(current.get("reason") or "recover interrupted sync")
+        return self.enqueue(root, sync_config=sync_config, mode=mode, reason=reason)
+
+
+class DetachedSyncScheduler:
+    """Background sync launcher for short-lived CLI commands.
+
+    Instead of scheduling an in-process daemon Timer that dies when the CLI exits,
+    spawns a detached worker subprocess that runs ``sync_git.sync`` and updates
+    ``sync-status.json`` with its own PID and terminal outcome.
+    """
+
+    def __init__(self, *, state_dir: Optional[Union[Path, str]] = None, spawn_fn=None) -> None:
+        self.state_dir = Path(state_dir).expanduser().resolve() if state_dir else None
+        self.spawn_fn = spawn_fn
+
+    def _state_path(self, root: Path) -> Path:
+        if self.state_dir is not None:
+            import hashlib
+
+            digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+            return self.state_dir / digest / "sync-status.json"
+        return library_state_dir(root) / "sync-status.json"
+
+    def status(self, root: Union[Path, str]) -> Dict[str, Any]:
+        root_path = Path(root).expanduser().resolve()
+        path = self._state_path(root_path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
+
+    def enqueue(
+        self,
+        root: Union[Path, str],
+        *,
+        sync_config: Optional[Dict[str, Any]],
+        mode: str = "rw",
+        reason: str = "memory write",
+    ) -> Dict[str, Any]:
+        root_path = Path(root).expanduser().resolve()
+        config = dict(sync_config or {})
+        if mode != "rw":
+            return {"queued": False, "reason": "read_only"}
+        if str(config.get("driver") or "git").casefold() != "git":
+            return {"queued": False, "reason": "unsupported_driver"}
+        if not bool(config.get("auto_push", False)):
+            return {"queued": False, "reason": "auto_push_disabled"}
+        if os.environ.get("UNIFIED_MEMORY_DISABLE_DETACHED_SYNC") == "1":
+            return {"queued": False, "reason": "detached_sync_disabled"}
+
+        cmd = [
+            sys.executable,
+            "-B",
+            str(Path(__file__).resolve()),
+            "--root",
+            str(root_path),
+            "--remote",
+            str(config.get("remote") or "origin"),
+            "--branch",
+            str(config.get("branch") or ""),
+            "--reason",
+            _redact(reason),
+        ]
+        if self.state_dir is not None:
+            cmd += ["--state-dir", str(self.state_dir)]
+
+        now = _now()
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "library": str(root_path),
+            "status": "pending",
+            "generation": 1,
+            "attempt": 0,
+            "pid": None,
+            "queued_at": now,
+            "updated_at": now,
+            "reason": _redact(reason),
+        }
+        try:
+            _atomic_json(self._state_path(root_path), payload)
+        except OSError:
+            pass
+
+        try:
+            if self.spawn_fn is not None:
+                pid = self.spawn_fn(cmd)
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+                pid = proc.pid
+        except OSError as exc:
+            payload["status"] = "error"
+            payload["error"] = _redact(f"{exc.__class__.__name__}: {exc}")
+            payload["finished_at"] = _now()
+            try:
+                _atomic_json(self._state_path(root_path), payload)
+            except OSError:
+                pass
+            return {"queued": False, **payload}
+
+        payload["pid"] = pid
+        return {"queued": True, **payload}
+
+    def shutdown(self) -> None:
+        return None
+
+
+def record_external_result(
+    root: Union[Path, str],
+    result: Any = None,
+    *,
+    error: Any = None,
+    reason: str = "manual sync",
+    state_dir: Optional[Union[Path, str]] = None,
+) -> Dict[str, Any]:
+    """Update sync-status.json after an explicit CLI/UI sync so stale pending/error badges clear."""
+    root_path = Path(root).expanduser().resolve()
+    if state_dir is not None:
+        import hashlib
+
+        digest = hashlib.sha256(str(root_path).encode("utf-8")).hexdigest()[:16]
+        path = Path(state_dir).expanduser().resolve() / digest / "sync-status.json"
+    else:
+        path = library_state_dir(root_path) / "sync-status.json"
+    if error is not None:
+        state = "error"
+    elif AsyncSyncScheduler._is_conflict(result):
+        state = "conflict"
+    elif AsyncSyncScheduler._sync_success(result):
+        state = "success"
+    else:
+        state = "error"
+    now = _now()
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "library": str(root_path),
+        "status": state,
+        "generation": 0,
+        "attempt": 1,
+        "pid": os.getpid(),
+        "updated_at": now,
+        "finished_at": now,
+        "reason": _redact(reason),
+    }
+    if result is not None:
+        payload["result"] = _sanitize(result)
+    if error is not None:
+        payload["error"] = _redact(error)
+    elif state == "error":
+        payload["error"] = _redact((result or {}).get("error") if isinstance(result, dict) else "sync failed")
+    try:
+        _atomic_json(path, payload)
+    except OSError:
+        pass
+    return payload
+
+
+def _run_detached_worker(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run a single detached Unified Memory Git sync.")
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--branch", default="")
+    parser.add_argument("--reason", default="memory write")
+    parser.add_argument("--state-dir", default="")
+    args = parser.parse_args(argv)
+
+    scheduler = AsyncSyncScheduler(
+        debounce_seconds=0.0,
+        max_retries=1,
+        retry_backoff=2.0,
+        state_dir=args.state_dir or None,
+    )
+    try:
+        scheduler.enqueue(
+            args.root,
+            sync_config={
+                "driver": "git",
+                "remote": args.remote,
+                "branch": args.branch,
+                "auto_push": True,
+            },
+            mode="rw",
+            reason=args.reason,
+        )
+        result = scheduler.wait_for_idle(args.root, timeout=180.0)
+        return 0 if result.get("status") in {"success", "conflict"} else 1
+    finally:
+        scheduler.shutdown()
+
+
 # Short alias for callers that prefer the less verbose name.
 SyncScheduler = AsyncSyncScheduler
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_detached_worker())

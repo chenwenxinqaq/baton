@@ -34,6 +34,7 @@ from library_paths import (
     validate_mount_id,
 )
 import audit_log
+import async_sync
 import sync_git
 
 
@@ -2190,6 +2191,8 @@ def sync_libraries(target="all", *, pull_only=False, push_only=False, status_onl
             pull_only=pull_only,
             push_only=push_only,
         )
+        if lib["mode"] == "rw" and sync_cfg.get("auto_push"):
+            async_sync.record_external_result(lib["path"], result=res, reason="cli sync")
         results.append({"library": lib["id"], **res})
     return {"results": results}
 
@@ -2566,8 +2569,10 @@ def main():
         sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
         from server import WorkspaceStore, compact_list_entry, compact_search_hit
         started = time.monotonic()
+        scheduler = async_sync.DetachedSyncScheduler() if args.command == "write" else None
+        store = None
         try:
-            store = WorkspaceStore(MEMORY_ROOT)
+            store = WorkspaceStore(MEMORY_ROOT, async_scheduler=scheduler)
             if args.command == "list":
                 result = store.list_entries(
                     library=args.library or "*",
@@ -2625,6 +2630,9 @@ def main():
             elapsed_ms = int((time.monotonic() - started) * 1000)
             _record_cli_audit(args.command, args, None, False, elapsed_ms, error=str(exc))
             parser.exit(1, f"{exc}\n")
+        finally:
+            if store is not None:
+                store.shutdown()
         output_text = json.dumps(result, ensure_ascii=False, indent=2)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _record_cli_audit(args.command, args, result, True, elapsed_ms, output_text=output_text)

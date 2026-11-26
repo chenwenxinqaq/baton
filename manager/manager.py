@@ -49,7 +49,7 @@ import memory_import  # noqa: E402
 import secret_guard  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
-from async_sync import AsyncSyncScheduler  # noqa: E402
+from async_sync import AsyncSyncScheduler, is_stale_active, record_external_result  # noqa: E402
 
 LAYERS = {
     "L0": ("操作约束", "feedback", "操作红线、只读范围与环境授权边界"),
@@ -1836,7 +1836,10 @@ def render_library_sync_bar(library, key, token, tab=""):
     if sync_cfg.get("auto_push") and library.mode == "rw":
         async_state = str(async_status.get("status") or "").casefold()
         if async_state in {"pending", "running"}:
-            parts.append('<span class="chip-ok">⟳ 后台同步中</span>')
+            if is_stale_active(async_status):
+                parts.append('<span class="chip-warn">! 上次后台同步未完成</span>')
+            else:
+                parts.append('<span class="chip-ok">⟳ 后台同步中</span>')
         elif async_state == "conflict":
             parts.append('<span class="chip-warn">⚠ 后台同步有冲突</span>')
         elif async_state == "error":
@@ -4409,6 +4412,8 @@ class Handler(BaseHTTPRequestHandler):
                 sync_git.test_remote_access(library.root, remote, browser_login=interactive)
                 return query(library=key, view="sync_hub", notice="remote_readable")
             result = sync_git.sync(library.root, remote=remote, branch=cfg.get("branch") or "", mode=library.mode)
+            if cfg.get("auto_push") and library.mode == "rw":
+                record_external_result(library.root, result=result, reason="manual sync")
             if result.get("status") == "needs_manual_merge":
                 return query(library=key, view="conflicts", notice="synced_conflicts")
             return query(library=key, tab=tab, view=return_view, notice="synced")
@@ -5327,6 +5332,9 @@ def main():
             issues=mount_issues,
             async_scheduler=async_scheduler,
         )
+        for lib in libraries.values():
+            if lib.mode == "rw" and (lib.sync_config or {}).get("auto_push"):
+                async_scheduler.recover_stale(lib.root, sync_config=lib.sync_config, mode=lib.mode)
         server = HTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:

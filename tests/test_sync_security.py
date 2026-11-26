@@ -332,6 +332,57 @@ class SyncSecurityTests(unittest.TestCase):
                 ).stdout.strip()
                 self.assertEqual(upstream, "origin/main")
 
+    def test_macos_pac_proxy_parsing_and_fallback(self):
+        self.assertEqual(
+            sync_git._parse_pac_result("HTTPS proxy.example.com:8894; DIRECT"),
+            "https://proxy.example.com:8894",
+        )
+        self.assertEqual(
+            sync_git._parse_pac_result("PROXY 127.0.0.1:7890; DIRECT"),
+            "http://127.0.0.1:7890",
+        )
+        self.assertEqual(
+            sync_git._parse_pac_result("SOCKS5 127.0.0.1:1080; DIRECT"),
+            "socks5h://127.0.0.1:1080",
+        )
+        self.assertEqual(sync_git._parse_pac_result("DIRECT"), "")
+        self.assertEqual(sync_git._parse_pac_result("HTTPS bad host:80"), "")
+
+        if sys.platform == "darwin":
+            pac_js = (
+                "function FindProxyForURL(url, host) {"
+                "  if (dnsDomainIs(host, 'github.com')) return 'HTTPS pac.example.com:8894; DIRECT';"
+                "  return 'DIRECT';"
+                "}"
+            )
+            self.assertEqual(
+                sync_git._eval_pac_script(pac_js, "https://github.com/", "github.com"),
+                "HTTPS pac.example.com:8894; DIRECT",
+            )
+            self.assertEqual(
+                sync_git._eval_pac_script(pac_js, "https://example.org/", "example.org"),
+                "DIRECT",
+            )
+            # Infinite loop must be cut off cleanly instead of hanging.
+            self.assertEqual(
+                sync_git._eval_pac_script("function FindProxyForURL(){ while(true){} }", "https://github.com/", "github.com"),
+                "",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"HOME": tmp, "PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1"}
+            with mock.patch.object(sync_git.sys, "platform", "darwin"), \
+                    mock.patch.object(sync_git, "getproxies", return_value={}), \
+                    mock.patch.object(sync_git, "proxy_bypass", return_value=False), \
+                    mock.patch.object(sync_git, "_resolve_macos_pac_proxy", return_value="https://pac.example.com:8894"):
+                opts = sync_git._github_proxy_options(Path(tmp), env, "https://github.com/o/r.git")
+                self.assertEqual(opts, ["-c", "http.https://github.com/.proxy=https://pac.example.com:8894"])
+                # Respect explicit env override.
+                self.assertEqual(
+                    sync_git._github_proxy_options(Path(tmp), {**env, "HTTPS_PROXY": ""}, "https://github.com/o/r.git"),
+                    [],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
