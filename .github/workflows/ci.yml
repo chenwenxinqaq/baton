@@ -32,6 +32,70 @@ jobs:
           git config --global user.email "ci@example.invalid"
       - name: Run the Python tests
         run: python -B -m unittest discover -s tests
+      - name: Smoke-test the packaged CLI archive
+        run: |
+          python -B scripts/package_release.py --cli
+          python -B - <<'PY'
+          from hashlib import sha256
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+
+          dist = Path("dist")
+          archive = dist / "unified-memory-cli.tar.gz"
+          expected = (dist / "unified-memory-cli.tar.gz.sha256").read_text(encoding="utf-8").split()[0]
+          assert sha256(archive.read_bytes()).hexdigest() == expected
+
+          with tempfile.TemporaryDirectory() as tmp:
+              base = Path(tmp)
+              with tarfile.open(archive, "r:gz") as tar:
+                  tar.extractall(base)
+              cli_root = base / "unified-memory-cli"
+              home = base / "home"
+              home.mkdir()
+              lib = base / "library"
+              env = {
+                  **os.environ,
+                  "HOME": str(home),
+                  "UNIFIED_MEMORY_ROOT": str(lib),
+                  "PYTHONDONTWRITEBYTECODE": "1",
+              }
+              subprocess.run([sys.executable, str(cli_root / "bin/umem"), "init"], env=env, cwd=home, check=True)
+              subprocess.run(
+                  [
+                      sys.executable,
+                      str(cli_root / "bin/umem"),
+                      "write",
+                      "--layer",
+                      "L1",
+                      "--name",
+                      "ci-smoke",
+                      "--title",
+                      "CI smoke",
+                      "--description",
+                      "Packaged CLI smoke check",
+                      "--verified-at",
+                      "2026-11-26",
+                      "--body",
+                      "Verified in packaged archive.",
+                  ],
+                  env=env,
+                  cwd=home,
+                  check=True,
+              )
+              req = json.dumps(
+                  {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_lint", "arguments": {}}}
+              )
+              out = subprocess.check_output(
+                  [sys.executable, str(cli_root / "mcp/server.py")], input=req + "\n", env=env, cwd=home, text=True
+              )
+              assert not json.loads(out)["result"].get("isError"), out
+              subprocess.run([sys.executable, str(cli_root / "manager/manager.py"), "--help"], env=env, cwd=home, check=True)
+          PY
 
   desktop:
     name: Desktop updater tests
