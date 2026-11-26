@@ -668,8 +668,7 @@ class Library:
             md_file = self.root / rel_path
             if md_file.is_file():
                 try:
-                    raw = md_file.read_text(encoding="utf-8", errors="replace")
-                    meta, _ = mcp_server.parse_frontmatter(raw)
+                    meta, _ = mcp_server.load_entry(md_file)
                     cre_at, upd_at, cre_ep, upd_ep = mcp_server.file_timestamps(md_file, meta)
                     enriched[rel_path] = replace(
                         t,

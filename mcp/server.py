@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import sys
+import threading
 import time
 from tempfile import NamedTemporaryFile
 
@@ -662,10 +663,40 @@ def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
     return 0, []
 
 
+_ENTRY_CACHE = {}
+_ENTRY_CACHE_LOCK = threading.Lock()
+ENTRY_CACHE_LIMIT = 20000
+# A file changed this recently can change again without its timestamps moving on a
+# filesystem with coarse timestamps, so it is read from disk until it settles.
+ENTRY_CACHE_SETTLE_NS = 2_000_000_000
+
+
 def load_entry(path):
-    """Read one Markdown entry and return its frontmatter fields and body."""
+    """Read one Markdown entry and return its frontmatter fields and body.
+
+    Search and listing read every entry on each call. The parsed result is kept
+    in memory and reused while the file's modification time, change time, size
+    and inode all stay the same.
+    """
+    path = Path(path)
+    stat = path.stat()
+    stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+    key = str(path)
+    with _ENTRY_CACHE_LOCK:
+        hit = _ENTRY_CACHE.get(key)
+    if hit and hit[0] == stamp:
+        return dict(hit[1]), hit[2]
     # Match the Web manager: a stray non-UTF-8 file must not break every query.
-    return parse_frontmatter(Path(path).read_text(encoding="utf-8", errors="replace"))
+    meta, body = parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+    settled = time.time_ns() - max(stat.st_mtime_ns, stat.st_ctime_ns) > ENTRY_CACHE_SETTLE_NS
+    with _ENTRY_CACHE_LOCK:
+        if settled:
+            if len(_ENTRY_CACHE) >= ENTRY_CACHE_LIMIT:
+                _ENTRY_CACHE.clear()
+            _ENTRY_CACHE[key] = (stamp, meta, body)
+        else:
+            _ENTRY_CACHE.pop(key, None)
+    return dict(meta), body
 
 
 def relevance(raw_terms, subtokens, procedure_variants, name, title, description, body):
@@ -1012,9 +1043,7 @@ class MemoryStore:
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
-                # Match the Web manager: a stray non-UTF-8 file must not break every query.
-                raw = md.read_text(encoding="utf-8", errors="replace")
-                meta, body = parse_frontmatter(raw)
+                meta, body = load_entry(md)
                 cre_at, upd_at, cre_ep, upd_ep = file_timestamps(md, meta)
                 idx = indexed.get(rel, {})
                 verified_at = (meta.get("verified_at") or "").strip()
@@ -1049,9 +1078,7 @@ class MemoryStore:
                 if md.name == "README.md" or sync_git.is_conflict_filename(md.name):
                     continue
                 rel = md.relative_to(self.root).as_posix()
-                # Match the Web manager: a stray non-UTF-8 file must not break every query.
-                raw = md.read_text(encoding="utf-8", errors="replace")
-                meta, body = parse_frontmatter(raw)
+                meta, body = load_entry(md)
                 status = meta.get("status", "active")
                 if status == "archived" and not include_archived:
                     continue
