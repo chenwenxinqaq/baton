@@ -4,7 +4,6 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 from hashlib import sha256
 import json
 import os
@@ -27,8 +26,10 @@ from library_paths import (
     library_unavailable_reason,
     load_mounts_config,
     library_seed_files,
+    lock_file,
     normalize_layers,
     resolve_libraries,
+    unlock_file,
     update_mounts_config,
     validate_library_path,
     validate_mount_id,
@@ -212,11 +213,11 @@ def integration_lock():
     """Serialize config mutations using an advisory flock."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_FILE.open("a+", encoding="utf-8") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        lock_file(lock_fh.fileno())
         try:
             yield
         finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            unlock_file(lock_fh.fileno())
 
 
 def parse_skill_frontmatter(skill_md_path):

@@ -2,7 +2,6 @@
 
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-import fcntl
 from hashlib import sha256
 import json
 import os
@@ -10,7 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 
-from library_paths import _atomic_write_json, library_state_dir
+from library_paths import _atomic_write_json, library_state_dir, lock_file, unlock_file
 
 
 CLIENTS = {
@@ -43,8 +42,11 @@ def review_lock(root, client):
     directory = inbox(root, client)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / ".lock").open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
+        lock_file(handle.fileno())
+        try:
+            yield
+        finally:
+            unlock_file(handle.fileno())
 
 
 def _session_date(value):

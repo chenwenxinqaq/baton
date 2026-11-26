@@ -10,14 +10,13 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import time
 
-from library_paths import global_state_dir
+from library_paths import global_state_dir, lock_file, unlock_file
 
 MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
@@ -89,11 +88,11 @@ def _audit_lock(path):
     lock_path = path.with_name(path.name + ".lock")
     fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_file(fd)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_file(fd)
         finally:
             os.close(fd)
 

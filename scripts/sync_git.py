@@ -3,7 +3,6 @@
 from contextlib import contextmanager
 import ctypes
 from datetime import datetime
-import fcntl
 import getpass
 import json
 import os
@@ -20,7 +19,7 @@ from tempfile import NamedTemporaryFile
 from urllib.parse import unquote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass
 
-from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir
+from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir, lock_file, unlock_file
 
 
 LAYER_HEADINGS = (
@@ -238,11 +237,11 @@ def _state_lock(root, filename):
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_file(fd)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_file(fd)
     finally:
         os.close(fd)
 

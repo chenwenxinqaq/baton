@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 import difflib
 import errno
-import fcntl
 from hashlib import sha256
 from html import escape
 from http import HTTPStatus
@@ -41,8 +40,10 @@ from library_paths import (
     data_root,
     library_state_dir,
     library_unavailable_reason,
+    lock_file,
     resolve_libraries,
     unavailable_issue,
+    unlock_file,
 )
 import audit_log  # noqa: E402
 import memory_import  # noqa: E402
@@ -537,11 +538,11 @@ class Library:
         """Serialize concurrent writes with MCP servers."""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            lock_file(fh.fileno())
             try:
                 yield
             finally:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                unlock_file(fh.fileno())
 
     def _backup_to_trash(self, src_path, slug_hint):
         """Save a safety backup copy into .state/trash/ before deleting a memory."""

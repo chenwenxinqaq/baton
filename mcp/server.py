@@ -5,7 +5,6 @@ import argparse
 from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-import fcntl
 import json
 import math
 import os
@@ -24,7 +23,9 @@ from library_paths import (
     config_signature,
     data_root,
     library_state_dir,
+    lock_file,
     resolve_libraries,
+    unlock_file,
 )
 import audit_log
 import memory_lint
@@ -718,11 +719,11 @@ class MemoryStore:
         """Serialize concurrent writes across multiple MCP servers and Web UI."""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            lock_file(fh.fileno())
             try:
                 yield
             finally:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                unlock_file(fh.fileno())
 
     def _similar_entries(self, query, name, limit=3):
         """Find existing entries on the same topic so a new write can merge instead of fork."""

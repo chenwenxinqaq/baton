@@ -165,6 +165,8 @@ def _try_lock(fd):
         return True
     if msvcrt is not None:  # pragma: no cover - Windows only
         try:
+            # msvcrt locks a byte range starting at the file position.
+            os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError:
             return False
@@ -176,9 +178,24 @@ def _unlock(fd):
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_UN)
         elif msvcrt is not None:  # pragma: no cover - Windows only
+            os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     except OSError:
         pass
+
+
+def lock_file(fd):
+    """Block until this process holds the exclusive advisory lock on ``fd``."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while not _try_lock(fd):  # pragma: no cover - Windows only
+        time.sleep(0.05)
+
+
+def unlock_file(fd):
+    """Release a lock taken with ``lock_file``."""
+    _unlock(fd)
 
 
 @contextmanager
