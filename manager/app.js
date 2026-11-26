@@ -771,4 +771,299 @@
         });
     }
   });
+
+  // Desktop software updater UI (only active inside Electron where preload exposes window.umemDesktop).
+  const desktopApi = window.umemDesktop;
+  const railVersionEl = document.getElementById("rail-version");
+  const updateBannerEl = document.getElementById("app-update-banner");
+  if (desktopApi && (railVersionEl || updateBannerEl)) {
+    const formatBytes = (bytes) => {
+      const n = Number(bytes || 0);
+      if (!Number.isFinite(n) || n <= 0) return "";
+      if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+      if (n >= 1024) return `${(n / 1024).toFixed(0)} KB`;
+      return `${n} B`;
+    };
+    const makeBtn = (label, cls, onClick, disabled) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = cls;
+      btn.textContent = label;
+      if (disabled) btn.disabled = true;
+      if (onClick) btn.addEventListener("click", onClick);
+      return btn;
+    };
+    const firstSummaryLine = (notes) => {
+      const lines = String(notes || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) return "";
+      const text = lines[0].replace(/^#+\s*/, "");
+      return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+    };
+    const isSnoozed = (version) => {
+      try { return Boolean(version && sessionStorage.getItem("umem_update_snooze") === version); } catch { return false; }
+    };
+    const setSnoozed = (version) => {
+      try {
+        if (version) sessionStorage.setItem("umem_update_snooze", version);
+        else sessionStorage.removeItem("umem_update_snooze");
+      } catch {}
+    };
+
+    let latestState = null;
+    let upToDateUntil = 0;
+    let upToDateTimer = null;
+    const renderUpdateUi = (state) => {
+      if (!state || typeof state !== "object") return;
+      latestState = state;
+
+      if (railVersionEl) {
+        railVersionEl.replaceChildren();
+        railVersionEl.hidden = false;
+        const verSpan = document.createElement("span");
+        verSpan.className = "rail-ver-tag";
+        verSpan.textContent = state.currentVersion ? `v${state.currentVersion}` : "";
+        railVersionEl.appendChild(verSpan);
+
+        let btnLabel = "检查更新";
+        let btnClass = "rail-ver-btn";
+        let btnDisabled = false;
+        let btnAction = () => {
+          setSnoozed("");
+          desktopApi.checkForUpdates().then((next) => {
+            if (next && next.status === "up-to-date") {
+              upToDateUntil = Date.now() + 4500;
+              if (upToDateTimer) clearTimeout(upToDateTimer);
+              upToDateTimer = setTimeout(() => {
+                upToDateUntil = 0;
+                renderUpdateUi(latestState);
+              }, 4600);
+            }
+            renderUpdateUi(next);
+          }).catch(() => {});
+        };
+
+        if (state.status === "checking") {
+          btnLabel = "检查中…";
+          btnDisabled = true;
+        } else if (state.status === "downloading") {
+          const pct = state.progress && typeof state.progress.percent === "number" ? `${state.progress.percent}%` : "";
+          btnLabel = pct ? `下载 ${pct}` : "下载中…";
+          btnClass = "rail-ver-btn is-available";
+          btnDisabled = true;
+        } else if (state.status === "verifying") {
+          btnLabel = "校验中…";
+          btnClass = "rail-ver-btn is-available";
+          btnDisabled = true;
+        } else if (state.status === "ready") {
+          btnLabel = "重启更新";
+          btnClass = "rail-ver-btn is-ready";
+          btnAction = () => desktopApi.installUpdate().then(renderUpdateUi).catch(() => {});
+        } else if (state.status === "installing") {
+          btnLabel = "安装中…";
+          btnClass = "rail-ver-btn is-ready";
+          btnDisabled = true;
+        } else if (state.status === "available" && state.latestVersion) {
+          btnLabel = `更新 v${state.latestVersion}`;
+          btnClass = "rail-ver-btn is-available";
+          btnAction = () => {
+            setSnoozed("");
+            if (state.canAutoInstall) {
+              desktopApi.downloadUpdate().then(renderUpdateUi).catch(() => {});
+            } else {
+              desktopApi.openReleasePage(state.releaseUrl).catch(() => {});
+            }
+          };
+        } else if (state.status === "error") {
+          btnLabel = "重试更新";
+          btnClass = "rail-ver-btn is-error";
+        } else if (state.status === "up-to-date" && Date.now() < upToDateUntil) {
+          btnLabel = "已是最新";
+          btnClass = "rail-ver-btn is-ready";
+        }
+        railVersionEl.appendChild(makeBtn(btnLabel, btnClass, btnAction, btnDisabled));
+      }
+
+      if (!updateBannerEl) return;
+      updateBannerEl.replaceChildren();
+      updateBannerEl.className = "update-banner";
+
+      const mountBanner = ({ variant = "", title, detail = "", progress = null, actions = [] }) => {
+        if (variant) updateBannerEl.classList.add(variant);
+        const main = document.createElement("div");
+        main.className = "update-banner-main";
+        const titleEl = document.createElement("div");
+        titleEl.className = "update-banner-title";
+        titleEl.textContent = title;
+        main.appendChild(titleEl);
+        if (detail) {
+          const detailEl = document.createElement("div");
+          detailEl.className = "update-banner-detail";
+          detailEl.textContent = detail;
+          main.appendChild(detailEl);
+        }
+        if (progress) {
+          const bar = document.createElement("progress");
+          bar.className = "update-progress";
+          if (typeof progress.percent === "number") {
+            bar.max = 100;
+            bar.value = progress.percent;
+          }
+          main.appendChild(bar);
+        }
+        updateBannerEl.appendChild(main);
+        if (actions.length) {
+          const box = document.createElement("div");
+          box.className = "update-banner-actions";
+          for (const btn of actions) box.appendChild(btn);
+          updateBannerEl.appendChild(box);
+        }
+        updateBannerEl.hidden = false;
+      };
+
+      const skipped = Boolean(
+        state.latestVersion && (state.skippedVersion === state.latestTag || state.skippedVersion === state.latestVersion)
+      );
+
+      if (state.notice && state.notice.message) {
+        const isErr = state.notice.kind === "error";
+        const actions = [
+          makeBtn("知道了", "btn btn-ghost btn-compact", () => {
+            desktopApi.dismissNotice().then(renderUpdateUi).catch(() => {});
+          }),
+        ];
+        if (isErr) {
+          actions.unshift(
+            makeBtn("查看日志", "btn btn-ghost btn-compact", () => desktopApi.openUpdateLog().catch(() => {})),
+            makeBtn("前往发布页", "btn btn-primary btn-compact", () => desktopApi.openReleasePage(state.releaseUrl).catch(() => {}))
+          );
+        }
+        mountBanner({
+          variant: isErr ? "is-error" : "is-success",
+          title: state.notice.message,
+          detail: state.notice.detail || "",
+          actions,
+        });
+        return;
+      }
+
+      if (state.status === "downloading") {
+        const p = state.progress || {};
+        const parts = [];
+        if (p.transferred) {
+          parts.push(p.total ? `${formatBytes(p.transferred)} / ${formatBytes(p.total)}` : formatBytes(p.transferred));
+        }
+        if (p.bytesPerSecond) parts.push(`${formatBytes(p.bytesPerSecond)}/s`);
+        const pctText = typeof p.percent === "number" ? `（${p.percent}%）` : "";
+        mountBanner({
+          title: `正在下载 Unified Memory ${state.latestVersion}${pctText}`,
+          detail: parts.join(" · ") || "下载完成后将自动校验 SHA-256 与应用签名。",
+          progress: p,
+          actions: [
+            makeBtn("取消", "btn btn-ghost btn-compact", () => {
+              desktopApi.cancelDownload().then(renderUpdateUi).catch(() => {});
+            }),
+          ],
+        });
+        return;
+      }
+
+      if (state.status === "verifying") {
+        mountBanner({
+          title: `正在校验 Unified Memory ${state.latestVersion} 更新包…`,
+          detail: "正在解压并验证 Bundle ID、版本号、签名与内嵌运行环境。",
+          progress: {},
+        });
+        return;
+      }
+
+      if (state.status === "installing") {
+        mountBanner({
+          variant: "is-success",
+          title: `正在安装 Unified Memory ${state.latestVersion}…`,
+          detail: "应用将自动退出、原子替换程序包并重新打开，记忆库不受影响。",
+        });
+        return;
+      }
+
+      if (state.status === "ready" && state.latestVersion && !isSnoozed(`ready:${state.latestVersion}`)) {
+        mountBanner({
+          variant: "is-success",
+          title: `Unified Memory ${state.latestVersion} 已校验就绪`,
+          detail: "重启后将自动替换当前应用并刷新客户端启动器；异常时自动回滚，记忆库不受影响。",
+          actions: [
+            makeBtn("立即重启并安装", "btn btn-primary btn-compact", () => {
+              desktopApi.installUpdate().then(renderUpdateUi).catch(() => {});
+            }),
+            makeBtn("稍后", "btn btn-ghost btn-compact", () => {
+              setSnoozed(`ready:${state.latestVersion}`);
+              renderUpdateUi(latestState);
+            }),
+          ],
+        });
+        return;
+      }
+
+      if (state.status === "available" && state.latestVersion && !skipped && !isSnoozed(`avail:${state.latestVersion}`)) {
+        const summary = firstSummaryLine(state.releaseNotes);
+        const detail = state.canAutoInstall
+          ? (summary || `当前版本 ${state.currentVersion}，支持应用内一键下载、SHA-256 校验与安全替换。`)
+          : (state.installBlockDetail || `当前版本 ${state.currentVersion}，请前往 GitHub 发布页下载替换。`);
+        const actions = [];
+        if (state.canAutoInstall) {
+          actions.push(makeBtn("立即下载并更新", "btn btn-primary btn-compact", () => {
+            desktopApi.downloadUpdate().then(renderUpdateUi).catch(() => {});
+          }));
+        } else {
+          actions.push(makeBtn("前往发布页", "btn btn-primary btn-compact", () => {
+            desktopApi.openReleasePage(state.releaseUrl).catch(() => {});
+          }));
+        }
+        actions.push(makeBtn("查看更新说明", "btn btn-ghost btn-compact", () => {
+          desktopApi.openReleasePage(state.releaseUrl).catch(() => {});
+        }));
+        actions.push(makeBtn("跳过此版本", "btn btn-ghost btn-compact", () => {
+          desktopApi.skipUpdate(state.latestTag || state.latestVersion).then(renderUpdateUi).catch(() => {});
+        }));
+        actions.push(makeBtn("稍后", "btn btn-ghost btn-compact", () => {
+          setSnoozed(`avail:${state.latestVersion}`);
+          renderUpdateUi(latestState);
+        }));
+        mountBanner({
+          title: `发现新版本 Unified Memory ${state.latestVersion}`,
+          detail,
+          actions,
+        });
+        return;
+      }
+
+      if (state.status === "error" && state.error) {
+        mountBanner({
+          variant: "is-error",
+          title: "自动更新未完成",
+          detail: state.error,
+          actions: [
+            makeBtn("重试", "btn btn-primary btn-compact", () => {
+              if (state.latestVersion && state.canAutoInstall) {
+                desktopApi.downloadUpdate().then(renderUpdateUi).catch(() => {});
+              } else {
+                desktopApi.checkForUpdates().then(renderUpdateUi).catch(() => {});
+              }
+            }),
+            makeBtn("前往发布页", "btn btn-ghost btn-compact", () => {
+              desktopApi.openReleasePage(state.releaseUrl).catch(() => {});
+            }),
+            makeBtn("查看日志", "btn btn-ghost btn-compact", () => {
+              desktopApi.openUpdateLog().catch(() => {});
+            }),
+          ],
+        });
+        return;
+      }
+
+      updateBannerEl.hidden = true;
+    };
+
+    desktopApi.onUpdateState(renderUpdateUi);
+    desktopApi.getUpdateState().then(renderUpdateUi).catch(() => {});
+  }
 })();

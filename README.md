@@ -50,7 +50,9 @@ cd unified-memory-cli
 
 ### 本地构建
 
-在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP。构建脚本校验 Python 和 [Dugite Native v2.56.1](https://github.com/desktop/dugite-native/tree/v2.56.1) 发行包的 SHA-256，首次构建需要联网。Dugite 提供 Git 和 [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager/tree/v2.9.1)，许可证位于应用的 `Contents/Resources/licenses`。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。因此桌面端不做静默自动更新：打包后的应用每天向 GitHub 查询一次最新版本号，发现新版时提示前往发布页下载 ZIP 替换；可在应用菜单关闭「自动检查更新」，或随时点「检查更新…」。
+在 Apple 芯片 Mac 上用 Node.js 22.12+、npm、Python 3 和 macOS 命令行工具构建。源码开发使用 `cd desktop && npm ci && npm start`。在同一目录运行 `npm run package` 可生成桌面 ZIP 及 `.sha256` 校验文件。构建脚本校验 Python 和 [Dugite Native v2.56.1](https://github.com/desktop/dugite-native/tree/v2.56.1) 发行包的 SHA-256，首次构建需要联网。Dugite 提供 Git 和 [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager/tree/v2.9.1)，许可证位于应用的 `Contents/Resources/licenses`。另可提供同架构的可迁移运行时目录 `UMEM_PYTHON_DIST`。桌面产物为本地 ad-hoc 签名；正式面向公众分发还需 Developer ID 签名和 Apple 公证。
+
+桌面版内置应用内更新器（不使用会拒绝 ad-hoc 签名的 Squirrel.Mac）：打包后的应用每天检查一次 GitHub 最新版本（支持 ETag 缓存与网页发布页降级，避免 60 次/小时的 API 限流）；发现新版后可在窗口顶部更新条或菜单栏一键下载，自动校验 SHA-256、`CFBundleIdentifier`、版本号、`codesign --verify --deep --strict` 与内嵌运行环境，并在退出后原子替换当前 `.app`（异常自动回滚）、重启并运行 `umem doctor --fix` 刷新启动器与客户端规则。若应用运行在只读磁盘镜像、App Translocation 隔离路径或无写权限目录，会自动提示原因并提供发布页手动下载入口。可在应用菜单关闭「自动检查更新」，或随时点「检查更新…」。
 
 在仓库根目录运行 `python3 scripts/package_release.py --cli` 单独生成 CLI 包。两个发行包都位于 `dist/`。分发内容来自公开文件清单。
 

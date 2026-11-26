@@ -1,42 +1,43 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, net, session, shell } = require('electron');
-const { spawn } = require('node:child_process');
+const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, net, session, shell } = require('electron');
+const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline');
+const {
+  RELEASES_URL,
+  REPO_URL,
+  consumeUpdateResult,
+  createUpdateController,
+  pruneOldUpdateDirs,
+  readJsonSafe,
+  writeJsonAtomic,
+} = require('./updater.cjs');
 
 app.setName('Unified Memory');
-const REPO_URL = 'https://github.com/chenwenxinqaq/baton';
-const RELEASES_URL = REPO_URL + '/releases/latest';
-const LATEST_RELEASE_API = 'https://api.github.com/repos/chenwenxinqaq/baton/releases/latest';
-const UPDATE_INTERVAL = 24 * 60 * 60 * 1000;
+const UPDATE_CHECK_POLL_MS = 6 * 60 * 60 * 1000;
 let win;
 let backend;
 let origin;
 let quitting = false;
 let tray;
+let rebuildTrayMenu = () => {};
 let openedAtLogin = false;
+let updater;
+let lastMenuKey = '';
 
 function prefsFile() { return path.join(app.getPath('userData'), 'prefs.json'); }
+function updateCacheRoot() { return path.join(app.getPath('userData'), 'updates'); }
+function updateResultFile() { return path.join(app.getPath('userData'), 'update-result.json'); }
+function updateLogFile() { return path.join(app.getPath('userData'), 'updater.log'); }
+
 function readPrefs() {
-  try { return JSON.parse(fs.readFileSync(prefsFile(), 'utf8')); } catch { return {}; }
+  return readJsonSafe(prefsFile(), {});
 }
+
 function writePrefs(patch) {
-  fs.mkdirSync(app.getPath('userData'), { recursive: true });
-  fs.writeFileSync(prefsFile(), JSON.stringify({ ...readPrefs(), ...patch }, null, 2));
-}
-
-function versionParts(value) {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(value || '').trim());
-  return match ? match.slice(1).map(Number) : null;
-}
-
-function isNewerVersion(latest, current) {
-  const a = versionParts(latest), b = versionParts(current);
-  if (!a || !b) return false;
-  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
-  return false;
+  writeJsonAtomic(prefsFile(), { ...readPrefs(), ...patch });
 }
 
 function messageBox(options) {
@@ -45,45 +46,313 @@ function messageBox(options) {
 
 function autoUpdateCheckEnabled() { return readPrefs().autoUpdateCheck !== false; }
 
-// Only the release tag is requested from GitHub; memory content never leaves the machine here.
-async function checkForUpdates(manual) {
-  let release;
-  try {
-    const response = await net.fetch(LATEST_RELEASE_API, { headers: {
-      Accept: 'application/vnd.github+json', 'User-Agent': `UnifiedMemory/${app.getVersion()}` } });
-    if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
-    release = await response.json();
-  } catch (error) {
-    if (manual) await messageBox({ type: 'warning', message: '暂时无法检查更新', detail: String(error.message || error) });
-    return;
+function openSafeExternal(targetUrl) {
+  const isRepo = typeof targetUrl === 'string' && (targetUrl === REPO_URL || targetUrl.startsWith(REPO_URL + '/'));
+  const url = isRepo ? targetUrl : RELEASES_URL;
+  return shell.openExternal(url);
+}
+
+function formatUpdateMenuLabel(state) {
+  if (!state) return '检查更新…';
+  if (state.status === 'checking') return '正在检查更新…';
+  if (state.status === 'downloading') return '正在下载更新…';
+  if (state.status === 'verifying') return '正在校验更新包…';
+  if (state.status === 'ready') return `重启并安装 ${state.latestVersion}…`;
+  if (state.status === 'installing') return '正在安装更新…';
+  if (state.status === 'available' && state.latestVersion) return `发现新版本 ${state.latestVersion}…`;
+  return '检查更新…';
+}
+
+function syncUpdateChrome(state) {
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('umem:update-state', state);
   }
-  writePrefs({ lastUpdateCheck: Date.now() });
-  const latest = typeof release?.tag_name === 'string' ? release.tag_name.trim() : '';
-  const current = app.getVersion();
-  if (!isNewerVersion(latest, current)) {
-    if (manual) await messageBox({ type: 'info', message: '已是最新版本', detail: `当前版本 ${current}。` });
-    return;
+  if (tray) {
+    if (state.status === 'downloading' && typeof state.progress?.percent === 'number') {
+      tray.setToolTip(`Unified Memory · 正在下载 ${state.latestVersion} (${state.progress.percent}%)`);
+    } else if (state.status === 'ready' && state.latestVersion) {
+      tray.setToolTip(`Unified Memory · 新版本 ${state.latestVersion} 已就绪，点击重启安装`);
+    } else if (state.status === 'available' && state.latestVersion) {
+      tray.setToolTip(`Unified Memory · 发现新版本 ${state.latestVersion}`);
+    } else {
+      tray.setToolTip('Unified Memory');
+    }
   }
-  if (!manual && readPrefs().skippedVersion === latest) return;
-  const page = typeof release.html_url === 'string' && release.html_url.startsWith(REPO_URL + '/releases/')
-    ? release.html_url : RELEASES_URL;
-  const { response } = await messageBox({
-    type: 'info', buttons: ['前往下载', '跳过此版本', '稍后'], defaultId: 0, cancelId: 2,
-    message: `Unified Memory ${latest.replace(/^v/, '')} 已发布`,
-    detail: `当前版本 ${current}。下载 ZIP 后替换「应用程序」中的 Unified Memory，记忆库不受影响。`
+  const label = formatUpdateMenuLabel(state);
+  const key = `${label}|${state.autoCheck ? 1 : 0}`;
+  if (key !== lastMenuKey) {
+    lastMenuKey = key;
+    if (origin) {
+      installMenu();
+      rebuildTrayMenu();
+    }
+  }
+}
+
+function ensureUpdater() {
+  if (updater) return updater;
+  updater = createUpdateController({
+    currentVersion: app.getVersion(),
+    arch: process.arch,
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+    execPath: process.execPath,
+    cacheRoot: updateCacheRoot(),
+    logFile: updateLogFile(),
+    resultFile: updateResultFile(),
+    readPrefs,
+    writePrefs,
+    fetchImpl: (url, opts) => net.fetch(url, opts),
+    onStateChange: syncUpdateChrome,
   });
-  if (response === 0) shell.openExternal(page);
-  if (response === 1) writePrefs({ skippedVersion: latest });
+  return updater;
+}
+
+function formatReleaseNotesExcerpt(notes) {
+  const clean = String(notes || '').trim();
+  if (!clean) return '';
+  const lines = clean.split(/\r?\n/).filter(Boolean).slice(0, 8).join('\n');
+  return lines.length > 420 ? `${lines.slice(0, 420)}…` : lines;
+}
+
+async function triggerInstallFromUi() {
+  const ctrl = ensureUpdater();
+  const state = ctrl.getState();
+  if (state.status !== 'ready') return state;
+  try {
+    ctrl.beginInstall({ oldPid: process.pid, backendPid: backend?.pid || '' });
+    quitting = true;
+    try { backend?.stdin.end(); } catch {}
+    setTimeout(() => app.quit(), 120);
+    const forceExit = setTimeout(() => {
+      try { if (backend && backend.exitCode === null) backend.kill('SIGKILL'); } catch {}
+      app.exit(0);
+    }, 5000);
+    forceExit.unref?.();
+    return ctrl.getState();
+  } catch (error) {
+    const msg = String(error?.message || error || '启动安装程序失败');
+    await messageBox({
+      type: 'warning',
+      message: '无法自动替换应用',
+      detail: `${msg}\n\n你也可以前往 GitHub 发布页手动下载安装，记忆库数据不受影响。`,
+      buttons: ['前往发布页', '关闭'],
+      defaultId: 0,
+      cancelId: 1,
+    }).then(({ response }) => {
+      if (response === 0) openSafeExternal(state.releaseUrl);
+    });
+    return ctrl.getState();
+  }
+}
+
+async function handleUpdateMenuClick() {
+  const ctrl = ensureUpdater();
+  const current = ctrl.getState();
+  if (current.status === 'ready') {
+    const { response } = await messageBox({
+      type: 'info',
+      buttons: ['立即重启并安装', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+      message: `Unified Memory ${current.latestVersion} 已校验就绪`,
+      detail: '应用将自动退出、原子替换程序包并重新打开。记忆库数据不会受任何影响；若替换失败会自动回滚到当前版本。',
+    });
+    if (response === 0) await triggerInstallFromUi();
+    return;
+  }
+  if (current.status === 'downloading' || current.status === 'verifying' || current.status === 'installing') {
+    showWindow();
+    return;
+  }
+  await checkForUpdates(true);
+}
+
+// Only release metadata is requested from GitHub; memory content never leaves the machine here.
+async function checkForUpdates(manual) {
+  const ctrl = ensureUpdater();
+  const result = await ctrl.checkForUpdates({ manual: Boolean(manual) });
+  const state = result.snapshot;
+  if (!manual) {
+    return result;
+  }
+  if (result.error) {
+    const { response } = await messageBox({
+      type: 'warning',
+      buttons: ['重试', '打开发布页', '关闭'],
+      defaultId: 0,
+      cancelId: 2,
+      message: '暂时无法检查更新',
+      detail: `${result.error}\n\n如果当前网络受限，可以直接打开发布页或检查系统代理设置。`,
+    });
+    if (response === 0) return checkForUpdates(true);
+    if (response === 1) openSafeExternal(RELEASES_URL);
+    return result;
+  }
+  if (!result.newer) {
+    await messageBox({
+      type: 'info',
+      message: '已是最新版本',
+      detail: `当前版本 ${state.currentVersion}。`,
+    });
+    return result;
+  }
+  const notes = formatReleaseNotesExcerpt(state.releaseNotes);
+  if (state.status === 'ready') {
+    const { response } = await messageBox({
+      type: 'info',
+      buttons: ['立即重启并安装', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+      message: `Unified Memory ${state.latestVersion} 已下载就绪`,
+      detail: `当前版本 ${state.currentVersion}。${notes ? '\n\n' + notes : ''}`,
+    });
+    if (response === 0) await triggerInstallFromUi();
+    return result;
+  }
+  if (state.canAutoInstall) {
+    const { response } = await messageBox({
+      type: 'info',
+      buttons: ['立即下载并更新', '查看发布页', '跳过此版本', '稍后'],
+      defaultId: 0,
+      cancelId: 3,
+      message: `Unified Memory ${state.latestVersion} 已发布`,
+      detail: `当前版本 ${state.currentVersion}。应用将在后台下载并校验 SHA-256 与签名，记忆库不受影响。${notes ? '\n\n' + notes : ''}`,
+    });
+    if (response === 0) {
+      await showWindow();
+      const done = await ctrl.downloadUpdate();
+      if (done.status === 'ready') {
+        const prompt = await messageBox({
+          type: 'info',
+          buttons: ['立即重启并安装', '稍后'],
+          defaultId: 0,
+          cancelId: 1,
+          message: `Unified Memory ${done.latestVersion} 已校验完成`,
+          detail: '是否立即重启应用完成替换？记忆库不受影响。',
+        });
+        if (prompt.response === 0) await triggerInstallFromUi();
+      }
+    } else if (response === 1) {
+      openSafeExternal(state.releaseUrl);
+    } else if (response === 2) {
+      ctrl.skipVersion(state.latestTag);
+    }
+    return result;
+  }
+  const { response } = await messageBox({
+    type: 'info',
+    buttons: ['前往发布页下载', '跳过此版本', '稍后'],
+    defaultId: 0,
+    cancelId: 2,
+    message: `Unified Memory ${state.latestVersion} 已发布`,
+    detail: `当前版本 ${state.currentVersion}。${state.installBlockDetail}${notes ? '\n\n' + notes : ''}`,
+  });
+  if (response === 0) openSafeExternal(state.releaseUrl);
+  if (response === 1) ctrl.skipVersion(state.latestTag);
+  return result;
 }
 
 function scheduleUpdateChecks() {
   if (!app.isPackaged) return;
+  const ctrl = ensureUpdater();
   const run = () => {
-    if (autoUpdateCheckEnabled() && Date.now() - (readPrefs().lastUpdateCheck || 0) >= UPDATE_INTERVAL)
+    if (ctrl.shouldRunScheduledCheck()) {
       checkForUpdates(false).catch(() => {});
+    }
   };
   setTimeout(run, 15000);
-  setInterval(run, 6 * 60 * 60 * 1000);
+  setInterval(run, UPDATE_CHECK_POLL_MS);
+}
+
+function runPostUpgradeSync() {
+  try {
+    const { framework, python } = backendSettings();
+    const script = path.join(framework, 'scripts', 'memoryctl.py');
+    if (!fs.existsSync(script)) return;
+    execFile(python, ['-B', script, 'doctor', '--fix', '--json'], {
+      cwd: framework,
+      timeout: 30000,
+      env: {
+        ...process.env,
+        ...(app.isPackaged ? { UNIFIED_MEMORY_GIT_HOME: path.join(process.resourcesPath, 'git') } : {}),
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
+    }, () => {});
+  } catch {}
+}
+
+function handlePostUpdateStartup() {
+  const ctrl = ensureUpdater();
+  const current = app.getVersion();
+  const prefs = readPrefs();
+  const previous = typeof prefs.lastInstalledVersion === 'string' ? prefs.lastInstalledVersion : '';
+  const result = consumeUpdateResult(updateResultFile());
+  let shouldSync = false;
+  if (result && typeof result === 'object') {
+    if (result.status === 'updated') {
+      ctrl.setNotice({
+        kind: 'success',
+        message: result.message || `已更新至 Unified Memory ${current}`,
+        detail: '已自动刷新本机启动器并同步已接入客户端规则，记忆库完整保留。',
+      });
+      shouldSync = true;
+    } else if (result.status === 'rolled_back' || result.status === 'failed') {
+      ctrl.setNotice({
+        kind: 'error',
+        message: result.status === 'rolled_back' ? '上次更新失败，已自动回滚到旧版本' : '上次更新未完成',
+        detail: result.message || '请查看更新日志或前往 GitHub 发布页手动更新。',
+      });
+    }
+  } else if (app.isPackaged && previous && previous !== current) {
+    shouldSync = true;
+    ctrl.setNotice({
+      kind: 'success',
+      message: `已更新至 Unified Memory ${current}`,
+      detail: '检测到版本变更，已自动刷新启动器并同步客户端规则。',
+    });
+  }
+  if (app.isPackaged && previous !== current) {
+    writePrefs({ lastInstalledVersion: current });
+  }
+  if (shouldSync) {
+    pruneOldUpdateDirs(updateCacheRoot(), '');
+    runPostUpgradeSync();
+  }
+}
+
+function registerUpdateIpc() {
+  const guardSender = event => {
+    try {
+      return Boolean(origin && event?.senderFrame?.url && new URL(event.senderFrame.url).origin === origin);
+    } catch {
+      return false;
+    }
+  };
+  const wrap = handler => async (event, ...args) => {
+    if (!guardSender(event)) throw new Error('Forbidden');
+    return handler(...args);
+  };
+  ipcMain.handle('umem:update-state', wrap(() => ensureUpdater().getState()));
+  ipcMain.handle('umem:update-check', wrap(async () => (await ensureUpdater().checkForUpdates({ manual: true })).snapshot));
+  ipcMain.handle('umem:update-download', wrap(() => ensureUpdater().downloadUpdate()));
+  ipcMain.handle('umem:update-cancel', wrap(() => {
+    ensureUpdater().cancelDownload();
+    return ensureUpdater().getState();
+  }));
+  ipcMain.handle('umem:update-install', wrap(() => triggerInstallFromUi()));
+  ipcMain.handle('umem:update-skip', wrap(version => ensureUpdater().skipVersion(version)));
+  ipcMain.handle('umem:update-open-page', wrap(url => {
+    openSafeExternal(url);
+    return true;
+  }));
+  ipcMain.handle('umem:update-open-log', wrap(() => {
+    const file = updateLogFile();
+    if (fs.existsSync(file)) shell.showItemInFolder(file);
+    else shell.openPath(app.getPath('userData'));
+    return true;
+  }));
+  ipcMain.handle('umem:update-dismiss-notice', wrap(() => ensureUpdater().setNotice(null)));
 }
 
 function backendSettings() {
@@ -140,7 +409,13 @@ function createWindow() {
   win = new BrowserWindow({
     title: 'Unified Memory', width: 1140, height: 790, minWidth: 730, minHeight: 505,
     backgroundColor: background(), show: false,
-    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, partition: 'memory-workspace' }
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: 'memory-workspace',
+    }
   });
   const wc = win.webContents;
   const allowed = address => { try { return new URL(address).origin === origin; } catch { return false; } };
@@ -169,9 +444,9 @@ function installMenu() {
   };
   const appMenu = { label: app.name, submenu: [
     { role: 'about' },
-    { label: '检查更新…', click: () => checkForUpdates(true).catch(() => {}) },
+    { label: formatUpdateMenuLabel(ensureUpdater().getState()), click: () => handleUpdateMenuClick().catch(() => {}) },
     { label: '自动检查更新', type: 'checkbox', checked: autoUpdateCheckEnabled(),
-      click: item => writePrefs({ autoUpdateCheck: item.checked }) },
+      click: item => ensureUpdater().setAutoCheck(item.checked) },
     { label: '在 GitHub 上查看', click: () => shell.openExternal(REPO_URL) },
     { type: 'separator' }, { role: 'services' },
     { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
@@ -224,12 +499,13 @@ function installTray() {
     { label: '读写动态', click: () => showWindow('/?view=activity') },
     { label: '共享与同步', click: () => showWindow('/?view=sync_hub') },
     { type: 'separator' },
-    { label: '检查更新…', click: () => checkForUpdates(true).catch(() => {}) },
+    { label: formatUpdateMenuLabel(ensureUpdater().getState()), click: () => handleUpdateMenuClick().catch(() => {}) },
     { label: '开机自动启动', type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin,
       click: item => { setLoginItem(item.checked); rebuild(); } },
     { type: 'separator' },
     { label: '退出 Unified Memory', click: () => app.quit() }
   ]));
+  rebuildTrayMenu = rebuild;
   rebuild();
   tray.on('click', () => showWindow('/'));
 }
@@ -256,6 +532,9 @@ async function launch() {
   isolated.webRequest.onBeforeRequest({ urls: ['http://*/*','https://*/*'] }, (details, callback) => {
     callback({ cancel: new URL(details.url).origin !== origin });
   });
+  ensureUpdater();
+  handlePostUpdateStartup();
+  registerUpdateIpc();
   installMenu();
   installTray();
   await createWindow();

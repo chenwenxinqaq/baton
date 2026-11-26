@@ -1,5 +1,6 @@
 import { packager } from '@electron/packager';
 import { unpackPython, unpackGitTools } from './runtime.mjs';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -16,7 +17,9 @@ try {
   const appDir = path.join(temp, 'app');
   const framework = path.join(temp, 'framework');
   await fs.mkdir(appDir);
-  await fs.copyFile(path.join(here,'main.cjs'), path.join(appDir,'main.cjs'));
+  for (const file of ['main.cjs', 'preload.cjs', 'updater.cjs']) {
+    await fs.copyFile(path.join(here, file), path.join(appDir, file));
+  }
   // Menu-bar glyph: black-on-transparent template images (macOS tints them for light/dark).
   for (const [file, pixels] of [['trayTemplate.png', '18'], ['trayTemplate@2x.png', '36']]) {
     execFileSync('sips', ['-s','format','png','-z',pixels,pixels,path.join(here,'tray.svg'),'--out',path.join(appDir,file)]);
@@ -62,5 +65,7 @@ try {
   execFileSync('codesign',['--verify','--deep','--strict',appPath]);
   const zip = path.join(out,'Unified-Memory-macOS-' + process.arch + '.zip');
   execFileSync('ditto',['-c','-k','--sequesterRsrc','--keepParent',appPath,zip]);
+  const sha = createHash('sha256').update(await fs.readFile(zip)).digest('hex');
+  await fs.writeFile(zip + '.sha256', `${sha}  ${path.basename(zip)}\n`, 'utf8');
   console.log(zip);
 } finally { await fs.rm(temp,{recursive:true,force:true}); }

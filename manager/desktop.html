@@ -15,10 +15,14 @@
       <span>快速跳转</span><kbd>⌘K</kbd>
     </button>
     <nav class="routes" aria-label="工作区">$desktop_nav</nav>
-    <div class="rail-bottom"><span class="online-dot"></span>$library $library_nav</div>
+    <div class="rail-bottom">
+      <div><span class="online-dot"></span>$library $library_nav</div>
+      <div class="rail-version" id="rail-version" hidden></div>
+    </div>
   </aside>
   <main class="paper">
     <header class="desk-top"><span>工作空间 <b>/</b> $section_name</span><div>$topbar_cta</div></header>
+    <section class="update-banner" id="app-update-banner" hidden aria-live="polite"></section>
     <article class="sheet">$feedback $unreadable
       <div class="sheet-head">$detail_badges<h1 id="detail-title" tabindex="-1">$heading</h1>$detail_submeta
       <div class="sheet-actions">$detail_toolbar</div></div>
