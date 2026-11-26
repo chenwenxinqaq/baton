@@ -1163,6 +1163,12 @@ def approve_import(library, client, import_id, revision, draft):
              and provenance in library.read_markdown(library.root / path).splitlines()),
             None,
         )
+        prior = item.get("previously_approved")
+        if not saved and prior in index:
+            # The source changed after it was filed: update that entry instead of forking it.
+            current = library.read_topic(prior, index)
+            saved = library.save_topic(prior, current.revision, draft["layer"], draft["title"], draft["description"],
+                                       body, body_limit=MAX_BODY_CHARS + len(provenance) + 2)
         if not saved:
             # The same stop can also leave the file without its index line.
             library.discard_unindexed_topic(item["id"])
@@ -2216,6 +2222,8 @@ def render_memory_import(token, library, client, selected, q, draft):
         description = draft.get("description", "")
         body = draft.get("body", item["body"])
         origin = " · ".join(part for part in (item["source"], item.get("source_detail"), item["source_date"], item["thread_id"]) if part)
+        if item.get("previously_approved"):
+            origin += f' · 此前已归入 {item["previously_approved"]}，来源之后有改动；确认后会更新该条目'
         form = f"""
           <form class="edit-form" method="post" action="/memory_import">
             {hidden("csrf", token)}{hidden("op", "approve")}{hidden("client", client)}{hidden("import_id", item["id"])}

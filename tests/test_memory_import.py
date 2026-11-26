@@ -95,6 +95,56 @@ class MemoryImportTests(unittest.TestCase):
         self.assertIn("字" * memory_import.MAX_TEXT, text)
         self.assertIn("> 来源：", text)
 
+    def claude_note(self, text, stamp):
+        note = self.home / ".claude" / "projects" / "demo" / "memory" / "note.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(text, encoding="utf-8")
+        os.utime(note, (stamp, stamp))
+        return note
+
+    def scan_claude(self):
+        return memory_import.import_memories(self.root, "claude", home=self.home)
+
+    def test_source_edited_after_approval_reopens_and_updates_the_same_entry(self):
+        self.claude_note("白鹭旧结论", 1_700_000_000)
+        self.assertEqual(self.scan_claude()["added"], 1)
+        (item,) = memory_import.pending(self.root, "claude")
+        saved = self.approve(item, client="claude")
+
+        # Scanning the unchanged source again must not reopen it.
+        report = self.scan_claude()
+        self.assertEqual((report["added"], report["updated"]), (0, 0))
+        self.assertEqual(memory_import.pending(self.root, "claude"), [])
+
+        self.claude_note("白鹭新结论", 1_700_000_500)
+        self.assertEqual(self.scan_claude()["updated"], 1)
+        (reopened,) = memory_import.pending(self.root, "claude")
+        self.assertEqual(reopened["previously_approved"], saved)
+        self.assertEqual(reopened["body"], "白鹭新结论")
+
+        self.assertEqual(self.approve(reopened, client="claude"), saved)
+        text = (self.root / saved).read_text(encoding="utf-8")
+        self.assertIn("白鹭新结论", text)
+        self.assertNotIn("白鹭旧结论", text)
+        index = (self.root / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertEqual(index.count(f"]({saved})"), 1)
+        self.assertEqual(memory_import.pending(self.root, "claude"), [])
+
+    def test_touched_but_identical_source_and_legacy_receipts_stay_closed(self):
+        note = self.claude_note("杜鹃结论", 1_700_000_000)
+        self.scan_claude()
+        (item,) = memory_import.pending(self.root, "claude")
+        self.approve(item, client="claude")
+
+        os.utime(note, (1_700_000_900, 1_700_000_900))
+        self.assertEqual(self.scan_claude()["updated"], 0)
+
+        receipt = memory_import.inbox(self.root, "claude") / (item["id"] + ".json")
+        receipt.write_text('{"approved": "projects/x.md"}', encoding="utf-8")
+        self.claude_note("杜鹃改动", 1_700_001_000)
+        self.assertEqual(self.scan_claude()["updated"], 0)
+        self.assertEqual(memory_import.pending(self.root, "claude"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

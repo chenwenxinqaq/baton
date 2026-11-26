@@ -180,6 +180,26 @@ def _collect_claude(profile):
     return _collect_markdown("claude", groups)
 
 
+def _body_digest(body):
+    return sha256(body.encode("utf-8")).hexdigest()
+
+
+def _refresh_kind(existing, candidate):
+    """Say whether a scanned source should replace what the queue holds for it.
+
+    Returns "update" for a newer copy of a pending candidate, "reopen" for a
+    source edited after its candidate was filed, and "" to leave things alone.
+    Receipts written before the source date was recorded cannot be compared and
+    stay closed.
+    """
+    seen = existing.get("source_date")
+    if existing.get("approved"):
+        if not seen or candidate["source_date"] <= seen:
+            return ""
+        return "" if existing.get("body_sha256") == _body_digest(candidate["body"]) else "reopen"
+    return "update" if candidate["source_date"] > (seen or "") else ""
+
+
 def _save_candidates(root, client, candidates, warnings=()):
     added = updated = 0
     if candidates:
@@ -189,8 +209,11 @@ def _save_candidates(root, client, candidates, warnings=()):
                 dest = directory / (candidate["id"] + ".json")
                 if dest.is_file():
                     existing = json.loads(dest.read_text(encoding="utf-8"))
-                    if existing.get("approved") or candidate["source_date"] <= existing["source_date"]:
+                    kind = _refresh_kind(existing, candidate)
+                    if not kind:
                         continue
+                    if kind == "reopen":
+                        candidate = dict(candidate, previously_approved=existing["approved"])
                     updated += 1
                 else:
                     added += 1
@@ -255,5 +278,6 @@ def revision(item):
 
 
 def mark_approved(root, client, item, topic):
-    """Keep a receipt so repeated imports cannot reopen an already reviewed thread."""
-    _atomic_write_json(inbox(root, client) / (item["id"] + ".json"), {"approved": topic})
+    """Keep a receipt so repeated imports reopen a reviewed source only after it changes."""
+    receipt = {"approved": topic, "source_date": item["source_date"], "body_sha256": _body_digest(item["body"])}
+    _atomic_write_json(inbox(root, client) / (item["id"] + ".json"), receipt)
