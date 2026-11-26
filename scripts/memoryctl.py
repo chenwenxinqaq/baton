@@ -2563,6 +2563,11 @@ def main():
     p_lint.add_argument("--library", default="personal", help="Library id, or '*' for every mounted library.")
     p_lint.add_argument("--stale-days", type=int, default=90, help="Flag L3 snapshots older than this (default 90).")
 
+    sub.add_parser("version", help="Print the installed Unified Memory version and runtime location.")
+    p_upg = sub.add_parser("upgrade", help="Check for or apply verified standalone CLI upgrades from GitHub Releases.")
+    p_upg.add_argument("--check", action="store_true", help="Only check for a newer release without modifying files.")
+    p_upg.add_argument("--force", action="store_true", help="Reinstall even if the current version matches latest.")
+
     args = parser.parse_args()
 
     if args.command in {"list", "search", "read", "write", "lint"}:
@@ -2695,11 +2700,13 @@ def main():
     elif args.command == "install-shims":
         print(json.dumps({"directory": str(stable_bin_dir()), "changed": ensure_stable_shims()}, ensure_ascii=False, indent=2))
     elif args.command == "interface":
+        import cli_updater
         hub = discover_hub_skills()
         print(
             json.dumps(
                 {
                     "protocol_version": 4,
+                    "version": cli_updater.current_version(),
                     "python_command": resolve_python_cmd(),
                     "capabilities": {
                         "marker_block_injection": True,
@@ -2766,6 +2773,29 @@ def main():
         since = time.time() - args.days * 86400
         report = audit_log.usage_stats(audit_log.read_events(since=since))
         report["days"] = args.days
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == "version":
+        import cli_updater
+        info = cli_updater.inspect_install_target()
+        print(
+            json.dumps(
+                {
+                    "version": cli_updater.current_version(),
+                    "install_kind": info["install_kind"],
+                    "can_replace": info["can_replace"],
+                    "framework_root": info["target"],
+                    "python_command": resolve_python_cmd(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "upgrade":
+        import cli_updater
+        try:
+            report = cli_updater.check_or_upgrade(apply=not args.check, force=args.force)
+        except (ValueError, RuntimeError, OSError) as exc:
+            parser.exit(1, f"{exc}\n")
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

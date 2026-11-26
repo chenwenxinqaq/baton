@@ -36,9 +36,10 @@ cd unified-memory-cli
 ./bin/umem list
 ./bin/umem search "部署"
 ./bin/umem doctor
+./bin/umem upgrade --check
 ```
 
-`umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body-file -` 从标准输入读取 Markdown。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。独立使用 CLI 时，GitHub HTTPS 浏览器登录需要可在 PATH 中找到的 Git Credential Manager，或已安装到 Applications 的桌面版。已有 Git 凭据也可继续使用。
+`umem read` 接受上一条结果的 `ref`。`umem write --help` 给出写入所需字段，可用 `--body` 或 `--body-file -` 传入 Markdown。独立安装的 CLI 包可随时运行 `umem version` 查看版本、运行 `umem upgrade` 经 SHA-256 校验与自检后原地原子升级（桌面版自带的 CLI 或 Git 源码仓库会被自动保护，避免误覆盖）。把 `bin/umem` 链接到 PATH 中的个人 bin 目录即可从任何目录调用。独立使用 CLI 时，GitHub HTTPS 浏览器登录需要可在 PATH 中找到的 Git Credential Manager，或已安装到 Applications 的桌面版。已有 Git 凭据也可继续使用。
 
 桌面版会常驻 macOS 菜单栏：关闭窗口不会退出，菜单栏图标可打开读写动态、共享与同步，并提供「开机自动启动」开关（首次打开会询问一次）。
 

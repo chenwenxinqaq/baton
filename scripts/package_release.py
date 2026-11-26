@@ -1,6 +1,7 @@
 """Build a source distribution using an explicit list of public framework files."""
 
 import argparse
+from hashlib import sha256
 import tarfile
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -11,6 +12,7 @@ from library_paths import FRAMEWORK_ROOT
 
 PUBLIC_FILES = (
     ".gitignore",
+    "VERSION",
     "bin/umem",
     "desktop/licenses/dugite-LICENSE.md",
     "desktop/licenses/git-COPYING",
@@ -38,6 +40,7 @@ PUBLIC_FILES = (
     "scripts/memory_import.py",
     "scripts/memory_lint.py",
     "scripts/memoryctl.py",
+    "scripts/cli_updater.py",
     "scripts/package_release.py",
     "scripts/sync_git.py",
     "scripts/async_sync.py",
@@ -73,6 +76,11 @@ def main():
                         raise ValueError(f"Expected a regular source file: {name}")
                     archive.add(source, arcname="unified-memory-cli/" + name, recursive=False)
             staged.replace(output)
+            output.chmod(0o644)
+            digest = sha256(output.read_bytes()).hexdigest()
+            sha_file = directory / (output.name + ".sha256")
+            sha_file.write_text(f"{digest}  {output.name}\n", encoding="utf-8")
+            sha_file.chmod(0o644)
         finally:
             staged.unlink(missing_ok=True)
         print(output)
