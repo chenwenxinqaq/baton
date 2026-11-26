@@ -11,7 +11,7 @@ import errno
 from hashlib import sha256
 from html import escape
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -4183,10 +4183,33 @@ def render(
     )
 
 
+class ManagerServer(ThreadingHTTPServer):
+    """Serve each request on its own thread so a slow one cannot stall the rest.
+
+    Library writes are serialized by the per-library file lock, the sync job
+    registry and mount reloads by their own locks.
+    """
+
+    # Let requests that are still writing finish before the process exits.
+    daemon_threads = False
+    block_on_close = True
+
+
 class Handler(BaseHTTPRequestHandler):
-    # The current server is single-threaded, but sync workers and future
-    # threaded integrations can observe this registry concurrently.
+    # Request threads and sync workers observe this registry concurrently.
     SYNC_JOB_TTL_SECONDS = 15 * 60
+
+    @property
+    def libraries(self):
+        """The mounted libraries as this request first saw them.
+
+        Another request may reload the mounts at any time; one request must not
+        see two different maps.
+        """
+        snapshot = self.__dict__.get("_libraries")
+        if snapshot is None:
+            snapshot = self.__dict__["_libraries"] = self.server.libraries
+        return snapshot
 
     def _sync_jobs_lock(self):
         lock = getattr(self.server, "sync_jobs_lock", None)
@@ -4244,7 +4267,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(
             code,
             render(
-                self.server.libraries,
+                self.libraries,
                 key,
                 self.server.token,
                 entry=entry,
@@ -4257,6 +4280,7 @@ class Handler(BaseHTTPRequestHandler):
         loader = getattr(self.server, "reload_mounts", None)
         if loader is not None:
             loader(force=force)
+        self.__dict__.pop("_libraries", None)
 
     def do_GET(self):
         if not self.known_host():
@@ -4289,7 +4313,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             params = parse_qs(url.query, max_num_fields=18)
             requested_key = params.get("library", ["primary"])[0]
-            if requested_key not in self.server.libraries:
+            if requested_key not in self.libraries:
                 raise InvalidEntry("记忆库不存在。")
             key = requested_key
             tab = "skills" if params.get("tab", [""])[0] == "skills" else "memory"
@@ -4321,7 +4345,7 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
-            library = self.server.libraries[key]
+            library = self.libraries[key]
             entry = library.read(name) if (name and tab == "memory") else Entry(layer=layer or "L2")
         except (ValueError, OSError):
             self.page(HTTPStatus.BAD_REQUEST, key=key, error="无法打开条目，请重新选择。")
@@ -4477,7 +4501,7 @@ class Handler(BaseHTTPRequestHandler):
         self.update_entry(fields)
 
     def handle_memory_import(self, fields):
-        library = self.server.libraries["primary"]
+        library = self.libraries["primary"]
         selected = fields.get("import_id", "")
         client = fields.get("client", "codex")
         if client not in memory_import.CLIENTS:
@@ -4508,7 +4532,7 @@ class Handler(BaseHTTPRequestHandler):
             self.page(HTTPStatus.CONFLICT, view="memory_import", topic_path=selected, error=str(exc), import_draft=draft, import_client=client)
 
     def start_sync_action(self, key, read_only, tab, return_view):
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         cfg = library.sync_config or {}
         remote = cfg.get("remote") or "origin"
         remote_url = sync_git.git_status(library.root, remote=remote).get("remote_url") or ""
@@ -4583,7 +4607,7 @@ class Handler(BaseHTTPRequestHandler):
         for key, job in self._sync_jobs_snapshot():
             if not job.inline:
                 continue
-            library = self.server.libraries.get(key)
+            library = self.libraries.get(key)
             destination = query(library=key if library else "primary", view="sync_hub")
             status = {"id": job.identifier, "label": library.label if library else "记忆库"}
             if not job.outcome.done():
@@ -4604,14 +4628,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_quick_search(self, params):
         q = (params.get("q", [""])[0] or "").strip()[:120]
         active_key = params.get("library", ["primary"])[0]
-        if active_key not in self.server.libraries:
+        if active_key not in self.libraries:
             active_key = "primary"
         items = []
-        active_lib = self.server.libraries[active_key]
+        active_lib = self.libraries[active_key]
         if not q:
             # Show the most recently updated items across mounted libraries when empty.
             recent = []
-            for lib_key, lib in self.server.libraries.items():
+            for lib_key, lib in self.libraries.items():
                 try:
                     store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
                     for entry in store.list_entries(include_archived=False, sort="updated")[:8]:
@@ -4638,7 +4662,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
         else:
             scored = []
-            for lib_key, lib in self.server.libraries.items():
+            for lib_key, lib in self.libraries.items():
                 try:
                     store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
                     for hit in store.search(q, limit=8, include_archived=True):
@@ -4686,7 +4710,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_version_diff(self, params):
         key = params.get("library", ["primary"])[0]
         version = (params.get("version", [""])[0] or "").strip()
-        library = self.server.libraries.get(key)
+        library = self.libraries.get(key)
         if library is None:
             self.respond_json(HTTPStatus.NOT_FOUND, {"error": "记忆库不存在。"})
             return
@@ -4706,7 +4730,7 @@ class Handler(BaseHTTPRequestHandler):
                 # so Chromium requests the job result instead of scrolling the same page.
                 progress_url = "/sync_progress?" + urlencode({"job": job.identifier})
                 title = escape(f"正在{job.action}")
-                back_url = escape(query(library=key if key in self.server.libraries else "primary", view="sync_hub"))
+                back_url = escape(query(library=key if key in self.libraries else "primary", view="sync_hub"))
                 content = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -4744,7 +4768,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     location = job.outcome.result()
                 except Exception as exc:
-                    self.page(HTTPStatus.CONFLICT, key=key if key in self.server.libraries else "primary",
+                    self.page(HTTPStatus.CONFLICT, key=key if key in self.libraries else "primary",
                               view="sync_hub", error=f"操作未完成：{exc}")
                 else:
                     self.respond(HTTPStatus.SEE_OTHER, "", location=location + "#feedback")
@@ -4755,7 +4779,7 @@ class Handler(BaseHTTPRequestHandler):
         import memoryctl
 
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             key = "primary"
         return_tab = "skills" if fields.get("tab") == "skills" or self.path == "/skill" else ""
         agent_home = getattr(self.server, "agent_home", None)
@@ -4782,7 +4806,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/rebuild_index":
-                lib_obj = self.server.libraries[key]
+                lib_obj = self.libraries[key]
                 lib_obj._ensure_writable()
                 sync_git.rebuild_index(lib_obj.root)
                 return_view = fields.get("return_view", "")
@@ -4877,7 +4901,7 @@ class Handler(BaseHTTPRequestHandler):
                     home=agent_home,
                 )
                 self._refresh_mounts(force=True)
-                dest_key = key if key in self.server.libraries else "primary"
+                dest_key = key if key in self.libraries else "primary"
                 loc = query(library=dest_key, view="sync_hub", notice="mount_updated")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
@@ -4885,12 +4909,12 @@ class Handler(BaseHTTPRequestHandler):
                 mount_id = fields.get("mount_id", "").strip()
                 memoryctl.mount_remove(mount_id, home=agent_home)
                 self._refresh_mounts(force=True)
-                dest_key = key if key in self.server.libraries else "primary"
+                dest_key = key if key in self.libraries else "primary"
                 loc = query(library=dest_key, view="sync_hub", notice="mount_removed")
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/resolve_conflict":
-                lib_obj = self.server.libraries[key]
+                lib_obj = self.libraries[key]
                 lib_obj._ensure_writable()
                 conflict_file = fields.get("conflict_file", "").strip()
                 strategy = fields.get("strategy", "").strip()
@@ -4909,14 +4933,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(HTTPStatus.SEE_OTHER, "", location=loc + "#feedback")
                 return
             if self.path == "/share_topic":
-                src_lib = self.server.libraries[key]
+                src_lib = self.libraries[key]
                 topic_path = fields.get("topic", "").strip()
                 target_key = fields.get("target_library", "").strip()
                 target_layer = fields.get("target_layer", "").strip()
                 overwrite = fields.get("overwrite") == "1"
-                if target_key not in self.server.libraries:
+                if target_key not in self.libraries:
                     raise InvalidEntry("目标共享库不存在或未启用。")
-                dst_lib = self.server.libraries[target_key]
+                dst_lib = self.libraries[target_key]
                 dst_lib._ensure_writable(layer=target_layer)
                 t_entry = src_lib.read_topic(topic_path)
                 dst_folder = mcp_server.LAYER_DIRS[target_layer]
@@ -5001,10 +5025,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_save_index(self, fields):
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         body = fields.get("body", "")
         revision = fields.get("revision", "")
         try:
@@ -5041,10 +5065,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_archive_topic(self, fields):
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         topic_path = fields.get("topic", "")
         revision = fields.get("revision", "")
         try:
@@ -5065,10 +5089,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_verify_topic(self, fields):
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         topic_path = fields.get("topic", "")
         revision = fields.get("revision", "")
         return_view = fields.get("return_view", "")
@@ -5101,9 +5125,9 @@ class Handler(BaseHTTPRequestHandler):
     def handle_preview_markdown(self, fields):
         """Render Markdown editor draft safely and flag suspected plaintext secrets before save."""
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             key = "primary"
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         body = fields.get("body", "")
         title = fields.get("title", "").strip()
         description = fields.get("description", "").strip()
@@ -5143,10 +5167,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle_restore_version(self, fields):
         """Put one saved version back as the current entry."""
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         slug = fields.get("slug", "")
         topic_path = ""
         try:
@@ -5174,10 +5198,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_delete(self, fields):
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         scope = fields.get("scope", "")
         target = fields.get("target", "")
         revision = fields.get("revision", "")
@@ -5203,10 +5227,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def update_entry(self, fields):
         key = fields.get("library", "primary")
-        if key not in self.server.libraries:
+        if key not in self.libraries:
             self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
             return
-        library = self.server.libraries[key]
+        library = self.libraries[key]
         saving = self.path == "/save"
         scope = fields.get("scope", "user") if saving else "user"
 
@@ -5442,7 +5466,7 @@ def main():
         for lib in libraries.values():
             if lib.mode == "rw" and (lib.sync_config or {}).get("auto_push"):
                 async_scheduler.recover_stale(lib.root, sync_config=lib.sync_config, mode=lib.mode)
-        server = HTTPServer(("127.0.0.1", args.port), Handler)
+        server = ManagerServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             parser.exit(
@@ -5464,19 +5488,21 @@ def main():
         # Capture the pre-build signature so a config rewrite during library construction
         # is observed on the first request instead of being mistaken for the initial state.
         state_holder = {"signature": initial_config_signature}
+        reload_lock = threading.Lock()
 
         def reload_mounts(force=False):
-            cur_signature = config_signature()
-            if force or cur_signature != state_holder["signature"]:
-                issues = []
-                server.libraries = build_libraries_map(
-                    primary,
-                    also_root=args.also_root,
-                    issues=issues,
-                    async_scheduler=server.async_scheduler,
-                )
-                server.mount_issues = issues
-                state_holder["signature"] = cur_signature
+            with reload_lock:
+                cur_signature = config_signature()
+                if force or cur_signature != state_holder["signature"]:
+                    issues = []
+                    server.libraries = build_libraries_map(
+                        primary,
+                        also_root=args.also_root,
+                        issues=issues,
+                        async_scheduler=server.async_scheduler,
+                    )
+                    server.mount_issues = issues
+                    state_holder["signature"] = cur_signature
 
         if DESKTOP:
             # The native window owns the write end. EOF also covers a parent crash.
