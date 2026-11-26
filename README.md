@@ -157,3 +157,7 @@ python3 scripts/memoryctl.py sync run all
 发布源码仓库或从该仓库打包。备份个人记忆时备份数据目录。模板中写入示范格式，测试中使用虚构数据。
 
 运行 `python3 scripts/package_release.py` 生成 `unified-memory-starter.zip`。打包脚本仅从源码根目录逐个读取清单中的文件，新增公开组件时同步更新清单。
+
+## 许可证
+
+本项目以 MIT 许可证发布，见 `LICENSE`。随桌面应用分发的 Git 和 Git Credential Manager 沿用各自的许可证，见 `desktop/licenses/`。

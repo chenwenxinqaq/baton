@@ -30,6 +30,7 @@ PUBLIC_FILES = (
     "desktop/umem-python",
     "manager/desktop.css",
     "manager/desktop.html",
+    "LICENSE",
     "README.md",
     "manager/app.js",
     "manager/manager.py",
