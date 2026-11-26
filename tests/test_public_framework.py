@@ -1707,3 +1707,10 @@ class PackagedFrameworkTests(unittest.TestCase):
                                          cwd=home, text=True)
         payload = json.loads(json.loads(output)["result"]["content"][0]["text"])
         self.assertIn("findings", payload)
+        help_out = subprocess.check_output(
+            [sys.executable, str(staged / "manager/manager.py"), "--help"],
+            env=environment,
+            cwd=home,
+            text=True,
+        )
+        self.assertIn("--memory-root", help_out)
