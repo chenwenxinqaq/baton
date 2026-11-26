@@ -77,6 +77,31 @@ class VersionHistoryUITests(unittest.TestCase):
         # Restoring backs up what it replaced, so the list grows instead of losing it.
         self.assertEqual(len(self.library.topic_versions("docker-cache")), 2)
 
+    def test_web_edits_layer_moves_and_archives_record_shared_history(self):
+        first = self._write("初版内容。")
+        cur = self.library.read_topic(first["path"])
+        self.library.save_topic(
+            cur.path, cur.revision, "L1", cur.title, cur.description, "# Docker 构建缓存排查\n\nWeb 修订版。"
+        )
+        cur2 = self.library.read_topic(first["path"])
+        moved = self.library.save_topic(
+            cur2.path, cur2.revision, "L3", cur2.title, cur2.description, "# Docker 构建缓存排查\n\n移至 L3。"
+        )
+        self.assertEqual(moved, "projects/docker-cache.md")
+        cur3 = self.library.read_topic(moved)
+        archived = self.library.archive_topic(cur3.path, cur3.revision)
+        self.assertEqual(archived, "archive/docker-cache.md")
+
+        reasons = {v["reason"] for v in self.store.entry_history("docker-cache")["versions"]}
+        self.assertEqual(reasons, {"update", "layer-change", "archive"})
+
+        self.library.save(Entry(name="ui-note", title="手记", description="初版", body="手记一"))
+        note = self.library.read("ui-note")
+        self.library.save(replace(note, body="手记二"))
+        user_versions = self.store.entry_history("ui-note")["versions"]
+        self.assertEqual(len(user_versions), 1)
+        self.assertEqual(user_versions[0]["reason"], "update")
+
     def test_desktop_edits_invalidate_stale_agent_versions(self):
         with patch.object(mcp_server, "datetime", FrozenClock):
             first = self._write("第一版结论。")

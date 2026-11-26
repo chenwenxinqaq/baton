@@ -511,6 +511,68 @@ def atomic_write(path, content):
             staged.unlink(missing_ok=True)
 
 
+def atomic_create(path, content):
+    """Atomically create a new UTF-8 text file, raising FileExistsError if it exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".tmp-", delete=False
+        ) as handle:
+            staged = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(staged, path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+def format_topic_markdown(name, description, entry_type, created_at, updated_at, body,
+                          *, verified_at="", valid_until=""):
+    """Serialize an indexed L0-L4 Markdown memory entry with canonical frontmatter."""
+    name_serialized = name if NAME_RE.fullmatch(name) else json.dumps(name, ensure_ascii=False)
+    desc_serialized = json.dumps(description, ensure_ascii=False)
+    extra_fm = ""
+    if verified_at:
+        extra_fm += f"verified_at: {json.dumps(verified_at)}\n"
+    if valid_until:
+        extra_fm += f"valid_until: {json.dumps(valid_until)}\n"
+    return (
+        f"---\n"
+        f"name: {name_serialized}\n"
+        f"description: {desc_serialized}\n"
+        f"type: {entry_type}\n"
+        f"created_at: {json.dumps(created_at)}\n"
+        f"updated_at: {json.dumps(updated_at)}\n"
+        f"{extra_fm}"
+        f"---\n\n"
+        f"{body.strip()}\n"
+    )
+
+
+def format_user_markdown(name, title, description, entry_type, layer, status, created_at, updated_at, body,
+                         *, verified_at="", valid_until=""):
+    """Serialize a user-managed Markdown entry with canonical frontmatter."""
+    meta = {
+        "name": name,
+        "title": title,
+        "description": description,
+        "type": entry_type,
+        "layer": layer,
+        "status": status,
+        "created_at": created_at or updated_at,
+        "updated_at": updated_at,
+    }
+    if verified_at:
+        meta["verified_at"] = verified_at
+    if valid_until:
+        meta["valid_until"] = valid_until
+    header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
+    return f"---\n{header}\n---\n\n{body}\n"
+
+
 def cjk_chunks(cjk_run):
     """Split a Chinese run at function particles, keeping pieces of 2+ chars."""
     return [part for part in CJK_PARTICLE_RE.split(cjk_run) if len(part) > 1]
@@ -778,6 +840,9 @@ class MemoryStore:
         allow_user_managed=True,
         sync_config=None,
         async_scheduler=None,
+        audit_source="sync",
+        audit_client=None,
+        log_sync_warnings=False,
     ):
         self.root = data_root(root).resolve(strict=True)
         self.index_path = self.root / "MEMORY.md"
@@ -794,6 +859,10 @@ class MemoryStore:
         # this MCP process share one lightweight worker registry.  Keeping this
         # optional preserves the small, directly-testable MemoryStore API.
         self.async_scheduler = async_scheduler
+        self.audit_source = audit_source
+        self.audit_client = audit_client
+        self.log_sync_warnings = bool(log_sync_warnings)
+        self.last_sync_status = None
         self.state_dir = library_state_dir(self.root)
         self.lock_path = self.state_dir / "library.lock"
         self.trash_dir = self.state_dir / "trash"
@@ -891,6 +960,7 @@ class MemoryStore:
         status metadata and is surfaced on the write result as ``sync_warning``.  It is also
         recorded separately so a successful memory write cannot hide a failed Git snapshot.
         """
+        self.last_sync_status = None
         if not self.sync_config or self.sync_config.get("driver") != "git":
             return None
         if not self.sync_config.get("auto_commit", True):
@@ -915,11 +985,12 @@ class MemoryStore:
             if detail:
                 status["error"] = detail
             status["warning"] = f"记忆已保存，但 Git 快照未提交（原因：{reason}）。"
+            self.last_sync_status = status
             audit_log.record(
                 {
-                    "source": "sync",
+                    "source": self.audit_source,
                     "event": "git_auto_commit",
-                    "client": CLIENT_NAME,
+                    "client": self.audit_client or CLIENT_NAME,
                     "tool": "git_auto_commit",
                     "ok": False,
                     "library": self.library_id,
@@ -929,14 +1000,26 @@ class MemoryStore:
                 },
                 home=AUDIT_HOME,
             )
+            if self.log_sync_warnings:
+                try:
+                    print(f"[unified-memory] {status['warning']}", file=sys.stderr)
+                except Exception:
+                    pass
             return status
 
         try:
             result = sync_git.auto_commit(self.root, message)
         except Exception as exc:
             return failure(None, error=exc)
+        if isinstance(result, dict) and not result.get("committed") and result.get("reason") in {
+            "clean",
+            "nothing_allowed",
+        }:
+            self.last_sync_status = result
+            return result
         if not isinstance(result, dict) or not result.get("committed"):
             return failure(result)
+        self.last_sync_status = result
         return result
 
     @staticmethod
@@ -1560,22 +1643,20 @@ class MemoryStore:
                 eff_valid_until = old_valid_until if norm_valid_until is None else norm_valid_until
                 if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
                     raise ValueError("valid_until must not be earlier than verified_at.")
-                meta = {
-                    "name": name,
-                    "title": effective_title,
-                    "description": effective_desc,
-                    "type": resolved_type,
-                    "layer": layer,
-                    "status": status,
-                    "created_at": cre_at,
-                    "updated_at": ts_now,
-                }
-                if eff_verified:
-                    meta["verified_at"] = eff_verified
-                if eff_valid_until:
-                    meta["valid_until"] = eff_valid_until
-                header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items())
-                atomic_write(target, f"---\n{header}\n---\n\n{merged_body}\n")
+                content = format_user_markdown(
+                    name,
+                    effective_title,
+                    effective_desc,
+                    resolved_type,
+                    layer,
+                    status,
+                    cre_at,
+                    ts_now,
+                    merged_body,
+                    verified_at=eff_verified,
+                    valid_until=eff_valid_until,
+                )
+                atomic_write(target, content)
                 rel_out = target.relative_to(self.root).as_posix()
                 message = f"memory({self.library_id}): upsert {rel_out}"
                 sync_status = self._maybe_auto_commit(message)
@@ -1660,7 +1741,6 @@ class MemoryStore:
             if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
                 raise ValueError("valid_until must not be earlier than verified_at.")
 
-            desc_val = json.dumps(effective_desc, ensure_ascii=False)
             resolved_section = ""
             section_action = ""
             if section:
@@ -1688,41 +1768,25 @@ class MemoryStore:
                 formatted_body = f"{base_body}\n\n{body}"
             else:
                 formatted_body = body if body.lstrip().startswith("# ") else f"# {effective_title}\n\n{body}"
-            extra_fm = ""
-            if eff_verified:
-                extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
-            if eff_valid_until:
-                extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
-            content = (
-                f"---\n"
-                f"name: {name}\n"
-                f"description: {desc_val}\n"
-                f"type: {resolved_type}\n"
-                f"created_at: {json.dumps(cre_at)}\n"
-                f"updated_at: {json.dumps(ts_now)}\n"
-                f"{extra_fm}"
-                f"---\n\n"
-                f"{formatted_body}\n"
+            content = format_topic_markdown(
+                name,
+                effective_desc,
+                resolved_type,
+                cre_at,
+                ts_now,
+                formatted_body,
+                verified_at=eff_verified,
+                valid_until=eff_valid_until,
             )
-
-            # Crash-safe multi-file update: snapshot MEMORY.md & target so any error rolls back both cleanly
-            prev_target_bytes = target.read_bytes() if target.is_file() else None
-            prev_index_text = self.index_path.read_text(encoding="utf-8")
-            atomic_write(target, content)
-            try:
-                for _, stale_rel in stale_files:
-                    self._remove_index_line(stale_rel)
-                self._upsert_index_line(layer, effective_title, rel_path, effective_desc)
-            except Exception:
-                if prev_target_bytes is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    atomic_write(target, prev_target_bytes.decode("utf-8"))
-                try:
-                    atomic_write(self.index_path, prev_index_text)
-                except OSError:
-                    pass
-                raise
+            self._write_topic_and_index(
+                target,
+                rel_path,
+                layer,
+                effective_title,
+                effective_desc,
+                content,
+                remove_rels=[stale_rel for _, stale_rel in stale_files],
+            )
 
             migrated_from = []
             for stale_path, stale_rel in stale_files:
@@ -1761,6 +1825,221 @@ class MemoryStore:
                 )
             self._attach_previous(res, previous, formatted_body)
             return self._with_sync_warning(res, sync_status)
+
+    def _write_topic_and_index(self, target, rel_path, layer, title, idx_desc, content, *, remove_rels=()):
+        """Atomically write a topic file and update MEMORY.md, rolling back both on error."""
+        prev_target_bytes = target.read_bytes() if target.is_file() else None
+        prev_index_text = self.index_path.read_text(encoding="utf-8")
+        atomic_write(target, content)
+        try:
+            for old_rel in remove_rels:
+                self._remove_index_line(old_rel)
+            self._upsert_index_line(layer, title, rel_path, idx_desc)
+        except Exception:
+            if prev_target_bytes is None:
+                target.unlink(missing_ok=True)
+            else:
+                atomic_write(target, prev_target_bytes.decode("utf-8"))
+            try:
+                atomic_write(self.index_path, prev_index_text)
+            except OSError:
+                pass
+            raise
+
+    def save_topic_entry(
+        self,
+        *,
+        layer,
+        title,
+        description,
+        body,
+        slug="",
+        orig_rel="",
+        entry_type="",
+        frontmatter_name="",
+        file_description=None,
+        created_at="",
+        previous_updated_at="",
+        verified_at="",
+        valid_until="",
+        before_write=None,
+    ):
+        """Create or update an indexed topic via the shared write, backup, index, and sync kernel.
+
+        Used by the Web/Desktop manager so UI edits share the exact same atomic
+        write, trash version backup, MEMORY.md update, rollback, auto-commit,
+        and async Git push path as MCP writes.
+        """
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        if layer not in LAYER_DIRS or layer not in self.allowed_layers:
+            raise ValueError(f"Layer {layer} is not allowed in library '{self.library_id}'.")
+        with self.write_lock():
+            if before_write is not None:
+                overrides = before_write()
+                if isinstance(overrides, dict):
+                    orig_rel = overrides.get("orig_rel", orig_rel)
+                    slug = overrides.get("slug", slug)
+                    entry_type = overrides.get("entry_type", entry_type)
+                    frontmatter_name = overrides.get("frontmatter_name", frontmatter_name)
+                    file_description = overrides.get("file_description", file_description)
+                    created_at = overrides.get("created_at", created_at)
+                    previous_updated_at = overrides.get("previous_updated_at", previous_updated_at)
+                    verified_at = overrides.get("verified_at", verified_at)
+                    valid_until = overrides.get("valid_until", valid_until)
+            if not NAME_RE.fullmatch(slug or "") or (slug or "").lower() == "readme":
+                raise ValueError("Invalid entry name.")
+            new_folder = LAYER_DIRS[layer]
+            new_rel = f"{new_folder}/{slug}.md"
+            new_file = self.root / new_rel
+            if orig_rel:
+                if new_rel != orig_rel and new_file.exists():
+                    raise ValueError(f"目标层级目录已存在同名文件：{new_rel}")
+                orig_file = self.root / orig_rel
+                backup_hint = slug if new_rel == orig_rel else f"migrated-{slug}"
+                self._backup_to_trash(orig_file, backup_hint)
+                ts_now = now_iso(previous_updated_at)
+                cre_at = created_at or ts_now
+                action = "update"
+            else:
+                ts_now = now_iso()
+                cre_at = ts_now
+                action = "create"
+
+            fm_name = frontmatter_name or slug
+            idx_desc = description.strip() or title
+            fm_desc = idx_desc if file_description is None else file_description
+            fm_type = entry_type if entry_type in VALID_TOPIC_TYPES else LAYER_DEFAULT_TYPE[layer]
+            content = format_topic_markdown(
+                fm_name,
+                fm_desc,
+                fm_type,
+                cre_at,
+                ts_now,
+                body,
+                verified_at=verified_at,
+                valid_until=valid_until,
+            )
+            remove_rels = (orig_rel,) if (orig_rel and new_rel != orig_rel) else ()
+            self._write_topic_and_index(new_file, new_rel, layer, title, idx_desc, content, remove_rels=remove_rels)
+            if orig_rel and new_rel != orig_rel:
+                (self.root / orig_rel).unlink(missing_ok=True)
+            message = f"memory({self.library_id}): {action} {new_rel}"
+            self._maybe_auto_commit(message)
+            self._enqueue_async_sync(message)
+            return new_rel
+
+    def save_user_entry(
+        self,
+        *,
+        name,
+        title,
+        description,
+        body,
+        layer="L2",
+        entry_type="",
+        status="active",
+        created_at="",
+        verified_at="",
+        valid_until="",
+        exclusive_create=False,
+        before_write=None,
+    ):
+        """Create or update a user-managed entry through the unified locked write path."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        if not self.allow_user_managed:
+            raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
+        if layer not in LAYER_DIRS or layer not in self.allowed_layers:
+            raise ValueError(f"Layer {layer} is not allowed in library '{self.library_id}'.")
+        if not NAME_RE.fullmatch(name or "") or (name or "").lower() == "readme":
+            raise ValueError("Invalid entry name.")
+        target = self.root / "user-managed" / f"{name}.md"
+        with self.write_lock():
+            prev_updated = ""
+            if before_write is not None:
+                overrides = before_write()
+                if isinstance(overrides, dict):
+                    prev_updated = overrides.get("previous_updated_at", prev_updated)
+                    created_at = overrides.get("created_at", created_at)
+            if not exclusive_create and target.is_file():
+                self._backup_to_trash(target, f"user-{name}")
+            ts_now = now_iso(prev_updated)
+            cre_at = created_at or ts_now
+            allowed = ALLOWED_LAYER_TYPES.get(layer, {"feedback"})
+            resolved_type = entry_type if entry_type in allowed else LAYER_DEFAULT_TYPE[layer]
+            content = format_user_markdown(
+                name,
+                title,
+                description,
+                resolved_type,
+                layer,
+                status,
+                cre_at,
+                ts_now,
+                body,
+                verified_at=verified_at,
+                valid_until=valid_until,
+            )
+            if exclusive_create:
+                atomic_create(target, content)
+            else:
+                atomic_write(target, content)
+        message = f"memory({self.library_id}): save user-managed/{name}.md"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
+        return f"user-managed/{name}.md"
+
+    def delete_entry(self, rel_path="", *, user_managed=False, slug_hint="", before_delete=None):
+        """Delete an indexed topic or user-managed entry after backing it up to trash."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        if user_managed and not self.allow_user_managed:
+            raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
+        with self.write_lock():
+            if before_delete is not None:
+                overrides = before_delete()
+                if isinstance(overrides, dict):
+                    rel_path = overrides.get("rel_path", rel_path)
+                    slug_hint = overrides.get("slug_hint", slug_hint)
+            target = self.resolve_safe(rel_path)
+            self._backup_to_trash(target, slug_hint or target.stem)
+            target.unlink()
+            if not user_managed:
+                self._remove_index_line(rel_path)
+        message = f"memory({self.library_id}): delete {rel_path}"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
+        return rel_path
+
+    def save_index_text(self, normalized_text, *, before_write=None):
+        """Atomically overwrite MEMORY.md under the library write lock and trigger sync."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        with self.write_lock():
+            if before_write is not None:
+                before_write()
+            atomic_write(self.index_path, normalized_text + "\n")
+        message = f"memory({self.library_id}): update MEMORY.md"
+        self._maybe_auto_commit(message)
+        self._enqueue_async_sync(message)
+
+    def discard_unindexed_topic(self, slug):
+        """Move aside a topic file that a stopped save left on disk without an index line."""
+        if not NAME_RE.fullmatch(slug or ""):
+            return []
+        removed = []
+        with self.write_lock():
+            index = self.parse_index()
+            for folder in LAYER_DIRS.values():
+                rel = f"{folder}/{slug}.md"
+                path = self.root / rel
+                if rel in index or path.is_symlink() or not path.is_file():
+                    continue
+                self._backup_to_trash(path, slug)
+                path.unlink()
+                removed.append(rel)
+        return removed
 
     def _remove_index_line(self, rel_path):
         """Remove any index line referencing rel_path from MEMORY.md."""
@@ -1957,7 +2236,7 @@ class MemoryStore:
         res.pop("content_warning", None)
         return res
 
-    def archive_entry(self, name, user_managed=False):
+    def archive_entry(self, name="", user_managed=False, *, orig_rel="", before_archive=None):
         """Archive a user-managed entry or move a standard topic into archive/."""
         if self.mode == "ro":
             raise ValueError(f"Library '{self.library_id}' is read-only.")
@@ -1965,7 +2244,7 @@ class MemoryStore:
             raise ValueError(f"Library '{self.library_id}' does not allow user-managed entries.")
         if not user_managed and "L4" not in self.allowed_layers:
             raise ValueError(f"Layer L4 (archive) is not enabled in library '{self.library_id}'.")
-        if not NAME_RE.fullmatch(name):
+        if not orig_rel and before_archive is None and not NAME_RE.fullmatch(name):
             raise ValueError("Invalid entry name.")
         with self.write_lock():
             if user_managed:
@@ -1976,22 +2255,20 @@ class MemoryStore:
                 meta, body = parse_frontmatter(target.read_text(encoding="utf-8"))
                 ts_now = now_iso(file_timestamps(target, meta)[1])
                 cre_at = meta.get("created_at") or meta.get("updated_at") or ts_now
-                ordered = {
-                    "name": meta.get("name", name),
-                    "title": meta.get("title", extract_title(body, name)),
-                    "description": meta.get("description", ""),
-                    "type": meta.get("type", LAYER_DEFAULT_TYPE.get(meta.get("layer", "L2"), "feedback")),
-                    "layer": meta.get("layer", "L2"),
-                    "status": "archived",
-                    "created_at": cre_at,
-                    "updated_at": ts_now,
-                }
-                if (meta.get("verified_at") or "").strip():
-                    ordered["verified_at"] = str(meta["verified_at"]).strip()
-                if (meta.get("valid_until") or "").strip():
-                    ordered["valid_until"] = str(meta["valid_until"]).strip()
-                header = "\n".join(f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in ordered.items())
-                atomic_write(target, f"---\n{header}\n---\n\n{body.strip()}\n")
+                archived_user = format_user_markdown(
+                    meta.get("name", name),
+                    meta.get("title", extract_title(body, name)),
+                    meta.get("description", ""),
+                    meta.get("type", LAYER_DEFAULT_TYPE.get(meta.get("layer", "L2"), "feedback")),
+                    meta.get("layer", "L2"),
+                    "archived",
+                    cre_at,
+                    ts_now,
+                    body.strip(),
+                    verified_at=str(meta.get("verified_at") or "").strip(),
+                    valid_until=str(meta.get("valid_until") or "").strip(),
+                )
+                atomic_write(target, archived_user)
                 rel_out = target.relative_to(self.root).as_posix()
                 message = f"memory({self.library_id}): archive {rel_out}"
                 sync_status = self._maybe_auto_commit(message)
@@ -2003,69 +2280,72 @@ class MemoryStore:
                     "updated_at": ts_now,
                 }, sync_status)
 
+            if before_archive is not None:
+                overrides = before_archive()
+                if isinstance(overrides, dict):
+                    if overrides.get("already_archived"):
+                        return {
+                            **self._result_metadata(),
+                            "from": overrides["orig_rel"],
+                            "to": overrides["orig_rel"],
+                            "layer": "L4",
+                        }
+                    orig_rel = overrides.get("orig_rel", orig_rel)
+                    name = overrides.get("slug", name)
+
             indexed = self.parse_index()
-            for layer, folder in LAYER_DIRS.items():
-                if layer == "L4" or layer not in self.allowed_layers:
-                    continue
-                candidate = self.root / folder / f"{name}.md"
-                if candidate.is_file():
-                    dest = self.root / "archive" / f"{name}.md"
-                    if dest.exists():
-                        raise ValueError(f"Archive file already exists: archive/{name}.md")
-                    old_rel = f"{folder}/{name}.md"
-                    idx_info = indexed.get(old_rel, {})
-                    raw = candidate.read_text(encoding="utf-8")
-                    meta, body = parse_frontmatter(raw)
-                    cre_at, old_updated, _, _ = file_timestamps(candidate, meta)
-                    ts_now = now_iso(old_updated)
-                    title = idx_info.get("title") or extract_title(body, name)
-                    fm_desc = meta.get("description") or idx_info.get("description") or title
-                    idx_desc = idx_info.get("description") or fm_desc
-                    fm_name = meta.get("name", name)
-                    name_serialized = fm_name if NAME_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
-                    desc_json = json.dumps(fm_desc, ensure_ascii=False)
-                    fm_type = meta.get("type") if meta.get("type") in VALID_TOPIC_TYPES else "reference"
-                    extra_fm = ""
-                    if (meta.get("verified_at") or "").strip():
-                        extra_fm += f"verified_at: {json.dumps(str(meta['verified_at']).strip())}\n"
-                    if (meta.get("valid_until") or "").strip():
-                        extra_fm += f"valid_until: {json.dumps(str(meta['valid_until']).strip())}\n"
-                    archived_raw = (
-                        f"---\n"
-                        f"name: {name_serialized}\n"
-                        f"description: {desc_json}\n"
-                        f"type: {fm_type}\n"
-                        f"created_at: {json.dumps(cre_at)}\n"
-                        f"updated_at: {json.dumps(ts_now)}\n"
-                        f"{extra_fm}"
-                        f"---\n\n"
-                        f"{body.strip()}\n"
-                    )
-                    new_rel = f"archive/{name}.md"
-                    prev_index_text = self.index_path.read_text(encoding="utf-8")
-                    self._backup_to_trash(candidate, f"archive-{name}")
-                    atomic_write(dest, archived_raw)
-                    try:
-                        self._remove_index_line(old_rel)
-                        self._upsert_index_line("L4", title, new_rel, idx_desc)
-                    except Exception:
-                        dest.unlink(missing_ok=True)
-                        try:
-                            atomic_write(self.index_path, prev_index_text)
-                        except OSError:
-                            pass
-                        raise
-                    candidate.unlink(missing_ok=True)
-                    message = f"memory({self.library_id}): archive {old_rel} -> {new_rel}"
-                    sync_status = self._maybe_auto_commit(message)
-                    self._enqueue_async_sync(message)
-                    return self._with_sync_warning({
-                        **self._result_metadata(),
-                        "from": old_rel,
-                        "to": new_rel,
-                        "layer": "L4",
-                        "updated_at": ts_now,
-                    }, sync_status)
+            if orig_rel:
+                candidate = self.resolve_safe(orig_rel)
+                candidates = [(candidate, orig_rel)] if candidate.is_file() else []
+                if not name:
+                    name = candidate.stem
+            else:
+                candidates = [
+                    (self.root / folder / f"{name}.md", f"{folder}/{name}.md")
+                    for layer, folder in LAYER_DIRS.items()
+                    if layer != "L4" and layer in self.allowed_layers
+                    and (self.root / folder / f"{name}.md").is_file()
+                ]
+            for candidate, old_rel in candidates:
+                dest = self.root / "archive" / f"{name}.md"
+                if dest.exists():
+                    raise ValueError(f"Archive file already exists: archive/{name}.md")
+                idx_info = indexed.get(old_rel, {})
+                raw = candidate.read_text(encoding="utf-8")
+                meta, body = parse_frontmatter(raw)
+                cre_at, old_updated, _, _ = file_timestamps(candidate, meta)
+                ts_now = now_iso(old_updated)
+                title = idx_info.get("title") or extract_title(body, name)
+                fm_desc = meta.get("description") or idx_info.get("description") or title
+                idx_desc = idx_info.get("description") or fm_desc
+                fm_name = meta.get("name", name)
+                fm_type = meta.get("type") if meta.get("type") in VALID_TOPIC_TYPES else "reference"
+                archived_raw = format_topic_markdown(
+                    fm_name,
+                    fm_desc,
+                    fm_type,
+                    cre_at,
+                    ts_now,
+                    body,
+                    verified_at=str(meta.get("verified_at") or "").strip(),
+                    valid_until=str(meta.get("valid_until") or "").strip(),
+                )
+                new_rel = f"archive/{name}.md"
+                self._backup_to_trash(candidate, f"archive-{name}")
+                self._write_topic_and_index(
+                    dest, new_rel, "L4", title, idx_desc, archived_raw, remove_rels=(old_rel,)
+                )
+                candidate.unlink(missing_ok=True)
+                message = f"memory({self.library_id}): archive {old_rel} -> {new_rel}"
+                sync_status = self._maybe_auto_commit(message)
+                self._enqueue_async_sync(message)
+                return self._with_sync_warning({
+                    **self._result_metadata(),
+                    "from": old_rel,
+                    "to": new_rel,
+                    "layer": "L4",
+                    "updated_at": ts_now,
+                }, sync_status)
 
         raise ValueError(f"Active entry not found: {name}")
 

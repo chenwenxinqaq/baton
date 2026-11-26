@@ -17,13 +17,11 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import stat
 from string import Template
 import sys
 import time
 import threading
-from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 
@@ -40,10 +38,8 @@ from library_paths import (
     data_root,
     library_state_dir,
     library_unavailable_reason,
-    lock_file,
     resolve_libraries,
     unavailable_issue,
-    unlock_file,
 )
 import audit_log  # noqa: E402
 import memory_import  # noqa: E402
@@ -186,7 +182,7 @@ def desktop_status_strip(key, library):
     except Exception:
         pass
     try:
-        report = mcp_server.MemoryStore(library.root).lint()
+        report = library.store.lint()
         by_sev = (report.get("summary") or {}).get("by_severity") or {}
         err_cnt = by_sev.get("error", 0)
         warn_cnt = by_sev.get("warning", 0)
@@ -277,25 +273,19 @@ class Entry:
         return LAYERS[self.layer][1]
 
     def markdown(self):
-        metadata = {
-            "name": self.name,
-            "title": self.title,
-            "description": self.description,
-            "type": self.resolved_type(),
-            "layer": self.layer,
-            "status": self.status,
-            "created_at": self.created_at or self.updated_at,
-            "updated_at": self.updated_at,
-        }
-        if self.verified_at:
-            metadata["verified_at"] = self.verified_at
-        if self.valid_until:
-            metadata["valid_until"] = self.valid_until
-        fields = "\n".join(
-            f"{key}: {json.dumps(value, ensure_ascii=False)}"
-            for key, value in metadata.items()
+        return mcp_server.format_user_markdown(
+            self.name,
+            self.title,
+            self.description,
+            self.resolved_type(),
+            self.layer,
+            self.status,
+            self.created_at or self.updated_at,
+            self.updated_at,
+            self.body,
+            verified_at=self.verified_at,
+            valid_until=self.valid_until,
         )
-        return f"---\n{fields}\n---\n\n{self.body}\n"
 
     @classmethod
     def from_file(cls, name, raw):
@@ -410,52 +400,41 @@ class Library:
         self.lock_path = self.state_dir / "library.lock"
         self.trash_dir = self.state_dir / "trash"
         self.label = label
+        self.store = mcp_server.MemoryStore(
+            root,
+            library_id=library_id,
+            label=label,
+            role=role,
+            mode=mode,
+            allowed_layers=self.allowed_layers,
+            allow_user_managed=self.allow_user_managed,
+            sync_config=sync_config,
+            async_scheduler=async_scheduler,
+            audit_source="manager",
+            audit_client="Unified Memory Web",
+            log_sync_warnings=True,
+        )
         # The web UI keeps the primary write API stable (save_topic still returns a path), while
         # retaining the latest non-fatal Git snapshot outcome for notices and diagnostics.
-        self.last_sync_status = None
+
+    @property
+    def last_sync_status(self):
+        return self.store.last_sync_status
+
+    @last_sync_status.setter
+    def last_sync_status(self, value):
+        self.store.last_sync_status = value
 
     def _enqueue_async_sync(self, message):
-        """Queue a debounced remote Git sync after a successful local write.
-
-        This is deliberately best-effort.  Local writes and their existing
-        ``auto_commit`` behavior remain authoritative; scheduler failures are
-        persisted by the worker and must never turn a completed web write into
-        an HTTP error.
-        """
-        scheduler = self.async_scheduler
-        if scheduler is None:
-            return None
-        config = self.sync_config or {}
-        if (
-            self.mode != "rw"
-            or str(config.get("driver") or "").casefold() != "git"
-            or not bool(config.get("auto_push", False))
-        ):
-            return None
-        try:
-            return scheduler.enqueue(
-                self.root,
-                sync_config=config,
-                mode=self.mode,
-                reason=message,
-            )
-        except Exception:
-            return None
+        """Queue a debounced remote Git sync via the shared MemoryStore."""
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        return self.store._enqueue_async_sync(message)
 
     def async_sync_status(self):
         """Return the latest persisted/in-process asynchronous sync status."""
-        scheduler = self.async_scheduler
-        if scheduler is not None:
-            try:
-                return scheduler.status(self.root)
-            except Exception:
-                pass
-        path = self.state_dir / "sync-status.json"
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return payload if isinstance(payload, dict) else {}
-        except (FileNotFoundError, OSError, ValueError):
-            return {}
+        self.store.async_scheduler = self.async_scheduler
+        return self.store.async_sync_status()
 
     @property
     def is_readonly(self):
@@ -471,89 +450,19 @@ class Library:
             raise InvalidEntry(f"记忆库「{self.label}」未启用层级 {layer}（允许：{allowed_str}）。")
 
     def _maybe_auto_commit(self, message):
-        """Auto-commit to Git without making the primary web write fail.
-
-        Existing manager callers intentionally ignore the return value, so a successful write
-        still returns the same path/None as before.  The returned status and
-        ``last_sync_status`` make failures observable to callers that opt in, while the audit
-        event and stderr warning provide a durable/operator-visible trail.
-        """
-        self.last_sync_status = None
-        if not self.sync_config or self.sync_config.get("driver") != "git":
-            return None
-        if not self.sync_config.get("auto_commit", True):
-            return None
-
-        def redacted(value):
-            return sync_git.redact_remote_url(str(value or ""))[:320]
-
-        def failure(result, *, error="", reason=None):
-            if isinstance(result, dict):
-                status = dict(result)
-            else:
-                status = {"committed": False, "reason": reason or "sync_error"}
-            status["committed"] = False
-            reason = redacted(status.get("reason") or "unknown")
-            detail = redacted(error or status.get("error") or "")
-            status["reason"] = reason
-            if detail:
-                status["error"] = detail
-            status["warning"] = f"记忆已保存，但 Git 快照未提交（原因：{reason}）。"
-            self.last_sync_status = status
-            audit_log.record(
-                {
-                    "source": "manager",
-                    "event": "git_auto_commit",
-                    "client": "Unified Memory Web",
-                    "tool": "git_auto_commit",
-                    "ok": False,
-                    "library": self.library_id,
-                    "message": redacted(message),
-                    "reason": reason,
-                    "error": detail,
-                }
-            )
-            try:
-                print(f"[unified-memory] {status['warning']}", file=sys.stderr)
-            except Exception:
-                pass
-            return status
-
-        try:
-            result = sync_git.auto_commit(self.root, message)
-        except Exception as exc:
-            return failure(None, error=exc, reason="exception")
-        if isinstance(result, dict) and not result.get("committed") and result.get("reason") in {
-            "clean",
-            "nothing_allowed",
-        }:
-            self.last_sync_status = result
-            return result
-        if not isinstance(result, dict) or not result.get("committed"):
-            return failure(result)
-        self.last_sync_status = result
-        return result
+        """Auto-commit to Git via the shared MemoryStore."""
+        self.store.sync_config = self.sync_config
+        return self.store._maybe_auto_commit(message)
 
     @contextmanager
     def write_lock(self):
         """Serialize concurrent writes with MCP servers."""
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+", encoding="utf-8") as fh:
-            lock_file(fh.fileno())
-            try:
-                yield
-            finally:
-                unlock_file(fh.fileno())
+        with self.store.write_lock():
+            yield
 
     def _backup_to_trash(self, src_path, slug_hint):
         """Save a safety backup copy into .state/trash/ before deleting a memory."""
-        if not src_path.is_file():
-            return
-        self.trash_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug_hint)[:80] or "entry"
-        dest = self.trash_dir / f"{stamp}-{safe_slug}-{secrets.token_hex(2)}.md"
-        shutil.copy2(src_path, dest)
+        return self.store._backup_to_trash(src_path, slug_hint)
 
     def topic_versions(self, slug, limit=8):
         """List saved previous versions of one entry.
@@ -563,17 +472,15 @@ class Library:
         """
         if not mcp_server.NAME_RE.fullmatch(slug or ""):
             return []
-        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
         try:
-            return store.entry_history(slug, limit=limit).get("versions", [])
+            return self.store.entry_history(slug, limit=limit).get("versions", [])
         except (ValueError, OSError):
             return []
 
     def topic_links(self, topic_path, body):
         """Return (outgoing links, incoming backlinks) for one topic."""
-        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
         try:
-            return store.entry_links(topic_path, body)
+            return self.store.entry_links(topic_path, body)
         except (ValueError, OSError):
             return [], []
 
@@ -605,15 +512,15 @@ class Library:
         """Put a saved version back as the current entry; returns its path."""
         if self.is_readonly:
             raise InvalidEntry("该库为只读挂载，无法恢复历史版本。")
-        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
         # restore_entry takes the shared write lock itself, so do not wrap it.
-        result = store.restore_entry(version)
+        result = self.store.restore_entry(version)
         return result.get("path", "")
 
     def version_diff(self, version):
         """Return a unified diff between one saved backup version and the live entry."""
-        store = mcp_server.MemoryStore(self.root, label=self.label, allowed_layers=self.allowed_layers)
-        preview = store.restore_entry(version, dry_run=True)
+        preview = self.store.restore_entry(version, dry_run=True)
         _, backup_body = mcp_server.parse_frontmatter(preview.get("content") or "")
         backup_lines = backup_body.strip().splitlines()
         current_rel = preview.get("would_replace") or ""
@@ -710,14 +617,14 @@ class Library:
             if not candidate.is_relative_to(self.root) or not candidate.is_file():
                 raise InvalidEntry(f"索引引用的文件不存在：{rel_path}")
 
-        with self.write_lock():
+        def verify_revision():
             cur_rev = sha256(self.index.read_bytes()).hexdigest()
             if cur_rev != expected_revision:
                 raise StaleEntry
-            mcp_server.atomic_write(self.index, normalized + "\n")
-        message = f"memory({self.library_id}): update MEMORY.md"
-        self._maybe_auto_commit(message)
-        self._enqueue_async_sync(message)
+
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        self.store.save_index_text(normalized, before_write=verify_revision)
 
     @staticmethod
     def _topic_revision(raw_bytes, topic):
@@ -805,20 +712,7 @@ class Library:
         between leaves a file that every later save with the same slug collides with.
         The file goes to the trash backups first, so nothing is lost.
         """
-        if not TOPIC_SLUG_RE.fullmatch(slug or ""):
-            return []
-        removed = []
-        with self.write_lock():
-            _, index = self.read_index()
-            for folder in mcp_server.LAYER_DIRS.values():
-                rel = f"{folder}/{slug}.md"
-                path = self.root / rel
-                if rel in index or path.is_symlink() or not path.is_file():
-                    continue
-                self._backup_to_trash(path, slug)
-                path.unlink()
-                removed.append(rel)
-        return removed
+        return self.store.discard_unindexed_topic(slug)
 
     def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type="",
                    verified_at=None, valid_until=None, body_limit=MAX_BODY_CHARS):
@@ -827,26 +721,18 @@ class Library:
                                body_limit=body_limit)
         norm_verified = None if verified_at is None else str(verified_at).strip()
         norm_valid_until = None if valid_until is None else str(valid_until).strip()
-        with self.write_lock():
-            store = mcp_server.MemoryStore(self.root)
-            _, current_topics = self.read_index()
 
+        def prepare_topic():
             if orig_path:
+                _, current_topics = self.read_index()
                 try:
                     cur = self.read_topic(orig_path, current_topics)
                 except (FileNotFoundError, InvalidEntry) as exc:
                     raise StaleEntry from exc
-                orig_path = cur.path
                 if cur.revision != expected_revision:
                     raise StaleEntry
 
                 stem = cur.slug
-                new_folder = mcp_server.LAYER_DIRS[layer]
-                new_rel = f"{new_folder}/{stem}.md"
-                new_file = self.root / new_rel
-                if new_rel != orig_path and new_file.exists():
-                    raise InvalidEntry(f"目标层级目录已存在同名文件：{new_rel}")
-
                 fm_name = cur.meta_name or stem
                 if description.strip() == cur.description.strip() and cur.file_description:
                     fm_desc = cur.file_description
@@ -860,98 +746,55 @@ class Library:
                 else:
                     fm_type = LAYERS[layer][1]
 
-                ts_now = mcp_server.now_iso(cur.updated_at)
-                cre_at = cur.created_at or ts_now
                 eff_verified = cur.verified_at if norm_verified is None else norm_verified
                 eff_valid_until = cur.valid_until if norm_valid_until is None else norm_valid_until
                 if eff_verified and eff_valid_until and eff_valid_until < eff_verified:
                     raise InvalidEntry("有效期截止日期不能早于核实日期。")
-                name_serialized = (
-                    fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
-                )
-                desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
-                extra_fm = ""
-                if eff_verified:
-                    extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
-                if eff_valid_until:
-                    extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
-                content = (
-                    f"---\n"
-                    f"name: {name_serialized}\n"
-                    f"description: {desc_serialized}\n"
-                    f"type: {fm_type}\n"
-                    f"created_at: {json.dumps(cre_at)}\n"
-                    f"updated_at: {json.dumps(ts_now)}\n"
-                    f"{extra_fm}"
-                    f"---\n\n"
-                    f"{body.strip()}\n"
-                )
-                prev_bytes = new_file.read_bytes() if new_file.is_file() else None
-                prev_index_text = self.index.read_text(encoding="utf-8")
-                mcp_server.atomic_write(new_file, content)
-                idx_desc = description.strip() or title
-                try:
-                    if new_rel != orig_path:
-                        store._remove_index_line(orig_path)
-                    store._upsert_index_line(layer, title, new_rel, idx_desc)
-                except Exception:
-                    if prev_bytes is None:
-                        new_file.unlink(missing_ok=True)
-                    else:
-                        mcp_server.atomic_write(new_file, prev_bytes.decode("utf-8"))
-                    try:
-                        mcp_server.atomic_write(self.index, prev_index_text)
-                    except OSError:
-                        pass
-                    raise
-                if new_rel != orig_path:
-                    (self.root / orig_path).unlink(missing_ok=True)
-                message = f"memory({self.library_id}): update {new_rel}"
-                self._maybe_auto_commit(message)
-                self._enqueue_async_sync(message)
-                return new_rel
+                return {
+                    "orig_rel": cur.path,
+                    "slug": stem,
+                    "entry_type": fm_type,
+                    "frontmatter_name": fm_name,
+                    "file_description": fm_desc,
+                    "created_at": cur.created_at,
+                    "previous_updated_at": cur.updated_at,
+                    "verified_at": eff_verified,
+                    "valid_until": eff_valid_until,
+                }
 
-            ts_now = mcp_server.now_iso()
             final_slug = self._generate_unique_slug(title, slug)
-            new_folder = mcp_server.LAYER_DIRS[layer]
-            new_rel = f"{new_folder}/{final_slug}.md"
-            new_file = self.root / new_rel
             fm_type = entry_type if entry_type in VALID_TOPIC_TYPES else LAYERS[layer][1]
-            idx_desc = description.strip() or title
-            desc_serialized = json.dumps(idx_desc, ensure_ascii=False)
-            eff_verified = norm_verified or ""
-            eff_valid_until = norm_valid_until or ""
-            extra_fm = ""
-            if eff_verified:
-                extra_fm += f"verified_at: {json.dumps(eff_verified)}\n"
-            if eff_valid_until:
-                extra_fm += f"valid_until: {json.dumps(eff_valid_until)}\n"
-            content = (
-                f"---\n"
-                f"name: {final_slug}\n"
-                f"description: {desc_serialized}\n"
-                f"type: {fm_type}\n"
-                f"created_at: {json.dumps(ts_now)}\n"
-                f"updated_at: {json.dumps(ts_now)}\n"
-                f"{extra_fm}"
-                f"---\n\n"
-                f"{body.strip()}\n"
+            return {
+                "orig_rel": "",
+                "slug": final_slug,
+                "entry_type": fm_type,
+                "frontmatter_name": final_slug,
+                "file_description": None,
+                "created_at": "",
+                "previous_updated_at": "",
+                "verified_at": norm_verified or "",
+                "valid_until": norm_valid_until or "",
+            }
+
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        try:
+            return self.store.save_topic_entry(
+                layer=layer,
+                title=title,
+                description=description,
+                body=body,
+                before_write=prepare_topic,
             )
-            mcp_server.atomic_write(new_file, content)
-            try:
-                store._upsert_index_line(layer, title, new_rel, idx_desc)
-            except Exception:
-                new_file.unlink(missing_ok=True)
-                raise
-            message = f"memory({self.library_id}): create {new_rel}"
-            self._maybe_auto_commit(message)
-            self._enqueue_async_sync(message)
-            return new_rel
+        except InvalidEntry:
+            raise
+        except ValueError as exc:
+            raise InvalidEntry(str(exc)) from exc
 
     def archive_topic(self, topic_path, expected_revision):
         self._ensure_writable(layer="L4")
-        with self.write_lock():
-            store = mcp_server.MemoryStore(self.root)
+
+        def prepare_archive():
             _, current_topics = self.read_index()
             try:
                 cur = self.read_topic(topic_path, current_topics)
@@ -959,57 +802,27 @@ class Library:
                 raise StaleEntry from exc
             if cur.revision != expected_revision:
                 raise StaleEntry
-            topic_path = cur.path
             if cur.layer == "L4":
-                return cur.path
+                return {"already_archived": True, "orig_rel": cur.path, "slug": cur.slug}
+            return {"orig_rel": cur.path, "slug": cur.slug}
 
-            new_rel = f"archive/{cur.slug}.md"
-            dest = self.root / new_rel
-            if dest.exists():
-                raise InvalidEntry(f"归档目录已存在同名文件：{new_rel}")
-
-            ts_now = mcp_server.now_iso(cur.updated_at)
-            cre_at = cur.created_at or ts_now
-            fm_name = cur.meta_name or cur.slug
-            name_serialized = (
-                fm_name if TOPIC_SLUG_RE.fullmatch(fm_name) else json.dumps(fm_name, ensure_ascii=False)
-            )
-            fm_desc = cur.file_description or cur.description or cur.title
-            desc_serialized = json.dumps(fm_desc, ensure_ascii=False)
-            fm_type = cur.entry_type if cur.entry_type in VALID_TOPIC_TYPES else "reference"
-            extra_fm = ""
-            if cur.verified_at:
-                extra_fm += f"verified_at: {json.dumps(cur.verified_at)}\n"
-            if cur.valid_until:
-                extra_fm += f"valid_until: {json.dumps(cur.valid_until)}\n"
-            content = (
-                f"---\n"
-                f"name: {name_serialized}\n"
-                f"description: {desc_serialized}\n"
-                f"type: {fm_type}\n"
-                f"created_at: {json.dumps(cre_at)}\n"
-                f"updated_at: {json.dumps(ts_now)}\n"
-                f"{extra_fm}"
-                f"---\n\n"
-                f"{cur.body.strip()}\n"
-            )
-            mcp_server.atomic_write(dest, content)
-            try:
-                store._remove_index_line(topic_path)
-                store._upsert_index_line("L4", cur.title, new_rel, cur.description or fm_desc)
-            except Exception:
-                dest.unlink(missing_ok=True)
-                raise
-            (self.root / topic_path).unlink(missing_ok=True)
-            message = f"memory({self.library_id}): archive {topic_path} -> {new_rel}"
-            self._maybe_auto_commit(message)
-            self._enqueue_async_sync(message)
-            return new_rel
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        try:
+            result = self.store.archive_entry(before_archive=prepare_archive)
+        except InvalidEntry:
+            raise
+        except ValueError as exc:
+            msg = str(exc)
+            if msg.startswith("Archive file already exists: "):
+                raise InvalidEntry(f"归档目录已存在同名文件：{msg.split(': ', 1)[1]}") from exc
+            raise InvalidEntry(msg) from exc
+        return result.get("to", "")
 
     def delete_topic(self, topic_path, expected_revision):
         self._ensure_writable()
-        with self.write_lock():
-            store = mcp_server.MemoryStore(self.root)
+
+        def prepare_delete():
             _, current_topics = self.read_index()
             try:
                 cur = self.read_topic(topic_path, current_topics)
@@ -1017,14 +830,16 @@ class Library:
                 raise StaleEntry from exc
             if cur.revision != expected_revision:
                 raise StaleEntry
-            topic_path = cur.path
-            target = self.root / topic_path
-            self._backup_to_trash(target, cur.slug)
-            target.unlink()
-            store._remove_index_line(topic_path)
-        message = f"memory({self.library_id}): delete {topic_path}"
-        self._maybe_auto_commit(message)
-        self._enqueue_async_sync(message)
+            return {"rel_path": cur.path, "slug_hint": cur.slug}
+
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        try:
+            self.store.delete_entry(user_managed=False, before_delete=prepare_delete)
+        except InvalidEntry:
+            raise
+        except ValueError as exc:
+            raise InvalidEntry(str(exc)) from exc
 
     def path(self, name):
         if not self.allow_user_managed:
@@ -1069,8 +884,9 @@ class Library:
         if norm_v and norm_u and norm_u < norm_v:
             raise InvalidEntry("有效期截止日期不能早于核实日期。")
         entry = replace(entry, verified_at=norm_v, valid_until=norm_u)
-        path = self.path(entry.name)
-        with self.write_lock():
+        self.path(entry.name)
+
+        def prepare_user():
             if entry.revision:
                 try:
                     current = self.read(entry.name)
@@ -1078,45 +894,60 @@ class Library:
                     raise StaleEntry from exc
                 if entry.revision != current.revision:
                     raise StaleEntry
-                ts_now = mcp_server.now_iso(current.updated_at)
-            else:
-                ts_now = mcp_server.now_iso()
-            entry = replace(entry, updated_at=ts_now)
-            staged = None
-            try:
-                with NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=self.folder, prefix=".memory-", delete=False
-                ) as stream:
-                    staged = Path(stream.name)
-                    stream.write(entry.markdown())
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if entry.revision:
-                    staged.replace(path)
-                else:
-                    os.link(staged, path)
-            finally:
-                if staged is not None:
-                    staged.unlink(missing_ok=True)
-        message = f"memory({self.library_id}): save user-managed/{entry.name}.md"
-        self._maybe_auto_commit(message)
-        self._enqueue_async_sync(message)
+                return {
+                    "previous_updated_at": current.updated_at,
+                    "created_at": entry.created_at or current.created_at,
+                }
+            return {"previous_updated_at": "", "created_at": entry.created_at}
+
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        try:
+            self.store.save_user_entry(
+                name=entry.name,
+                title=entry.title,
+                description=entry.description,
+                body=entry.body,
+                layer=entry.layer,
+                entry_type=entry.resolved_type(),
+                status=entry.status,
+                created_at=entry.created_at,
+                verified_at=entry.verified_at,
+                valid_until=entry.valid_until,
+                exclusive_create=not entry.revision,
+                before_write=prepare_user,
+            )
+        except InvalidEntry:
+            raise
+        except ValueError as exc:
+            raise InvalidEntry(str(exc)) from exc
 
     def delete_user_entry(self, name, expected_revision):
         self._ensure_writable(user_managed=True)
-        path = self.path(name)
-        with self.write_lock():
+        self.path(name)
+
+        def prepare_delete():
             try:
                 current = self.read(name)
             except (FileNotFoundError, ValueError) as exc:
                 raise StaleEntry from exc
             if current.revision != expected_revision:
                 raise StaleEntry
-            self._backup_to_trash(path, name)
-            path.unlink()
-        message = f"memory({self.library_id}): delete user-managed/{name}.md"
-        self._maybe_auto_commit(message)
-        self._enqueue_async_sync(message)
+            return {"rel_path": f"user-managed/{name}.md", "slug_hint": name}
+
+        self.store.sync_config = self.sync_config
+        self.store.async_scheduler = self.async_scheduler
+        try:
+            self.store.delete_entry(
+                rel_path=f"user-managed/{name}.md",
+                user_managed=True,
+                slug_hint=name,
+                before_delete=prepare_delete,
+            )
+        except InvalidEntry:
+            raise
+        except ValueError as exc:
+            raise InvalidEntry(str(exc)) from exc
 
 
 def validate_common_fields(layer, title, description, body, verified_at=None, valid_until=None,
@@ -4687,25 +4518,24 @@ class Handler(BaseHTTPRequestHandler):
             recent = []
             for lib_key, lib in self.libraries.items():
                 try:
-                    store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
-                    for entry in store.list_entries(include_archived=False, sort="updated")[:8]:
+                    for entry in lib.store.list_entries(include_archived=False, sort="updated")[:8]:
                         recent.append((entry.get("updated_at") or "", lib_key, lib.label, entry))
                 except OSError:
                     continue
             recent.sort(key=lambda row: row[0], reverse=True)
             for _, lib_key, lib_label, entry in recent[:10]:
-                ref = entry.get("ref", "")
-                if ref.startswith("user-managed/") and ref.endswith(".md"):
-                    href = query(library=lib_key, entry=Path(ref).stem) + "#detail-title"
+                rel_path = entry.get("path") or entry.get("ref", "")
+                if rel_path.startswith("user-managed/") and rel_path.endswith(".md"):
+                    href = query(library=lib_key, entry=Path(rel_path).stem) + "#detail-title"
                 else:
-                    href = query(library=lib_key, topic=ref) + "#detail-title"
+                    href = query(library=lib_key, topic=rel_path) + "#detail-title"
                 items.append(
                     {
-                        "title": entry.get("title") or ref,
+                        "title": entry.get("title") or rel_path,
                         "description": entry.get("description") or "",
                         "layer": entry.get("layer") or "",
                         "library": lib_label,
-                        "ref": ref,
+                        "ref": rel_path,
                         "href": href,
                         "expired": bool(entry.get("expired")),
                     }
@@ -4714,8 +4544,7 @@ class Handler(BaseHTTPRequestHandler):
             scored = []
             for lib_key, lib in self.libraries.items():
                 try:
-                    store = mcp_server.MemoryStore(lib.root, label=lib.label, allowed_layers=lib.allowed_layers)
-                    for hit in store.search(q, limit=8, include_archived=True):
+                    for hit in lib.store.search(q, limit=8, include_archived=True):
                         scored.append((hit.get("score", 0), hit.get("updated_at") or "", lib_key, lib.label, hit))
                 except OSError:
                     continue
@@ -4723,18 +4552,18 @@ class Handler(BaseHTTPRequestHandler):
             scored.sort(key=lambda row: row[1], reverse=True)
             scored.sort(key=lambda row: row[0], reverse=True)
             for _, _, lib_key, lib_label, hit in scored[:12]:
-                ref = hit.get("ref", "")
-                if ref.startswith("user-managed/") and ref.endswith(".md"):
-                    href = query(library=lib_key, entry=Path(ref).stem) + "#detail-title"
+                rel_path = hit.get("path") or hit.get("ref", "")
+                if rel_path.startswith("user-managed/") and rel_path.endswith(".md"):
+                    href = query(library=lib_key, entry=Path(rel_path).stem) + "#detail-title"
                 else:
-                    href = query(library=lib_key, topic=ref) + "#detail-title"
+                    href = query(library=lib_key, topic=rel_path) + "#detail-title"
                 items.append(
                     {
-                        "title": hit.get("title") or ref,
+                        "title": hit.get("title") or rel_path,
                         "description": hit.get("description") or hit.get("snippet") or "",
                         "layer": hit.get("layer") or "",
                         "library": lib_label,
-                        "ref": ref,
+                        "ref": rel_path,
                         "href": href,
                         "expired": bool(hit.get("expired")),
                     }
@@ -4999,18 +4828,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise InvalidEntry(
                         f"目标库「{dst_lib.label}」已存在 {dst_folder}/{t_entry.slug}.md；如需覆盖请勾选确认项。"
                     )
-                dst_store = mcp_server.MemoryStore(
-                    dst_lib.root,
-                    library_id=dst_lib.library_id,
-                    label=dst_lib.label,
-                    role=dst_lib.role,
-                    mode=dst_lib.mode,
-                    allowed_layers=dst_lib.allowed_layers,
-                    allow_user_managed=dst_lib.allow_user_managed,
-                    sync_config=dst_lib.sync_config,
-                    async_scheduler=getattr(self.server, "async_scheduler", None),
-                )
-                saved = dst_store.upsert_entry(
+                dst_lib.store.sync_config = dst_lib.sync_config
+                dst_lib.store.async_scheduler = getattr(self.server, "async_scheduler", dst_lib.async_scheduler)
+                saved = dst_lib.store.upsert_entry(
                     layer=target_layer,
                     name=t_entry.slug,
                     title=t_entry.title,
