@@ -2074,7 +2074,9 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 <button class="btn btn-ghost btn-compact" type="submit">重建索引</button>
               </form>"""
 
-        stray_list = memoryctl.scan_stray_agent_memories(home=agent_home)
+        # Imports are filed into the primary library, so only its receipts can clear the list.
+        stray_root = library.root if library is not None and key == "primary" else None
+        stray_list = memoryctl.scan_stray_agent_memories(home=agent_home, root=stray_root)
         stray_alert = ""
         if stray_list:
             stray_items = "".join(f"<li><code>{escape(p)}</code></li>" for p in stray_list[:20])

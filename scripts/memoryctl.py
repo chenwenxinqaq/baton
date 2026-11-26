@@ -559,20 +559,18 @@ def restore_legacy_codex_memories(toml_text, restore):
     return toml_text
 
 
-def scan_stray_agent_memories(home=None):
-    """Find any stray .md memory files written into hidden per-client default directories."""
-    home = home or Path.home()
-    stray = []
-    claude_projects = home / ".claude" / "projects"
-    if claude_projects.is_dir():
-        for mem_dir in sorted(claude_projects.glob("*/memory")):
-            if not mem_dir.is_dir() or mem_dir.is_symlink():
-                continue
-            for md in sorted(mem_dir.glob("*.md")):
-                if md.name == "MEMORY.md" and md.stat().st_size == 0:
-                    continue
-                stray.append(str(md))
-    return stray
+def scan_stray_agent_memories(home=None, root=None):
+    """Find native Claude memory files that the library at ``root`` has not filed yet.
+
+    The importer decides which files count, so this list and the import queue
+    always agree. Without ``root``, every importable file is reported.
+    """
+    from memory_import import unfiled_sources
+
+    try:
+        return unfiled_sources("claude", root=root, home=home)
+    except (OSError, ValueError):
+        return []
 
 
 def _claude_desktop_config_path(home, *, use_env=True):
@@ -2301,7 +2299,7 @@ def run_doctor(fix=False, home=None):
                 )
         agent_reports.append(report)
 
-    stray = scan_stray_agent_memories(home=home)
+    stray = scan_stray_agent_memories(home=home, root=MEMORY_ROOT)
     if stray:
         findings.append(
             {

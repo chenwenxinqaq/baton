@@ -160,7 +160,7 @@ def _collect_markdown(client, groups):
     return candidates, warnings
 
 
-def _collect_claude(profile):
+def _claude_groups(profile):
     directories = set(profile.glob("projects/*/memory"))
     settings = profile / "settings.json"
     if settings.is_file():
@@ -177,7 +177,7 @@ def _collect_claude(profile):
         topics = [path for path in directory.glob("*.md") if path.name != "MEMORY.md" and not path.is_symlink()]
         base = profile if directory.is_relative_to(profile) else directory
         groups.append((base, topics or [directory / "MEMORY.md"]))
-    return _collect_markdown("claude", groups)
+    return groups
 
 
 def _body_digest(body):
@@ -221,22 +221,49 @@ def _save_candidates(root, client, candidates, warnings=()):
     return {"found": len(candidates), "added": added, "updated": updated, "warnings": list(dict.fromkeys(warnings))}
 
 
-def import_memories(root, client, home=None):
+def _markdown_groups(client, home=None):
+    """List the (base, files) groups of native Markdown memory the importer reads for a client."""
     user_home = (Path(home) if home is not None else Path.home()).resolve()
+    if client == "claude":
+        profile = os.environ.get("CLAUDE_CONFIG_DIR") if home is None else None
+        return _claude_groups(Path(profile or user_home / ".claude").expanduser().resolve())
+    if client == "antigravity":
+        gemini = user_home / ".gemini"
+        return [(gemini, list((gemini / directory / "knowledge").glob("**/*.md")))
+                for directory in ("antigravity", "antigravity-ide")]
+    raise ValueError("请选择记忆文件或粘贴原文。")
+
+
+def import_memories(root, client, home=None):
     if client == "codex":
+        user_home = (Path(home) if home is not None else Path.home()).resolve()
         profile = os.environ.get("CODEX_HOME") if home is None else None
         candidates, warnings = _collect_codex(Path(profile or user_home / ".codex").expanduser().resolve())
-    elif client == "claude":
-        profile = os.environ.get("CLAUDE_CONFIG_DIR") if home is None else None
-        candidates, warnings = _collect_claude(Path(profile or user_home / ".claude").expanduser().resolve())
-    elif client == "antigravity":
-        gemini = user_home / ".gemini"
-        groups = ((gemini, (gemini / directory / "knowledge").glob("**/*.md"))
-                  for directory in ("antigravity", "antigravity-ide"))
-        candidates, warnings = _collect_markdown(client, groups)
     else:
-        raise ValueError("请选择记忆文件或粘贴原文。")
+        candidates, warnings = _collect_markdown(client, _markdown_groups(client, home))
     return _save_candidates(root, client, candidates, warnings)
+
+
+def unfiled_sources(client, root=None, home=None):
+    """List native memory files the importer would read that the library has not filed.
+
+    A file counts as filed once its candidate was approved and the file has not
+    changed since. Without a library root, every importable file is listed.
+    """
+    directory = inbox(Path(root), client) if root is not None else None
+    unfiled = []
+    for base, paths in _markdown_groups(client, home):
+        for path in sorted(paths):
+            for candidate in _collect_markdown(client, [(base, [path])])[0]:
+                if directory is not None:
+                    try:
+                        existing = json.loads((directory / (candidate["id"] + ".json")).read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        existing = {}
+                    if existing.get("approved") and not _refresh_kind(existing, candidate):
+                        continue
+                unfiled.append(str(path))
+    return unfiled
 
 
 def import_text(root, client, title, body):

@@ -145,6 +145,27 @@ class MemoryImportTests(unittest.TestCase):
         self.assertEqual(self.scan_claude()["updated"], 0)
         self.assertEqual(memory_import.pending(self.root, "claude"), [])
 
+    def test_stray_scan_follows_the_importer_and_clears_after_approval(self):
+        import memoryctl
+
+        note = self.claude_note("海燕结论", 1_700_000_000)
+        index = note.with_name("MEMORY.md")
+        index.write_text("- [note](note.md)\n", encoding="utf-8")
+        # The importer skips MEMORY.md when topic files sit next to it; so must the warning.
+        self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home, root=self.root), [str(note)])
+        self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home), [str(note)])
+
+        self.scan_claude()
+        (item,) = memory_import.pending(self.root, "claude")
+        # Queued but unreviewed content is still outside the library.
+        self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home, root=self.root), [str(note)])
+
+        self.approve(item, client="claude")
+        self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home, root=self.root), [])
+
+        self.claude_note("海燕新结论", 1_700_000_500)
+        self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home, root=self.root), [str(note)])
+
 
 if __name__ == "__main__":
     unittest.main()
