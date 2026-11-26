@@ -2737,13 +2737,56 @@ def render_conflicts_view_html(token, key, library):
     return f'<div class="conflict-list">{"".join(blocks)}</div>'
 
 
-def filter_and_score(library, topics, entries, q, layer, status, source, window="", sort_by="updated"):
-    """Filter topics and user entries by layer/status/source/window, temporal cues, and sort order."""
+def query_plan(q):
+    """Split a search box query the way MCP search does.
+
+    Returns ``(has_temporal_cue, pure_temporal, raw_terms, subtokens, procedure_variants)``.
+    """
     q_stripped = q.strip()
     has_temporal_cue = bool(q_stripped and mcp_server.TEMPORAL_CUE_RE.search(q_stripped))
     residual_q = mcp_server.TEMPORAL_STOP_RE.sub(" ", q_stripped).strip() if has_temporal_cue else q_stripped
     pure_temporal = bool(has_temporal_cue and not residual_q)
-    raw_terms, subtokens = mcp_server.build_query_features("" if pure_temporal else (residual_q or q_stripped))
+    effective_q = "" if pure_temporal else (residual_q or q_stripped)
+    raw_terms, subtokens = mcp_server.build_query_features(effective_q)
+    return has_temporal_cue, pure_temporal, raw_terms, subtokens, mcp_server.procedure_phrase_variants(effective_q)
+
+
+def topic_search_fields(library, topic):
+    """Return the name, description and body MCP search would score for an indexed topic."""
+    try:
+        resolved = (library.root / topic.path).resolve(strict=True)
+        if not resolved.is_relative_to(library.root):
+            raise InvalidEntry("只能读取当前库中的 Markdown。")
+        meta, body = mcp_server.load_entry(resolved)
+    except (ValueError, OSError):
+        return Path(topic.path).stem, topic.description, ""
+    return str(meta.get("name") or Path(topic.path).stem), str(meta.get("description") or topic.description), body
+
+
+def top_hit_citations(library, topics, rows, q):
+    """List the indexed entries the best hit cites that the result list lacks.
+
+    This is the list MCP search returns as ``see_also``.
+    """
+    _, _, raw_terms, subtokens, variants = query_plan(q)
+    if not raw_terms or not rows or rows[0][1] != "index":
+        return []
+    top = rows[0][2]
+    name, description, body = topic_search_fields(library, top)
+    _, matched, _ = mcp_server.relevance(raw_terms, subtokens, variants, name, top.title, description, body)
+    if mcp_server.match_strength(raw_terms, matched) == "fuzzy":
+        return []
+    shown = {item.path for _, kind, item in rows if kind == "index"}
+    return [topics[path] for path in mcp_server.cited_paths(body, topics, shown)]
+
+
+def filter_and_score(library, topics, entries, q, layer, status, source, window="", sort_by="updated"):
+    """Filter topics and user entries by layer/status/source/window, temporal cues, and sort order.
+
+    Matching and scoring come from the MCP server, so the search box and
+    ``memory_search`` agree on what matches and how strongly.
+    """
+    has_temporal_cue, pure_temporal, raw_terms, subtokens, procedure_variants = query_plan(q)
 
     now_ep = datetime.now().astimezone().timestamp()
     window_cutoff = now_ep - 7 * 86400 if window == "7d" else None
@@ -2759,23 +2802,16 @@ def filter_and_score(library, topics, entries, q, layer, status, source, window=
                 continue
             score = 1
             if raw_terms:
-                body_text = ""
-                try:
-                    body_text = library.read_markdown(library.root / topic.path)
-                except (ValueError, OSError):
-                    body_text = ""
-                score, _ = mcp_server.score_fields(
-                    raw_terms,
-                    subtokens,
-                    Path(topic.path).stem.casefold(),
-                    topic.title.casefold(),
-                    topic.description.casefold(),
-                    body_text.casefold(),
+                name, description, body_text = topic_search_fields(library, topic)
+                score, _, _ = mcp_server.relevance(
+                    raw_terms, subtokens, procedure_variants, name, topic.title, description, body_text
                 )
                 if score == 0:
                     continue
-                if has_temporal_cue and now_ep - topic.updated_epoch <= 7 * 86400:
-                    score += 4
+                score = mcp_server.apply_freshness(
+                    score, now_ep - topic.updated_epoch, has_temporal_cue,
+                    topic.layer != "L4" and mcp_server.is_date_expired(topic.valid_until),
+                )
             scored_rows.append((score, "index", topic))
 
     if source != "index":
@@ -2786,18 +2822,15 @@ def filter_and_score(library, topics, entries, q, layer, status, source, window=
                 continue
             score = 1
             if raw_terms:
-                score, _ = mcp_server.score_fields(
-                    raw_terms,
-                    subtokens,
-                    item.name.casefold(),
-                    item.title.casefold(),
-                    item.description.casefold(),
-                    item.body.casefold(),
+                score, _, _ = mcp_server.relevance(
+                    raw_terms, subtokens, procedure_variants, item.name, item.title, item.description, item.body
                 )
                 if score == 0:
                     continue
-                if has_temporal_cue and now_ep - item.updated_epoch <= 7 * 86400:
-                    score += 4
+                score = mcp_server.apply_freshness(
+                    score, now_ep - item.updated_epoch, has_temporal_cue,
+                    item.layer != "L4" and mcp_server.is_date_expired(getattr(item, "valid_until", "")),
+                )
             scored_rows.append((score, "user", item))
 
     if raw_terms or pure_temporal:
@@ -3657,6 +3690,12 @@ def render(
         if rows
         else '<p class="empty">没有找到匹配的记忆条目，试试清空筛选或换个关键词。</p>'
     )
+    cited = top_hit_citations(library, topics, matched, q) if status == "active" and source != "user" else []
+    if cited:
+        cited_links = "、".join(
+            f'<a href="{escape(query(**link_params, topic=t.path))}">{escape(t.title)}</a>' for t in cited
+        )
+        listing += f'<p class="see-also">首条结果还引用了：{cited_links}</p>'
 
     base_all_layers = filter_and_score(library, topics, entries, q, "", status, source, window="", sort_by=sort_by)
     recent_7d_rows = filter_and_score(library, topics, entries, q, "", "active", source, window="7d", sort_by="updated")

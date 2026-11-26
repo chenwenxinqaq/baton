@@ -662,6 +662,59 @@ def score_fields(raw_terms, subtokens, name_cf, title_cf, desc_cf, body_cf):
     return 0, []
 
 
+def load_entry(path):
+    """Read one Markdown entry and return its frontmatter fields and body."""
+    # Match the Web manager: a stray non-UTF-8 file must not break every query.
+    return parse_frontmatter(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
+def relevance(raw_terms, subtokens, procedure_variants, name, title, description, body):
+    """Score one entry for a query; MCP search and the Web manager both use this.
+
+    Returns ``(score, matched, matched_phrase)``. A score of 0 means no match.
+    """
+    title_cf = title.casefold()
+    score, matched = score_fields(
+        raw_terms, subtokens, name.casefold(), title_cf, description.casefold(), body.casefold()
+    )
+    if score:
+        return score, matched, ""
+    # A complete variant in a title provides better evidence than
+    # scattered bigrams, but is weaker than a literal title hit.
+    # Do not accept a variant from a passing mention in the body.
+    phrase = next((v for v in procedure_variants if v in title_cf), "")
+    return (4, [phrase], phrase) if phrase else (0, [], "")
+
+
+def apply_freshness(score, age_sec, has_temporal_cue, expired, ranker="legacy"):
+    """Raise recent entries for a time-related query and lower expired ones."""
+    if has_temporal_cue:
+        age_sec = max(0.0, age_sec)
+        if age_sec <= 86400:
+            score += 1.0 if ranker == "bm25f" else 6
+        elif age_sec <= 7 * 86400:
+            score += 0.5 if ranker == "bm25f" else 3
+    if expired:
+        # Gently demote expired entries so current facts rank first while keeping history findable.
+        score = round(max(0.001, score * 0.7), 3) if ranker == "bm25f" else max(1, score - 3)
+    return score
+
+
+def cited_paths(body, known, shown, limit=SEE_ALSO_LIMIT):
+    """List the entry paths a body cites that exist in ``known`` and are not in ``shown``."""
+    seen = set(shown)
+    found = []
+    for folder, stem in ENTRY_LINK_RE.findall(body or ""):
+        ref = f"{folder}/{stem}.md"
+        if ref not in known or ref in seen:
+            continue
+        seen.add(ref)
+        found.append(ref)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def match_strength(raw_terms, matched):
     """How much of the query an entry covers: "full", "partial" or "fuzzy".
 
@@ -1141,24 +1194,12 @@ class MemoryStore:
 
         results = []
         for pos, item in enumerate(all_items):
-            title_cf = item["title"].casefold()
-            score, matched = score_fields(
-                raw_terms,
-                subtokens,
-                item["name"].casefold(),
-                title_cf,
-                item["description"].casefold(),
-                item["body"].casefold(),
+            score, matched, matched_phrase = relevance(
+                raw_terms, subtokens, procedure_variants,
+                item["name"], item["title"], item["description"], item["body"],
             )
-            matched_phrase = ""
             if score == 0:
-                # A complete variant in a title provides better evidence than
-                # scattered bigrams, but is weaker than a literal title hit.
-                # Do not accept a variant from a passing mention in the body.
-                matched_phrase = next((v for v in procedure_variants if v in title_cf), "")
-                if not matched_phrase:
-                    continue
-                score, matched = 4, [matched_phrase]
+                continue
             legacy_score = score
             if bm25:
                 # Substring-only matches (e.g. "dock") have no BM25 term hit; keep them last.
@@ -1167,15 +1208,10 @@ class MemoryStore:
                 else:
                     score = round(bm25[pos], 3) or 0.001
 
-            if has_temporal_cue:
-                age_sec = max(0.0, now_ep - item["updated_epoch"])
-                if age_sec <= 86400:
-                    score += 1.0 if ranker == "bm25f" else 6
-                elif age_sec <= 7 * 86400:
-                    score += 0.5 if ranker == "bm25f" else 3
-            if item.get("expired") and item["layer"] != "L4":
-                # Gently demote expired entries so current facts rank first while keeping history findable.
-                score = round(max(0.001, score * 0.7), 3) if ranker == "bm25f" else max(1, score - 3)
+            score = apply_freshness(
+                score, now_ep - item["updated_epoch"], has_temporal_cue,
+                bool(item.get("expired")) and item["layer"] != "L4", ranker,
+            )
 
             snippet = ""
             for line in item["body"].splitlines():
@@ -1230,17 +1266,10 @@ class MemoryStore:
         top = by_path.get(results[0]["path"])
         if not top:
             return
-        shown = {r["path"] for r in results}
-        see_also = []
-        for folder, stem in ENTRY_LINK_RE.findall(top.get("body") or ""):
-            ref = f"{folder}/{stem}.md"
-            linked = by_path.get(ref)
-            if not linked or ref in shown:
-                continue
-            shown.add(ref)
-            see_also.append({"ref": self._entry_ref(ref), "title": linked.get("title", "")})
-            if len(see_also) >= limit:
-                break
+        see_also = [
+            {"ref": self._entry_ref(ref), "title": by_path[ref].get("title", "")}
+            for ref in cited_paths(top.get("body"), by_path, {r["path"] for r in results}, limit)
+        ]
         if see_also:
             results[0]["see_also"] = see_also
 
