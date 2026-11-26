@@ -198,6 +198,16 @@ def unlock_file(fd):
     _unlock(fd)
 
 
+def set_fd_mode(fd, mode=0o600):
+    """Tighten permissions on an open file descriptor when supported by the OS."""
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        try:
+            fchmod(fd, mode)
+        except OSError:
+            pass
+
+
 @contextmanager
 def mounts_config_lock(home=None, timeout=None):
     """Exclusive cross-process lock around mounts.json read-modify-write cycles.

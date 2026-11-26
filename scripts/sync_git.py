@@ -19,7 +19,14 @@ from tempfile import NamedTemporaryFile
 from urllib.parse import unquote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass
 
-from library_paths import FRAMEWORK_ROOT, library_seed_files, library_state_dir, lock_file, unlock_file
+from library_paths import (
+    FRAMEWORK_ROOT,
+    library_seed_files,
+    library_state_dir,
+    lock_file,
+    set_fd_mode,
+    unlock_file,
+)
 
 
 LAYER_HEADINGS = (
@@ -214,7 +221,7 @@ def _atomic_write(path, content):
             mode="w", encoding="utf-8", dir=path.parent, prefix=".tmp-", delete=False
         ) as handle:
             staged = Path(handle.name)
-            os.fchmod(handle.fileno(), 0o600)
+            set_fd_mode(handle.fileno(), 0o600)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -236,7 +243,7 @@ def _state_lock(root, filename):
         pass
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        set_fd_mode(fd, 0o600)
         lock_file(fd)
         try:
             yield
@@ -927,10 +934,14 @@ def _git_process(root, args, *, browser_login=False, timeout=None, env_extra=Non
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            killpg = getattr(os, "killpg", None)
+            if killpg is not None and hasattr(signal, "SIGKILL"):
+                try:
+                    killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
             process.communicate()
             if browser_login:
                 raise GitSyncError("等待 GitHub 授权或网络连接超时，请返回同步页重试。") from exc

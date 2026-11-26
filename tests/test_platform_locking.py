@@ -56,6 +56,38 @@ class PlatformLockingTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         self.assertEqual(fake.calls, [(2, 0, 1)] * 3 + [(0, 0, 1)])
 
+    def test_locks_audit_and_user_reads_work_without_posix_fd_helpers(self):
+        sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "mcp"), str(ROOT / "manager")]
+        import audit_log
+        import manager
+        import sync_git
+
+        fake = FakeMsvcrt()
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            lib_root = base / "lib"
+            lib_root.mkdir()
+            (lib_root / "MEMORY.md").write_text("# M\n\n## L0\n\n## L1\n\n## L2\n\n## L3\n\n## L4\n", encoding="utf-8")
+            for folder in ("constraints", "methods", "preferences", "projects", "archive", "user-managed"):
+                (lib_root / folder).mkdir()
+            env_patch = patch.dict(
+                os.environ,
+                {"HOME": str(base), "UNIFIED_MEMORY_STATE_DIR": str(base / "state")},
+            )
+            with env_patch, \
+                    patch.object(library_paths, "fcntl", None), \
+                    patch.object(library_paths, "msvcrt", fake), \
+                    patch.object(os, "fchmod", None, create=True), \
+                    patch.object(os, "O_NOFOLLOW", 0, create=True), \
+                    patch.object(os, "O_NONBLOCK", 0, create=True):
+                with sync_git._state_lock(lib_root, "sync.lock"):
+                    sync_git._atomic_write(base / "state" / "sample.txt", "ok\n")
+                self.assertEqual((base / "state" / "sample.txt").read_text(encoding="utf-8"), "ok\n")
+                self.assertTrue(audit_log.record({"tool": "memory_list", "client": "Codex", "library": "personal"}))
+                lib = manager.Library(lib_root, "demo")
+                lib.save(manager.Entry(name="note-1", title="手记", description="摘要", body="内容"))
+                self.assertEqual(lib.read("note-1").body, "内容")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import time
 
-from library_paths import global_state_dir, lock_file, unlock_file
+from library_paths import global_state_dir, lock_file, set_fd_mode, unlock_file
 
 MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 4000
@@ -73,10 +73,7 @@ def _open_private(path, flags, mode=0o600):
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags, mode)
-    try:
-        os.fchmod(fd, mode)
-    except OSError:
-        pass
+    set_fd_mode(fd, mode)
     return fd
 
 

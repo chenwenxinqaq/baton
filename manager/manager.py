@@ -1035,7 +1035,7 @@ class Library:
 
     def read(self, name):
         path = self.path(name)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
         with os.fdopen(os.open(path, flags), "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise InvalidEntry("条目必须是普通 Markdown 文件。")
