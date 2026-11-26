@@ -2750,7 +2750,7 @@ def main():
         client = getattr(args, "client", "codex")
         source = getattr(args, "file", None)
         try:
-            report = (import_text(MEMORY_ROOT, client, source.stem, source.read_text(encoding="utf-8"))
+            report = (import_text(MEMORY_ROOT, client, "", source.read_text(encoding="utf-8"), fallback_title=source.stem)
                       if source else import_memories(MEMORY_ROOT, client))
         except (ValueError, OSError) as exc:
             parser.error(str(exc))

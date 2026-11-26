@@ -270,7 +270,11 @@
         if (text.length > body.maxLength || !text.trim() || text.includes("\0")) {
           throw new Error("文件为空、过长或包含无法导入的字符。");
         }
-        title.value = file.name.replace(/\.[^.]+$/, "").slice(0, title.maxLength);
+        const hasHeadingOrTitle = /^(?:---\r?\n[\s\S]*?\r?\n---\r?\n\s*)?#{1,6}\s+\S/.test(text)
+          || /^---\r?\n[\s\S]*?^title\s*:\s*\S/m.test(text);
+        if (!title.value.trim() && !hasHeadingOrTitle) {
+          title.value = file.name.replace(/\.[^.]+$/, "").slice(0, title.maxLength);
+        }
         body.value = text;
         status.textContent = "已载入文件，可以核对后加入待确认。";
       } catch (error) {

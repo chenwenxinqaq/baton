@@ -94,6 +94,7 @@ INLINE_TOKEN_RE = re.compile(
 ORDERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+(.+)$")
 UNORDERED_ITEM_RE = re.compile(r"^\s*[-*+]\s+(.+)$")
 TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+IMPORT_PROVENANCE_RE = re.compile(r"^> 来源：.+，原日期 .+$")
 
 MAX_POST = 1_200_000
 MAX_TITLE_CHARS = 120
@@ -1143,6 +1144,16 @@ def validate_common_fields(layer, title, description, body, verified_at=None, va
         raise InvalidEntry(str(exc)) from exc
 
 
+def _strip_import_provenance(body):
+    lines = body.rstrip().split("\n")
+    while lines and IMPORT_PROVENANCE_RE.match(lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    cleaned = "\n".join(lines)
+    return cleaned if cleaned.strip() else body.strip()
+
+
 def approve_import(library, client, import_id, revision, draft):
     """File one reviewed candidate into the library, record its receipt, return the topic path."""
     with memory_import.review_lock(library.root, client):
@@ -1150,7 +1161,8 @@ def approve_import(library, client, import_id, revision, draft):
         if revision != memory_import.revision(item):
             raise InvalidEntry("导入原文已更新，请重新核对。")
         # Browsers submit textarea content with CRLF line endings.
-        draft = dict(draft, body=draft["body"].replace("\r\n", "\n").replace("\r", "\n"))
+        normalized_body = _strip_import_provenance(draft["body"].replace("\r\n", "\n").replace("\r", "\n"))
+        draft = dict(draft, body=normalized_body)
         validate_common_fields(**draft)
         original_date = item["source_date"] or "未知"
         session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
@@ -2221,7 +2233,7 @@ def render_memory_import(token, library, client, selected, q, draft):
     form = ""
     if item:
         title = draft.get("title", item["title"])
-        description = draft.get("description", "")
+        description = draft.get("description", item.get("description", ""))
         body = draft.get("body", item["body"])
         origin = " · ".join(part for part in (item["source"], item.get("source_detail"), item["source_date"], item["thread_id"]) if part)
         if item.get("previously_approved"):

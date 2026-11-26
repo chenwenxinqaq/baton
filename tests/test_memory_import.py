@@ -12,7 +12,8 @@ sys.path.insert(0, str(CODE / "scripts"))
 sys.path.insert(0, str(CODE / "mcp"))
 
 import memory_import  # noqa: E402
-from manager import InvalidEntry, Library, approve_import  # noqa: E402
+import server as mcp_server  # noqa: E402
+from manager import InvalidEntry, Library, approve_import, render_memory_import  # noqa: E402
 
 
 class MemoryImportTests(unittest.TestCase):
@@ -165,6 +166,68 @@ class MemoryImportTests(unittest.TestCase):
 
         self.claude_note("海燕新结论", 1_700_000_500)
         self.assertEqual(memoryctl.scan_stray_agent_memories(home=self.home, root=self.root), [str(note)])
+
+    def test_claude_frontmatter_is_stripped_and_populates_title_and_description(self):
+        raw = (
+            "---\n"
+            "name: agent-analysis-feature-plan\n"
+            "description: Perfetto 框选触发 AI Agent 分析规划，插件已完成 MVP\n"
+            "metadata:\n"
+            "  node_type: memory\n"
+            "  type: project\n"
+            "  originSessionId: 242a940d-37de-4992-ab26-a380373d1b52\n"
+            "---\n\n"
+            "# Perfetto AI Agent 分析功能规划\n\n"
+            "2026-06-14 验证结论：浏览器端到端回归通过。\n"
+        )
+        self.claude_note(raw, 1_700_000_000)
+        self.assertEqual(self.scan_claude()["added"], 1)
+        (item,) = memory_import.pending(self.root, "claude")
+        self.assertEqual(item["title"], "Perfetto AI Agent 分析功能规划")
+        self.assertEqual(item["description"], "Perfetto 框选触发 AI Agent 分析规划，插件已完成 MVP")
+        self.assertNotIn("originSessionId", item["body"])
+        self.assertNotIn("---", item["body"])
+
+        html = render_memory_import("tok", self.library, "claude", item["id"], "", {})
+        self.assertIn('value="Perfetto 框选触发 AI Agent 分析规划，插件已完成 MVP"', html)
+
+        saved = approve_import(
+            self.library,
+            "claude",
+            item["id"],
+            memory_import.revision(item),
+            {
+                "layer": "L3",
+                "title": item["title"],
+                "description": item.get("description", ""),
+                "body": item["body"],
+            },
+        )
+        lint = mcp_server.MemoryStore(self.root).lint()
+        dup_fm = [f for f in lint["findings"] if f["check"] == "duplicate-frontmatter"]
+        self.assertEqual(dup_fm, [], lint["findings"])
+        saved_text = (self.root / saved).read_text(encoding="utf-8")
+        self.assertEqual(saved_text.count("\n---\n"), 1)
+
+    def test_horizontal_rules_in_prose_are_preserved_and_provenance_is_not_duplicated(self):
+        prose = "前言段落\n---\n分隔线下方内容\n---\n结尾"
+        item = self.queue_text(prose, title="分隔线测试")
+        self.assertEqual(item["body"], prose)
+
+        self.claude_note("海鸥初版结论", 1_700_000_000)
+        self.scan_claude()
+        (first,) = memory_import.pending(self.root, "claude")
+        saved = self.approve(first, client="claude")
+        prior_body = self.library.read_topic(saved).body
+        self.assertEqual(prior_body.count("> 来源："), 1)
+
+        self.claude_note("海鸥二版结论", 1_700_000_500)
+        self.scan_claude()
+        (reopened,) = memory_import.pending(self.root, "claude")
+        # Even if a reviewer pastes or retains the previous provenance footer, only the latest one is stored.
+        self.approve(reopened, client="claude", body=f"海鸥二版结论\n\n{prior_body.splitlines()[-1]}")
+        updated_text = (self.root / saved).read_text(encoding="utf-8")
+        self.assertEqual(updated_text.count("> 来源："), 1)
 
 
 if __name__ == "__main__":

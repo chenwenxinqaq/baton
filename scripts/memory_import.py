@@ -24,7 +24,9 @@ CLIENTS = {
 AUTOMATIC_CLIENTS = frozenset({"claude", "codex", "antigravity"})
 IMPORT_ID = re.compile(r"([a-z]+(?:-[a-z]+)*)-import-[0-9a-f]{32}")
 THREAD_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
+YAML_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:")
 MAX_TEXT = 120_000
+MAX_DESCRIPTION = 800
 
 
 def inbox(root, client):
@@ -59,17 +61,81 @@ def _session_date(value):
         return ""
 
 
-def _candidate(client, key, updated_at, body, source, title="", thread_id=""):
+def _unquote_yaml_scalar(raw):
+    val = raw.strip()
+    if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, str) else str(parsed)
+        except ValueError:
+            return val[1:-1]
+    if len(val) >= 2 and val.startswith("'") and val.endswith("'"):
+        return val[1:-1].replace("''", "'")
+    return val
+
+
+def strip_markdown_frontmatter(text):
+    """Strip leading YAML frontmatter from native client Markdown, returning (meta, body).
+
+    Only recognizes blocks where every non-empty, non-comment line is a top-level
+    ``key: value`` entry or an indented YAML continuation (such as Claude Code's
+    nested ``metadata:`` block), so horizontal rules in prose stay intact.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    stripped = normalized.lstrip("\ufeff")
+    if not stripped.startswith("---\n") and stripped != "---":
+        return {}, normalized.strip()
+    lines = stripped.split("\n")
+    end_idx = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() in {"---", "..."}:
+            end_idx = idx
+            break
+    if end_idx is None:
+        return {}, normalized.strip()
+
+    header_lines = lines[1:end_idx]
+    fields = {}
+    saw_key = False
+    for line in header_lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[0] in {" ", "\t"}:
+            if not saw_key:
+                return {}, normalized.strip()
+            continue
+        if not YAML_KEY_RE.match(line):
+            return {}, normalized.strip()
+        saw_key = True
+        key, _, raw_val = line.partition(":")
+        key = key.strip()
+        if key not in fields:
+            fields[key] = _unquote_yaml_scalar(raw_val)
+    if not saw_key:
+        return {}, normalized.strip()
+    body = "\n".join(lines[end_idx + 1 :]).strip()
+    return fields, body
+
+
+def _clean_single_line(text, limit):
+    return " ".join(str(text or "").splitlines()).strip()[:limit]
+
+
+def _candidate(client, key, updated_at, body, source, title="", thread_id="", description="", fallback_title=""):
     heading = re.search(r"(?m)^#{1,6} +(.+)", body)
-    title = title or (heading[1] if heading else body.splitlines()[0])
-    return {
+    resolved_title = title or (heading[1] if heading else "") or fallback_title or body.splitlines()[0]
+    item = {
         "id": f"{client}-import-" + sha256(key.encode()).hexdigest()[:32],
         "thread_id": thread_id,
         "source_date": _session_date(updated_at),
         "source": source,
-        "title": " ".join(title.splitlines()).replace("](", "] (").strip()[:120] or CLIENTS[client],
+        "title": " ".join(resolved_title.splitlines()).replace("](", "] (").strip()[:120] or CLIENTS[client],
         "body": body,
     }
+    clean_desc = _clean_single_line(description, MAX_DESCRIPTION)
+    if clean_desc:
+        item["description"] = clean_desc
+    return item
 
 
 def _from_database(path, source):
@@ -149,12 +215,26 @@ def _collect_markdown(client, groups):
             try:
                 if not path.is_file() or path.resolve() != path:
                     continue
-                body = path.read_text(encoding="utf-8").strip()
+                raw = path.read_text(encoding="utf-8")
+                meta, body = strip_markdown_frontmatter(raw)
+                description = meta.get("description", "")
+                if not body and description:
+                    body = description
                 if body:
                     relative = path.relative_to(base).as_posix()
                     stamp = path.stat().st_mtime_ns
                     updated = datetime.fromtimestamp(stamp / 1e9, timezone.utc).isoformat()
-                    candidate = _candidate(client, str(path), updated, body, CLIENTS[client], title=path.stem)
+                    fallback = meta.get("name") or ("" if path.name == "MEMORY.md" else path.stem)
+                    candidate = _candidate(
+                        client,
+                        str(path),
+                        updated,
+                        body,
+                        CLIENTS[client],
+                        title=meta.get("title", ""),
+                        description=description,
+                        fallback_title=fallback,
+                    )
                     candidate["source_detail"] = " ".join(relative.splitlines())
                     candidates.append(candidate)
             except (ValueError, OSError):
@@ -186,6 +266,13 @@ def _body_digest(body):
     return sha256(body.encode("utf-8")).hexdigest()
 
 
+def _candidate_digest(item):
+    desc = item.get("description") or ""
+    if not desc:
+        return _body_digest(item["body"])
+    return _body_digest(f"{desc}\0{item['body']}")
+
+
 def _refresh_kind(existing, candidate):
     """Say whether a scanned source should replace what the queue holds for it.
 
@@ -198,7 +285,7 @@ def _refresh_kind(existing, candidate):
     if existing.get("approved"):
         if not seen or candidate["source_date"] <= seen:
             return ""
-        return "" if existing.get("body_sha256") == _body_digest(candidate["body"]) else "reopen"
+        return "" if existing.get("body_sha256") == _candidate_digest(candidate) else "reopen"
     return "update" if candidate["source_date"] > (seen or "") else ""
 
 
@@ -268,14 +355,29 @@ def unfiled_sources(client, root=None, home=None):
     return unfiled
 
 
-def import_text(root, client, title, body):
+def import_text(root, client, title, body, fallback_title=""):
     if client not in CLIENTS:
         raise ValueError("不支持的客户端。")
     # Browsers submit textarea content with CRLF line endings.
-    body = body.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not body or len(body) > MAX_TEXT or "\0" in body:
+    raw = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw or len(raw) > MAX_TEXT or "\0" in raw:
         raise ValueError(f"原文须为 1–{MAX_TEXT:,} 个字符。")
-    candidate = _candidate(client, "text:" + body, None, body, CLIENTS[client], title=title.strip())
+    meta, cleaned_body = strip_markdown_frontmatter(raw)
+    description = meta.get("description", "")
+    if not cleaned_body and description:
+        cleaned_body = description
+    if not cleaned_body:
+        raise ValueError(f"原文须为 1–{MAX_TEXT:,} 个字符。")
+    candidate = _candidate(
+        client,
+        "text:" + raw,
+        None,
+        cleaned_body,
+        CLIENTS[client],
+        title=title.strip() or meta.get("title", ""),
+        description=description,
+        fallback_title=fallback_title.strip() or meta.get("name", ""),
+    )
     return _save_candidates(root, client, [candidate])
 
 
@@ -308,5 +410,5 @@ def revision(item):
 
 def mark_approved(root, client, item, topic):
     """Keep a receipt so repeated imports reopen a reviewed source only after it changes."""
-    receipt = {"approved": topic, "source_date": item["source_date"], "body_sha256": _body_digest(item["body"])}
+    receipt = {"approved": topic, "source_date": item["source_date"], "body_sha256": _candidate_digest(item)}
     _atomic_write_json(inbox(root, client) / (item["id"] + ".json"), receipt)
