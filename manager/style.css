@@ -367,6 +367,71 @@
     color: var(--warn-fg);
     border-color: var(--warn-bd);
   }
+  .status-pill-detected {
+    background: var(--primary-soft);
+    color: var(--primary);
+    border-color: var(--primary-border);
+  }
+
+  .ops-callout {
+    display: grid;
+    gap: 0.5rem;
+    padding: 0.78rem 0.95rem;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--line);
+    background: var(--surface-subtle);
+    font-size: 0.8125rem;
+  }
+  .ops-callout-warn {
+    border-color: var(--warn-bd);
+    background: var(--warn-bg);
+  }
+  .ops-callout-info {
+    border-color: var(--primary-border);
+    background: var(--primary-soft);
+  }
+  .ops-callout-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem 1rem;
+  }
+  .ops-callout-head strong {
+    display: block;
+    font-size: 0.875rem;
+    color: var(--text);
+    margin-bottom: 0.15rem;
+  }
+  .ops-callout-head p {
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.45;
+  }
+  .ops-callout-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    flex: none;
+  }
+  .stray-files {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+  .stray-files summary {
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .stray-files ul {
+    margin: 0.4rem 0 0;
+    padding-left: 1.15rem;
+    display: grid;
+    gap: 0.2rem;
+  }
+  .stray-files code {
+    overflow-wrap: anywhere;
+  }
 
   .check-chips {
     display: flex;

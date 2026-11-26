@@ -424,6 +424,44 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertIn('<code class="inline-code">methods/missing.md</code>', rendered)
         self.assertNotIn("topic=methods%2Fmissing.md", rendered)
 
+    def test_clients_panel_guides_stray_memories_and_detected_unmanaged_agents(self):
+        import manager as manager_mod
+        import memoryctl
+
+        fake_home = self.base / "agent-home"
+        stray_dir = fake_home / ".claude" / "projects" / "-demo" / "memory"
+        stray_dir.mkdir(parents=True)
+        (stray_dir / "old-note.md").write_text("# Old Claude Note\nRemember this.\n", encoding="utf-8")
+        (fake_home / ".cursor").mkdir(parents=True)
+
+        # Avoid picking up host-level /Applications/Claude.app or WorkBuddy.app during test
+        orig_specs = memoryctl.agent_specs
+
+        def isolated_specs(home=None):
+            specs = orig_specs(home=home)
+            for spec in specs.values():
+                spec["detect_paths"] = [p for p in spec.get("detect_paths", []) if not str(p).startswith("/Applications/")]
+            return specs
+
+        with patch.object(memoryctl, "agent_specs", side_effect=isolated_specs):
+            detected_ids = [aid for aid, _ in memoryctl.resolve_targets("detected", home=fake_home)]
+            html = manager_mod.render_agent_panel(
+                "tok-123",
+                "primary",
+                agent_home=fake_home,
+                library=self.library,
+                flat=True,
+            )
+        self.assertIn("claude", detected_ids)
+        self.assertIn("cursor", detected_ids)
+        self.assertNotIn("workbuddy", detected_ids)
+        self.assertIn("发现 1 份未归集的 Claude Code 散落记忆", html)
+        self.assertIn("一键导入散落记忆", html)
+        self.assertIn("检测到本机已安装但尚未接入的客户端", html)
+        self.assertIn('name="target" value="detected"', html)
+        self.assertIn("一键接管已安装客户端", html)
+        self.assertIn("本机已安装", html)
+
 
 if __name__ == "__main__":
     unittest.main()

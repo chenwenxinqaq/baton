@@ -2327,12 +2327,18 @@ def run_doctor(fix=False, home=None):
 
 
 def resolve_targets(target, home=None):
-    """Resolve 'all' or a specific agent id."""
+    """Resolve 'all', 'detected', or a specific agent id."""
     specs = agent_specs(home=home)
     if target == "all":
         return list(specs.items())
+    if target == "detected":
+        return [
+            (aid, spec)
+            for aid, spec in specs.items()
+            if any(p.exists() for p in spec["detect_paths"])
+        ]
     if target not in specs:
-        raise SystemExit(f"Unknown agent '{target}'. Choose from: all, {', '.join(specs)}")
+        raise SystemExit(f"Unknown agent '{target}'. Choose from: all, detected, {', '.join(specs)}")
     return [(target, specs[target])]
 
 
@@ -2545,7 +2551,7 @@ def main():
     p_sdis = skill_sub.add_parser("disable", help="Disable a skill (folder name) and unlink from connected agents.")
     p_sdis.add_argument("folder")
 
-    p_conn = sub.add_parser("connect", help=f"Connect an agent ({', '.join(agent_specs())}, or all).")
+    p_conn = sub.add_parser("connect", help=f"Connect an agent ({', '.join(agent_specs())}, detected, or all).")
     p_conn.add_argument("target", nargs="?", default="all")
     p_conn.add_argument("--dry-run", action="store_true")
 

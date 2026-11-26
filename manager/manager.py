@@ -1906,9 +1906,18 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
         cards = []
         managed_count = 0
         drifted_count = 0
+        detected_unmanaged = []
         for aid, spec in specs.items():
             info = memoryctl.inspect_agent(aid, spec)
             state = info["state"]
+            detected = bool(info.get("detected"))
+            pending_count = 0
+            if aid in memory_import.CLIENTS and key == "primary" and library is not None:
+                try:
+                    pending_count = len(memory_import.pending(library.root, aid))
+                except (OSError, ValueError):
+                    pending_count = 0
+            detected_pill = ""
             if state == "managed":
                 managed_count += 1
                 pill_cls = "status-pill status-pill-managed"
@@ -1937,6 +1946,9 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             else:
                 pill_cls = "status-pill"
                 pill_txt = "○ 未接入"
+                if detected:
+                    detected_unmanaged.append(info["name"])
+                    detected_pill = '<span class="status-pill status-pill-detected">本机已安装</span>'
                 btn_html = f"""
                   <form method="post" action="/agent#feedback">
                     {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
@@ -1949,7 +1961,9 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 label = "导入记忆"
                 if aid in memory_import.AUTOMATIC_CLIENTS:
                     btn_html += render_native_import_button(token, aid)
-                    label = "待确认记忆"
+                    label = f"待确认记忆 ({pending_count})" if pending_count else "待确认记忆"
+                elif pending_count:
+                    label = f"导入记忆 ({pending_count})"
                 btn_html += f'<a class="btn btn-ghost btn-compact" href="{inbox_link}">{label}</a>'
             comp = info["components"]
             sk_comp = comp.get("skill", {})
@@ -1974,6 +1988,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 <div class="agent-name-row">
                   <strong>{escape(info["name"])}</strong>
                   <span class="{pill_cls}">{pill_txt}</span>
+                  {detected_pill}
                 </div>
                 <div class="check-chips">{chips}</div>
                 {issue_html}
@@ -2000,11 +2015,55 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
               </form>"""
 
         stray_list = memoryctl.scan_stray_agent_memories(home=agent_home)
-        stray_alert = (
-            f'<p class="agent-issue">发现未归集的隐藏目录散落记忆（请合并后清理）：{escape(", ".join(stray_list))}</p>'
-            if stray_list
-            else ""
-        )
+        stray_alert = ""
+        if stray_list:
+            stray_items = "".join(f"<li><code>{escape(p)}</code></li>" for p in stray_list[:20])
+            extra_note = f"<li>… 另有 {len(stray_list) - 20} 个文件</li>" if len(stray_list) > 20 else ""
+            stray_actions = ""
+            if key == "primary":
+                claude_inbox = escape(query(view="memory_import", client="claude") + "#detail-title")
+                stray_actions = f"""
+              <div class="ops-callout-actions">
+                <form method="post" action="/memory_import">
+                  {hidden("csrf", token)}{hidden("op", "import")}{hidden("client", "claude")}
+                  <button class="btn btn-warn btn-compact" type="submit">一键导入散落记忆</button>
+                </form>
+                <a class="btn btn-ghost btn-compact" href="{claude_inbox}">查看待确认队列 →</a>
+              </div>"""
+            stray_alert = f"""
+          <section class="ops-callout ops-callout-warn" aria-label="发现散落原生记忆">
+            <div class="ops-callout-head">
+              <div>
+                <strong>发现 {len(stray_list)} 份未归集的 Claude Code 散落记忆</strong>
+                <p>这些文件仍在客户端自带项目目录中，其他 AI 客户端无法共享。建议一键导入到待确认队列，审阅归层后再清理原文件。</p>
+              </div>
+              {stray_actions}
+            </div>
+            <details class="stray-files">
+              <summary>查看文件路径（{len(stray_list)}）</summary>
+              <ul>{stray_items}{extra_note}</ul>
+            </details>
+          </section>"""
+
+        detected_banner = ""
+        if flat and detected_unmanaged:
+            detected_names = "、".join(detected_unmanaged)
+            detected_banner = f"""
+          <section class="ops-callout ops-callout-info" aria-label="检测到未接管客户端">
+            <div class="ops-callout-head">
+              <div>
+                <strong>检测到本机已安装但尚未接入的客户端：{escape(detected_names)}</strong>
+                <p>一键接管后即可与已连接的客户端共享同一份本地记忆库（仅配置本机已检测到的客户端，不会改动未安装软件）。</p>
+              </div>
+              <div class="ops-callout-actions">
+                <form method="post" action="/agent#feedback">
+                  {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
+                  {hidden("target", "detected")}{hidden("op", "connect")}
+                  <button class="btn btn-primary btn-compact" type="submit">一键接管已安装客户端</button>
+                </form>
+              </div>
+            </div>
+          </section>"""
         agent_chip = (
             f'<span class="chip-warn">▲ 客户端待同步 ({drifted_count})</span>'
             if drifted_count
@@ -2040,6 +2099,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
           </div>
           {conflict_banner}
           {stray_alert}
+          {detected_banner}
           {clients_html}
         </div>"""
         return f"""
