@@ -76,6 +76,16 @@ class MemoryImportTests(unittest.TestCase):
         kept = (self.root / "projects" / f'{item["id"]}.md').read_text(encoding="utf-8")
         self.assertIn("用户自己的正文", kept)
 
+    def test_crlf_input_is_stored_with_lf_line_endings(self):
+        item = self.queue_text("第一行\r\n第二行\r第三行")
+        self.assertEqual(item["body"], "第一行\n第二行\n第三行")
+
+        saved = self.approve(item, body="甲\r\n乙\r丙")
+
+        text = (self.root / saved).read_bytes().decode("utf-8")
+        self.assertNotIn("\r", text)
+        self.assertIn("甲\n乙\n丙", text)
+
 
 if __name__ == "__main__":
     unittest.main()

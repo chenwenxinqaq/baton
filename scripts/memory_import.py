@@ -219,7 +219,8 @@ def import_memories(root, client, home=None):
 def import_text(root, client, title, body):
     if client not in CLIENTS:
         raise ValueError("不支持的客户端。")
-    body = body.strip()
+    # Browsers submit textarea content with CRLF line endings.
+    body = body.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not body or len(body) > MAX_TEXT or "\0" in body:
         raise ValueError(f"原文须为 1–{MAX_TEXT:,} 个字符。")
     candidate = _candidate(client, "text:" + body, None, body, CLIENTS[client], title=title.strip())

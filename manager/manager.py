@@ -1147,6 +1147,8 @@ def approve_import(library, client, import_id, revision, draft):
         item = memory_import.read_candidate(library.root, client, import_id)
         if revision != memory_import.revision(item):
             raise InvalidEntry("导入原文已更新，请重新核对。")
+        # Browsers submit textarea content with CRLF line endings.
+        draft = dict(draft, body=draft["body"].replace("\r\n", "\n").replace("\r", "\n"))
         validate_common_fields(**draft)
         original_date = item["source_date"] or "未知"
         session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
