@@ -797,6 +797,28 @@ class Library:
             candidate = f"{prefix}-{stamp}-{secrets.token_hex(2)}"
         return candidate
 
+    def discard_unindexed_topic(self, slug):
+        """Move aside a topic file that a stopped save left on disk without an index line.
+
+        ``save_topic`` writes the file before the index, so a process that dies in
+        between leaves a file that every later save with the same slug collides with.
+        The file goes to the trash backups first, so nothing is lost.
+        """
+        if not TOPIC_SLUG_RE.fullmatch(slug or ""):
+            return []
+        removed = []
+        with self.write_lock():
+            _, index = self.read_index()
+            for folder in mcp_server.LAYER_DIRS.values():
+                rel = f"{folder}/{slug}.md"
+                path = self.root / rel
+                if rel in index or path.is_symlink() or not path.is_file():
+                    continue
+                self._backup_to_trash(path, slug)
+                path.unlink()
+                removed.append(rel)
+        return removed
+
     def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type="",
                    verified_at=None, valid_until=None):
         self._ensure_writable(layer=layer)
@@ -1117,6 +1139,32 @@ def validate_common_fields(layer, title, description, body, verified_at=None, va
         secret_guard.ensure_no_secrets(title, description, body)
     except ValueError as exc:
         raise InvalidEntry(str(exc)) from exc
+
+
+def approve_import(library, client, import_id, revision, draft):
+    """File one reviewed candidate into the library, record its receipt, return the topic path."""
+    with memory_import.review_lock(library.root, client):
+        item = memory_import.read_candidate(library.root, client, import_id)
+        if revision != memory_import.revision(item):
+            raise InvalidEntry("导入原文已更新，请重新核对。")
+        validate_common_fields(**draft)
+        original_date = item["source_date"] or "未知"
+        session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
+        provenance = f'> 来源：{item["source"]}，原日期 {original_date}{session}'
+        body = f'{draft["body"]}\n\n{provenance}'
+        # Recover a completed save if the prior process stopped before recording its receipt.
+        _, index = library.read_index()
+        saved = next(
+            (path for path in index if Path(path).stem == item["id"]
+             and provenance in library.read_markdown(library.root / path).splitlines()),
+            None,
+        )
+        if not saved:
+            # The same stop can also leave the file without its index line.
+            library.discard_unindexed_topic(item["id"])
+            saved = library.save_topic("", "", draft["layer"], draft["title"], draft["description"], body, slug=item["id"])
+        memory_import.mark_approved(library.root, client, item, saved)
+    return saved
 
 
 def hidden(name, value):
@@ -4435,26 +4483,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if op != "approve":
                 raise InvalidEntry("未知的记忆导入操作。")
-            with memory_import.review_lock(library.root, client):
-                item = memory_import.read_candidate(library.root, client, selected)
-                if fields.get("revision") != memory_import.revision(item):
-                    raise InvalidEntry("导入原文已更新，请重新核对。")
-                draft = {name: fields.get(name, "").strip() for name in ("layer", "title", "description", "body")}
-                validate_common_fields(**draft)
-                original_date = item["source_date"] or "未知"
-                session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
-                provenance = f'> 来源：{item["source"]}，原日期 {original_date}{session}'
-                body = f'{draft["body"]}\n\n{provenance}'
-                # Recover a completed save if the prior process stopped before recording its receipt.
-                _, index = library.read_index()
-                saved = next(
-                    (path for path in index if Path(path).stem == item["id"]
-                     and provenance in library.read_markdown(library.root / path).splitlines()),
-                    None,
-                )
-                if not saved:
-                    saved = library.save_topic("", "", draft["layer"], draft["title"], draft["description"], body, slug=item["id"])
-                memory_import.mark_approved(library.root, client, item, saved)
+            draft = {name: fields.get(name, "").strip() for name in ("layer", "title", "description", "body")}
+            saved = approve_import(library, client, selected, fields.get("revision", ""), draft)
             target = query(topic=saved, notice="memory_import_approved") + "#detail-title"
             self.respond(HTTPStatus.SEE_OTHER, "", location=target)
         except (ValueError, OSError) as exc:
