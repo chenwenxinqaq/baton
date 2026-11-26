@@ -86,6 +86,15 @@ class MemoryImportTests(unittest.TestCase):
         self.assertNotIn("\r", text)
         self.assertIn("甲\n乙\n丙", text)
 
+    def test_candidate_at_the_size_limit_can_be_approved_unchanged(self):
+        item = self.queue_text("字" * memory_import.MAX_TEXT)
+
+        saved = self.approve(item)
+
+        text = (self.root / saved).read_text(encoding="utf-8")
+        self.assertIn("字" * memory_import.MAX_TEXT, text)
+        self.assertIn("> 来源：", text)
+
 
 if __name__ == "__main__":
     unittest.main()

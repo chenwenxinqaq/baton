@@ -820,9 +820,10 @@ class Library:
         return removed
 
     def save_topic(self, orig_path, expected_revision, layer, title, description, body, slug="", entry_type="",
-                   verified_at=None, valid_until=None):
+                   verified_at=None, valid_until=None, body_limit=MAX_BODY_CHARS):
         self._ensure_writable(layer=layer)
-        validate_common_fields(layer, title, description, body, verified_at=verified_at, valid_until=valid_until)
+        validate_common_fields(layer, title, description, body, verified_at=verified_at, valid_until=valid_until,
+                               body_limit=body_limit)
         norm_verified = None if verified_at is None else str(verified_at).strip()
         norm_valid_until = None if valid_until is None else str(valid_until).strip()
         with self.write_lock():
@@ -1117,7 +1118,8 @@ class Library:
         self._enqueue_async_sync(message)
 
 
-def validate_common_fields(layer, title, description, body, verified_at=None, valid_until=None):
+def validate_common_fields(layer, title, description, body, verified_at=None, valid_until=None,
+                           body_limit=MAX_BODY_CHARS):
     if layer not in LAYERS:
         raise InvalidEntry("请选择 L0–L4 中的一层。")
     if not title or len(title) > MAX_TITLE_CHARS or len(title.splitlines()) != 1:
@@ -1126,7 +1128,7 @@ def validate_common_fields(layer, title, description, body, verified_at=None, va
         raise InvalidEntry("标题中不能包含 Markdown 链接分隔符 ']('。")
     if len(description) > MAX_DESC_CHARS or len(description.splitlines()) > 1:
         raise InvalidEntry(f"检索摘要须为单行且不超过 {MAX_DESC_CHARS} 个字符。")
-    if not body.strip() or len(body) > MAX_BODY_CHARS:
+    if not body.strip() or len(body) > body_limit:
         raise InvalidEntry(f"正文不能为空且不超过 {MAX_BODY_CHARS:,} 个字符。")
     try:
         norm_v = "" if verified_at is None else mcp_server.normalize_iso_date(verified_at, "verified_at")
@@ -1164,7 +1166,9 @@ def approve_import(library, client, import_id, revision, draft):
         if not saved:
             # The same stop can also leave the file without its index line.
             library.discard_unindexed_topic(item["id"])
-            saved = library.save_topic("", "", draft["layer"], draft["title"], draft["description"], body, slug=item["id"])
+            # The draft was checked against the normal limit; the source line is added on top of it.
+            saved = library.save_topic("", "", draft["layer"], draft["title"], draft["description"], body,
+                                       slug=item["id"], body_limit=MAX_BODY_CHARS + len(provenance) + 2)
         memory_import.mark_approved(library.root, client, item, saved)
     return saved
 
