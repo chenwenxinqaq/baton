@@ -265,9 +265,13 @@ def desktop_navigation(key, selected):
         if slug == selected:
             section = label
         href = escape(query(library=key, **params))
-        icon = f'<svg viewBox="0 0 24 24" aria-hidden="true">{NAV_ICONS[slug]}</svg>'
+        icon = (
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+            f'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+            f"{NAV_ICONS[slug]}</svg>"
+        )
         links.append(f'<a href="{href}"{CUR_ATTR if slug == selected else ""}>'
-                     f'<span class="nav-icon" aria-hidden="true">{icon}</span>{label}</a>')
+                     f'<span class="nav-icon reicon" aria-hidden="true">{icon}</span>{label}</a>')
     return dict(desktop_nav="".join(links), section_name=section,
                 library_key=escape(key), list_title_short="技能" if selected == "skills" else "记忆")
 
@@ -336,10 +340,10 @@ def desktop_status_strip(key, library):
     href = escape(query(library=key, view="activity"))
     upkeep_href = escape(query(library=key, view="upkeep"))
     handoff_href = escape(query(library=key, view="handoff"))
-    handoff_link = f'<a href="{handoff_href}">会话交接</a> · ' if key == "primary" else ""
+    handoff_link = f'<a href="{handoff_href}">会话交接</a>' if key == "primary" else ""
     return (
         f'<div class="desk-status check-chips">{"".join(chips)}'
-        f'{handoff_link}<a href="{upkeep_href}">整理日报</a> · <a href="{href}">查看读写动态 →</a></div>'
+        f'<span class="desk-status-links">{handoff_link}<a href="{upkeep_href}">整理日报</a><a href="{href}">查看读写动态 →</a></span></div>'
     )
 
 
@@ -394,8 +398,8 @@ def render_layer_radios(selected_layer):
 
 def render_scope_radios(selected_scope):
     opts = [
-        ("index", "主知识库（写入对应分层目录并自动同步 MEMORY.md，已接入的 Agent 默认检索）"),
-        ("user", "个人手记区（仅存入 user-managed/，由你手动管理）"),
+        ("index", "主知识库"),
+        ("user", "个人手记"),
     ]
     pills = []
     for val, label_txt in opts:
@@ -437,15 +441,6 @@ def render_memory_editor_html(
 ):
     """Render unified accessible Markdown editor for indexed topics and user-managed notes."""
     is_new = mode == "new"
-    intro_text = (
-        "新建记忆默认写入主知识库并同步更新 MEMORY.md 索引；也可切换为仅保存在个人手记区（user-managed/）。"
-        if is_new
-        else (
-            f"正在编辑主知识库条目（保存时自动同步更新 MEMORY.md 索引；切换层级会自动迁移目录文件）。"
-            if scope == "index"
-            else "正在编辑个人手记（位于 user-managed/，不会改动自动索引条目）。"
-        )
-    )
     scope_html = (
         render_scope_radios(scope)
         if is_new
@@ -458,8 +453,7 @@ def render_memory_editor_html(
             <label for="slug">文件标识（可选）</label>
             <input id="slug" name="slug" type="text" value="{escape(slug)}" maxlength="90"
                    autocorrect="off" autocapitalize="none" spellcheck="false"
-                   aria-describedby="slug-help" placeholder="例如：weekly-report-export">
-            <span id="slug-help" class="field-hint">英文/数字/连字符文件名（主知识库使用），留空则根据标题与日期自动生成。</span>
+                   placeholder="weekly-report-export">
           </div>"""
 
     title_row = (
@@ -496,7 +490,6 @@ def render_memory_editor_html(
 
     return f"""
       <div class="editor-wrap">
-        <p class="editor-intro">{escape(intro_text)}</p>
         <form class="edit-form" method="post" action="/save#feedback" aria-labelledby="detail-title">
           {hidden_inputs}
           {scope_html}
@@ -505,19 +498,16 @@ def render_memory_editor_html(
           <div class="field">
             <label for="description">一句话索引摘要 / 检索线索</label>
             <input id="description" name="description" type="text" value="{escape(description)}" maxlength="{MAX_DESC_CHARS}"
-                   aria-describedby="desc-help" placeholder="写明核心结论与下次遇到什么场景时 Agent 应该优先读这条">
-            <span id="desc-help" class="field-hint">主知识库记忆会将此摘要同步展示在 <code>MEMORY.md</code> 索引行（单行 ≤ {MAX_DESC_CHARS} 字）。</span>
+                   placeholder="写明核心结论与触发场景">
           </div>
           <div class="form-row-two">
             <div class="field">
               <label for="verified_at">核实日期（可选）</label>
               <input id="verified_at" name="verified_at" type="date" value="{escape(verified_at)}">
-              <span class="field-hint">事实最后一次人工或实测核实的日期（YYYY-MM-DD），有助于判断记忆新鲜度。</span>
             </div>
             <div class="field">
               <label for="valid_until">有效期至（可选）</label>
               <input id="valid_until" name="valid_until" type="date" value="{escape(valid_until)}">
-              <span class="field-hint">临时授权、限时策略或里程碑快照的截止日；过期后搜索降权并提示复核。</span>
             </div>
           </div>
           <div class="field">
@@ -533,15 +523,12 @@ def render_memory_editor_html(
             </div>
             <div id="editor-secret-alert" class="editor-secret-alert" role="alert" hidden></div>
             <textarea class="auto-grow-textarea" id="body" name="body" rows="18" maxlength="{MAX_BODY_CHARS}"
-                      aria-describedby="body-help"
                       placeholder="记录已验证结论、适用条件、证据路径与失效边界…" required>{escape(body)}</textarea>
             <div id="editor-preview" class="editor-preview" hidden></div>
-            <span id="body-help" class="field-hint">支持标准 Markdown 与库内相对链接；严禁写入明文密码、Cookie 或 Token。</span>
           </div>
           <div class="form-actions">
             <button class="btn btn-primary" type="submit">{submit_txt}</button>
             <a class="btn btn-ghost" href="{escape(cancel_link)}">取消</a>
-            <span class="shortcut-hint">快捷键：⌘S / Ctrl+S 保存</span>
           </div>
         </form>
         {footer_meta}
@@ -557,19 +544,16 @@ def render_index_editor_html(token, library_key, markdown_text, revision, cancel
     )
     return f"""
       <div class="editor-wrap">
-        <p class="editor-intro">直接编辑权威入口 <code>MEMORY.md</code>（保存前会自动校验 <code>## L0</code>–<code>## L4</code> 章节结构及所有链接文件是否存在）。</p>
         <form class="edit-form" method="post" action="/save_index#feedback" aria-labelledby="detail-title">
           {hidden_inputs}
           <div class="field">
             <label for="index-body">MEMORY.md 全文（Markdown） <span class="required">必填</span></label>
             <textarea class="auto-grow-textarea" id="index-body" name="body" rows="24" maxlength="{MAX_BODY_CHARS}"
-                      aria-describedby="index-help" required autofocus>{escape(markdown_text)}</textarea>
-            <span id="index-help" class="field-hint">保持每条索引格式为 <code>- [标题](路径.md) — 一句话核心摘要</code>，严禁写入明文凭据。</span>
+                      required autofocus>{escape(markdown_text)}</textarea>
           </div>
           <div class="form-actions">
             <button class="btn btn-primary" type="submit">保存 MEMORY.md</button>
             <a class="btn btn-ghost" href="{escape(cancel_link)}">取消</a>
-            <span class="shortcut-hint">快捷键：⌘S / Ctrl+S 保存</span>
           </div>
         </form>
         <div class="file-info"><code>{escape(str(index_path))}</code></div>
@@ -593,7 +577,7 @@ def render_delete_dialog_html(token, library_key, scope, target_id, display_path
     return f"""
       <dialog class="confirm-dialog" id="delete-dialog" aria-labelledby="delete-dialog-title" closedby="any">
         <h2 id="delete-dialog-title">确认删除这条记忆？</h2>
-        <p class="confirm-dialog-desc">{escape(note)} <code>{escape(display_path)}</code>。删除前系统会自动在 <code>.state/trash/</code> 保存一份备份副本。</p>
+        <p class="confirm-dialog-desc">{escape(note)} <code>{escape(display_path)}</code></p>
         <div class="confirm-dialog-actions">
           <button class="btn btn-secondary" type="button" commandfor="delete-dialog" command="close" autofocus>取消</button>
           <form method="post" action="/delete#feedback">
@@ -661,12 +645,12 @@ def render_topic_versions_html(token, library_key, slug, versions, readonly):
                 <button class="btn btn-ghost btn-compact" type="submit">恢复此版本</button>
               </form>"""
         rows.append(
-            f'<li>'
+            f'<li class="intent-row">'
             f'<div class="version-row-head">'
             f'<span class="version-when">{escape(saved)}</span>'
             f'<span class="meta-chip">{escape(reason)}</span>'
             f'<span class="version-size">{chars} 字</span>'
-            f'<div class="version-actions">{diff_btn}{action}</div>'
+            f'<div class="version-actions intent-actions">{diff_btn}{action}</div>'
             f'</div>'
             f'<div class="version-diff-slot" hidden></div>'
             f'</li>'
@@ -674,7 +658,6 @@ def render_topic_versions_html(token, library_key, slug, versions, readonly):
     return f"""
       <section class="detail-block" aria-labelledby="versions-title">
         <h2 class="block-title" id="versions-title">历史版本</h2>
-        <p class="block-hint">每次编辑、换层或归档前都会在本机备份一份，可先「对比差异」再决定恢复；恢复会先备份当前版本，两个方向都不会丢内容。</p>
         <ul class="version-list">{"".join(rows)}</ul>
       </section>"""
 
@@ -898,7 +881,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 pill_cls = "status-pill status-pill-managed"
                 pill_txt = "● 已配置"
                 btn_html = f"""
-                  <form method="post" action="/agent#feedback">
+                  <form class="intent-secondary" method="post" action="/agent#feedback">
                     {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
                     {hidden("target", aid)}{hidden("op", "disconnect")}
                     <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
@@ -913,7 +896,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                     {hidden("target", aid)}{hidden("op", "connect")}
                     <button class="btn btn-warn btn-compact" type="submit">同步</button>
                   </form>
-                  <form method="post" action="/agent#feedback">
+                  <form class="intent-secondary" method="post" action="/agent#feedback">
                     {hidden("csrf", token)}{hidden("library", key)}{hidden("tab", tab)}
                     {hidden("target", aid)}{hidden("op", "disconnect")}
                     <button class="btn btn-danger-ghost btn-compact" type="submit">断开</button>
@@ -939,7 +922,8 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                     label = f"待确认记忆 ({pending_count})" if pending_count else "待确认记忆"
                 elif pending_count:
                     label = f"导入记忆 ({pending_count})"
-                btn_html += f'<a class="btn btn-ghost btn-compact" href="{inbox_link}">{label}</a>'
+                sec_cls = "" if pending_count else " intent-secondary"
+                btn_html += f'<a class="btn btn-ghost btn-compact{sec_cls}" href="{inbox_link}">{label}</a>'
             comp = info["components"]
             sk_comp = comp.get("skill", {})
             sk_suffix = f" ({sk_comp.get('linked', 0)}/{sk_comp.get('total', 0)})" if "total" in sk_comp else ""
@@ -958,7 +942,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             )
             cards.append(
                 f"""
-            <li class="agent-item">
+            <li class="agent-item intent-row">
               <div class="agent-info">
                 <div class="agent-name-row">
                   <strong>{escape(info["name"])}</strong>
@@ -968,7 +952,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
                 <div class="check-chips">{chips}</div>
                 {issue_html}
               </div>
-              <div class="agent-btns">{btn_html}</div>
+              <div class="agent-btns{" intent-actions" if state == "managed" and not pending_count else ""}">{btn_html}</div>
             </li>"""
             )
 
@@ -1012,7 +996,6 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             <div class="ops-callout-head">
               <div>
                 <strong>发现 {len(stray_list)} 份未归集的 Claude Code 散落记忆</strong>
-                <p>这些文件仍在客户端自带项目目录中，其他 AI 客户端无法共享。建议一键导入到待确认队列，审阅归层后再清理原文件。</p>
               </div>
               {stray_actions}
             </div>
@@ -1030,7 +1013,6 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
             <div class="ops-callout-head">
               <div>
                 <strong>检测到本机已安装但尚未接入的客户端：{escape(detected_names)}</strong>
-                <p>一键接管后即可与已连接的客户端共享同一份本地记忆库（仅配置本机已检测到的客户端，不会改动未安装软件）。</p>
               </div>
               <div class="ops-callout-actions">
                 <form method="post" action="/agent#feedback">
@@ -1112,7 +1094,7 @@ def render_agent_panel(token, key, tab="", agent_home=None, library=None, flat=F
 
 def render_native_import_button(token, client):
     return f"""
-      <form method="post" action="/memory_import">
+      <form class="intent-secondary" method="post" action="/memory_import">
         {hidden("csrf", token)}{hidden("op", "import")}{hidden("client", client)}
         <button class="btn btn-ghost btn-compact" type="submit">一键导入记忆</button>
       </form>"""
@@ -1186,7 +1168,6 @@ def render_memory_import(token, library, client, selected, q, draft):
             <label>检索摘要 <input type="text" name="description" maxlength="{MAX_DESC_CHARS}" value="{escape(description)}"></label>
             <label>正文 <textarea name="body" rows="14" required>{escape(body)}</textarea></label>
             {render_layer_radios(draft.get("layer", ""))}
-            <p>确认后会写入个人记忆库。若已启用个人库 Git 同步，这些条目会随个人库同步。</p>
             <button class="btn btn-primary" type="submit">确认归入所选层</button>
           </form>
         """
@@ -1210,11 +1191,9 @@ def render_memory_import(token, library, client, selected, q, draft):
     return f"""
       <section class="import-review">
         <nav class="sort-switch" aria-label="记忆来源">{tabs}</nav>
-        <p>待确认的内容只保存在本机。请核对原文，保留值得长期使用的部分后再归层。</p>
         {automatic}
         <details {"open" if not automatic and not item else ""}>
           <summary>从文件或文本导入</summary>
-          <p>{escape(guidance)}</p>
           <form class="edit-form" method="post" action="/memory_import">
             {hidden("csrf", token)}{hidden("op", "text")}{hidden("client", client)}
             <label>标题 <input type="text" name="title" maxlength="{MAX_TITLE_CHARS}"></label>
@@ -1264,9 +1243,6 @@ def render_l0_review(token, key, library):
             '<section class="activity-usage">'
             '<div class="usage-head"><h3>L0 操作约束待确认区</h3>'
             '<span class="usage-hint">当前没有待确认的 L0 约束修改</span></div>'
-            '<p class="act-meta">默认开启 L0 写保护：AI 客户端通过 <code>memory_upsert</code> 写入 L0 约束时，'
-            '会先进入本机待确认区，经你核对 Diff 并点击「确认生效」后才会写入 <code>constraints/</code>。'
-            '人工在桌面端编辑或执行 <code>umem write</code> 仍直接生效。</p>'
             '</section>'
         )
     cards = []
@@ -1281,7 +1257,7 @@ def render_l0_review(token, key, library):
         ]
         cards.append(
             f"""
-        <article class="conflict-card">
+        <article class="conflict-card intent-row">
           <div class="conflict-card-head">
             <div>
               <strong>提案 #{idx}：{escape(item.get("title") or item["name"])}</strong>
@@ -1319,8 +1295,6 @@ def render_l0_review(token, key, library):
         )
     return (
         '<section class="l0-review-panel">'
-        f'<p class="act-meta">共有 <strong>{len(proposals)} 条</strong> AI 提议的 L0 操作约束等待确认。'
-        '核对下方 Diff 确认无误后点击「确认生效」，或点击「拒绝丢弃」直接忽略。</p>'
         f'{"".join(cards)}'
         '</section>'
     )
@@ -1364,8 +1338,6 @@ def render_upkeep_panel(token, key, library, agent_home=None):
             '<div class="usage-head"><h3>记忆整理日报</h3>'
             f'<span class="usage-hint">当前库状态整洁，暂无待整理项 {reset_btn}</span></div>'
             f'<div class="check-chips">{"".join(header_chips)}</div>'
-            '<p class="act-meta">整理日报会结合记忆体检与近 7 天读取日志，识别重复主题、过期快照与超长条目，'
-            '并生成可逐条「应用」或「忽略」的预览 Diff。</p>'
             "</section>"
         )
 
@@ -1398,7 +1370,7 @@ def render_upkeep_panel(token, key, library, agent_home=None):
         )
         cards.append(
             f"""
-        <article class="conflict-card">
+        <article class="conflict-card intent-row">
           <div class="conflict-card-head">
             <div>
               <strong><span class="meta-chip">{escape(kind_label)}</span> #{idx} {escape(item["title"])}</strong>
@@ -1416,8 +1388,6 @@ def render_upkeep_panel(token, key, library, agent_home=None):
     return (
         '<section class="l0-review-panel">'
         f'<div class="usage-head"><div class="check-chips">{"".join(header_chips)}</div>{reset_btn}</div>'
-        f'<p class="act-meta">本次扫描发现 <strong>{len(suggestions)} 条</strong> 可执行整理建议。'
-        '所有「应用」操作都会自动在本地回收站保留原文件备份，可随时通过历史版本恢复。</p>'
         f'{"".join(cards)}'
         "</section>"
     )
@@ -1462,7 +1432,7 @@ def render_handoff_panel(token, key, library):
         )
         cards.append(
             f"""
-        <article class="conflict-card">
+        <article class="conflict-card intent-row">
           <div class="conflict-card-head">
             <div>
               <strong><span class="meta-chip">{escape(status_label)}</span> {escape(item.get("title") or hid)}</strong>
@@ -1481,7 +1451,7 @@ def render_handoff_panel(token, key, library):
     )
     create_form = f"""
       <details class="activity-usage" {"open" if not active_cnt else ""}>
-        <summary><strong>新建跨客户端会话交接包</strong>（例如把 Codex 排查的根因交给 Claude Code 写修复）</summary>
+        <summary><strong>新建跨客户端会话交接包</strong></summary>
         <form class="edit-form" method="post" action="/handoff#feedback">
           {hidden("csrf", token)}{hidden("library", key)}{hidden("op", "create")}
           <label>任务标题 <input type="text" name="title" maxlength="{handoff.MAX_TITLE_CHARS}" required placeholder="例如：修复自动更新器签名校验边界"></label>
@@ -1497,9 +1467,6 @@ def render_handoff_panel(token, key, library):
       </details>"""
     return (
         '<section class="l0-review-panel">'
-        f'<p class="act-meta">当前有 <strong>{active_cnt} 个</strong> 进行中的交接包（共 {len(items)} 个）。'
-        '另一个客户端开启新会话时会在 SessionStart 自动看到接力提示，也可点击「复制交接包」一键粘贴过去，'
-        '或运行 <code>umem handoff read --markdown</code> 直接输出。</p>'
         f'{create_form}{cards_html}'
         "</section>"
     )
@@ -1540,7 +1507,6 @@ def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
           <div class="field-group">
             <label class="field-label" for="share-target-layer">写入层级</label>
             <select id="share-target-layer" name="target_layer" required>{"".join(layer_options)}</select>
-            <p class="field-hint">共享库默认只允许 L1 / L3 / L4；如原条目为 L0/L2，建议改选 L1 方法或 L3 项目后分享。</p>
           </div>
           <label class="checkbox-row">
             <input type="checkbox" name="overwrite" value="1">
@@ -1738,13 +1704,13 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
         cards.append(
             f"""
-          <article class="hub-card">
+          <article class="hub-card intent-row">
             <div class="hub-card-head">
               <div>
                 <strong>{escape(item["label"])}</strong>
                 <span class="hub-card-id"><code>{escape(lid)}</code></span>
               </div>
-              <div class="hub-card-actions">{"".join(act_btns)}</div>
+              <div class="hub-card-actions intent-actions">{"".join(act_btns)}</div>
             </div>
             <div class="check-chips">{"".join(status_chips)}</div>
             <p class="hub-card-path">目录：<code>{escape(item["path"])}</code></p>
@@ -1759,13 +1725,11 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
     <div class="sync-hub">
       <section class="hub-section">
         <h2 class="hub-section-title">已挂载记忆库（{len(all_libs)}）</h2>
-        <p class="hub-section-desc">MCP 会跨所有已启用的库联合检索，写入默认只落个人主库；共享库默认隔离 L0 个人红线与 L2 个人偏好。</p>
         <div class="hub-card-list">{"".join(cards)}</div>
       </section>
 
       <section class="hub-section">
-        <h2 class="hub-section-title">个人主库跨设备同步（GitHub / Gitee / 自建 Git）</h2>
-        <p class="hub-section-desc">粘贴你有写入权限的仓库地址。GitHub HTTPS 仓库首次连接时会打开浏览器授权；Gitee、GitLab 和自建平台的 HTTPS 地址使用钥匙串中保存的用户名与访问令牌（可写成 https://用户名@主机/...）；SSH 地址使用本机 SSH 密钥。同步会上传本地记忆和提交历史。</p>
+        <h2 class="hub-section-title">个人主库跨设备同步</h2>
         <form method="post" action="/sync_setup#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}{hidden("target_library", "personal")}
           <div class="form-row-two">
@@ -1796,7 +1760,6 @@ def render_sync_hub_html(token, key, libraries, agent_home=None):
 
       <section class="hub-section">
         <h2 class="hub-section-title">挂载新的共享记忆库</h2>
-        <p class="hub-section-desc">粘贴团队仓库链接并选择权限即可加入。私有 GitHub 仓库会打开浏览器授权；其他平台的 HTTPS 地址读取钥匙串中的用户名与访问令牌，SSH 地址使用本机密钥。共享库使用独立目录，个人库保存在原处。</p>
         <form method="post" action="/mount_add#feedback" class="hub-form">
           {hidden("csrf", token)}{hidden("library", key)}
           <div class="field-group">
@@ -2047,7 +2010,7 @@ def _usage_section(today, week):
           <div class="usage-cols">
             <div><h4>近 7 天按工具</h4>{tool_html}</div>
             <div><h4>AI 读的结果排在第几条</h4>
-              <p class="usage-sub">一次搜索会返回多条结果，这里统计 AI 读的是排在第几条的那个。</p>{rank_html}</div>
+              {rank_html}</div>
           </div>
         </section>"""
 
@@ -2189,9 +2152,9 @@ def _lint_section(key, root, token="", readonly=False, return_view="", return_me
         if edit_href and item["check"] not in {"index-orphan"}:
             btn_label = "立即处理" if item["severity"] == "error" else "去编辑"
             actions.append(f'<a class="btn btn-ghost btn-compact" href="{escape(edit_href)}">{btn_label}</a>')
-        action_html = f'<span class="lint-actions">{"".join(actions)}</span>' if actions else ""
+        action_html = f'<span class="lint-actions intent-actions">{"".join(actions)}</span>' if actions else ""
         rows.append(
-            f'<li><div class="lint-row-head"><span>{_ref_link(ref, key)} '
+            f'<li class="intent-row"><div class="lint-row-head"><span>{_ref_link(ref, key)} '
             f'<span class="{cls}">{escape(label)}</span></span>{action_html}</div>'
             f'<span class="act-meta">{escape(item["detail"])} → {escape(item["hint"])}</span></li>'
         )
@@ -2314,7 +2277,7 @@ def render_activity_panel(key, agent_home=None, root=None, token="", readonly=Fa
       <section class="activity-panel" aria-labelledby="activity-heading">
         <div class="recent-panel-head">
           <div class="recent-panel-title">
-            <h2 id="activity-heading">🤖 AI 读写动态</h2>
+            <h2 id="activity-heading">AI 读写动态</h2>
             <span class="recent-stats">今日查询 {summary["reads_today"]} 次 · 今日写入 {summary["writes_today"]} 次 · 空结果搜索 {summary["empty_searches_today"]} 次{checkpoint_note} · 沉淀提醒 {summary["nudges_today"]} 次</span>
           </div>
         </div>
@@ -2400,7 +2363,7 @@ def render_overview(topics, entries, key, root=None, token="", readonly=False):
       <section class="recent-panel" aria-labelledby="recent-work-heading">
         <div class="recent-panel-head">
           <div class="recent-panel-title">
-            <h2 id="recent-work-heading">⚡ 最近工作动态</h2>
+            <h2 id="recent-work-heading">最近工作动态</h2>
             <span class="recent-stats">今日活跃 {today_cnt} 条 · 近 7 天活跃 {week_cnt} 条</span>
           </div>
           <a class="btn btn-secondary btn-compact" href="{escape(recent_more_href)}">筛选近 7 天全部 →</a>
@@ -2409,7 +2372,7 @@ def render_overview(topics, entries, key, root=None, token="", readonly=False):
       </section>"""
 
     cards = []
-    for lk, (lname, _, ldesc) in LAYERS.items():
+    for lk, (lname, _, _) in LAYERS.items():
         href = query(library=key, layer=lk)
         cards.append(
             f"""
@@ -2418,22 +2381,13 @@ def render_overview(topics, entries, key, root=None, token="", readonly=False):
               <span class="layer-badge layer-{lk}">{lk} · {escape(lname)}</span>
               <span class="overview-num">{layer_counts[lk]}</span>
             </div>
-            <p>{escape(ldesc)}</p>
           </a>"""
         )
 
-    active_user_cnt = sum(e.status == "active" for e in entries)
     return f"""
       {render_activity_panel(key, root=root, token=token, readonly=readonly)}
       {recent_panel}
-      <p class="overview-section-label">按 L0–L4 记忆性质浏览</p>
-      <div class="overview-grid">{"".join(cards)}</div>
-      <div class="overview-tip">
-        <strong>如何高效使用这套统一中枢？</strong>
-        <p>1. 左侧列表默认按 <strong>最近更新时间</strong> 倒序排列，顶部可切换「⚡ 最近工作」「最近写入」或「层级顺序」，每条卡片均标明多久前写入或更新。</p>
-        <p>2. 当前共有 <strong>{len(topics)} 条</strong> 主知识库记忆和 <strong>{active_user_cnt} 条</strong> 个人手记。点击任意条目右上角「编辑记忆」即可在线修改并自动刷新 <code>updated_at</code> 与 <code>MEMORY.md</code>。</p>
-        <p>3. 在已接入的客户端中直接询问“最近做了什么”或“最近工作”，MCP 服务也会按最新更新时间优先返回近期活跃工作。</p>
-      </div>"""
+      <div class="overview-grid">{"".join(cards)}</div>"""
 
 
 def render_skills_overview(skills_matrix, key):
@@ -2444,7 +2398,7 @@ def render_skills_overview(skills_matrix, key):
             cat_counts[sk["category"]] += 1
 
     cards = []
-    for ck, (cname, badge_layer, cdesc) in SKILL_CATS.items():
+    for ck, (cname, badge_layer, _) in SKILL_CATS.items():
         href = query(library=key, tab="skills", cat=ck)
         cards.append(
             f"""
@@ -2453,19 +2407,10 @@ def render_skills_overview(skills_matrix, key):
               <span class="layer-badge layer-{badge_layer}">{escape(cname)}</span>
               <span class="overview-num">{cat_counts[ck]}</span>
             </div>
-            <p>{escape(cdesc)}</p>
           </a>"""
         )
 
-    enabled_cnt = sum(sk["enabled"] for sk in skills_matrix)
-    return f"""
-      <div class="overview-grid">{"".join(cards)}</div>
-      <div class="overview-tip">
-        <strong>统一 Skills 管理机制</strong>
-        <p>1. 所有跨端共享技能统一存放在 <code>{escape(str(data_root() / "skills"))}</code>（共 <strong>{len(skills_matrix)} 个</strong>，当前已启用 <strong>{enabled_cnt} 个</strong>）。</p>
-        <p>2. 点击上方「一键同步全部」或「同步」后，系统会自动将原分散在各客户端的独立目录安全备份到 <code>.state/skill-backups/</code>，并统一替换为指向本仓库的软链接。</p>
-        <p>3. 在任意技能详情页右上角点击「停用此技能」或「启用此技能」，已接入客户端的挂载状态会实时自动增删同步；客户端专有的内部技能（如 Codex <code>.system</code>）保持原位不受影响。</p>
-      </div>"""
+    return f'<div class="overview-grid">{"".join(cards)}</div>'
 
 
 def render_skills_tab(
@@ -2615,7 +2560,6 @@ def render_skills_tab(
             error = "找不到请求的技能 Markdown 文件。"
     else:
         heading = "Skills 统一技能中心"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">已接入的客户端共享</span></div>'
         if dis_cnt > 0:
             detail_toolbar = f"""
               <form method="post" action="/skill#feedback">
@@ -2811,7 +2755,7 @@ def render(
     all_cur = CUR_ATTR if (not layer and not window) else ""
     layer_tabs = [
         f'<a class="pill-tab pill-tab-recent" href="{escape(query(library=key, q=q, source=source, window="7d"))}"'
-        f'{recent_cur}>⚡ 最近工作 <span class="pill-count">{len(recent_7d_rows)}</span></a>',
+        f'{recent_cur}>最近工作 <span class="pill-count">{len(recent_7d_rows)}</span></a>',
         f'<a class="pill-tab" href="{escape(query(library=key, q=q, status=status, source=source, sort=sort_param))}"'
         f'{all_cur}>全部 <span class="pill-count">{len(base_all_layers)}</span></a>',
     ]
@@ -2882,7 +2826,6 @@ def render(
             if topic_draft
             else (entry.layer if entry.title or entry.body else (layer or "L1"))
         )
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">支持写入主知识库或个人手记</span></div>'
         editor_html = render_memory_editor_html(
             mode="new",
             scope=default_scope,
@@ -2899,7 +2842,6 @@ def render(
         )
     elif view == "edit" and entry.name:
         heading = f"编辑手记 · {entry.title or entry.name}"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">个人手记区 · user-managed/</span></div>'
         detail_submeta = f'<p class="detail-path"><code>user-managed/{escape(entry.name)}.md</code></p>'
         _, upd_full, _ = mcp_server.format_relative_zh(entry.updated_at, now_dt=now_dt)
         meta_note = (
@@ -2970,7 +2912,6 @@ def render(
             )
     elif view == "edit_index":
         heading = "编辑 MEMORY.md · 记忆维护规则与总索引"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
         detail_submeta = f'<p class="detail-path"><code>{escape(str(library.index))}</code></p>'
         try:
             idx_text, idx_rev = index_draft if index_draft is not None else library.read_index_with_revision()
@@ -3017,8 +2958,8 @@ def render(
         detail_toolbar = f"""
           <a class="btn btn-primary btn-compact" href="{escape(edit_href)}">编辑手记</a>
           <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
-          <details class="action-menu">
-            <summary class="btn btn-ghost btn-compact">更多 ▾</summary>
+          <details class="action-menu" data-safe-menu>
+            <summary class="btn btn-ghost btn-compact"><span>更多</span><span class="reicon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></span></summary>
             <div class="action-menu-pop">
               <a class="action-menu-item" href="{escape(toggle_href)}">{toggle_label}</a>
               <form action="/{act}#feedback" method="post" aria-label="{act_label}当前条目">
@@ -3065,27 +3006,22 @@ def render(
         reader = render_memory_import(token, library, import_client, topic_path, q, import_draft or {})
     elif view == "l0_review":
         heading = "L0 操作约束待确认区"
-        detail_badges = '<div class="detail-badges"><span class="layer-badge layer-L0">L0 · 写保护</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_l0_review(token, key, library)
     elif view == "upkeep":
         heading = f"记忆整理日报 · {library.label}"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">Sleep-time Upkeep · 逐条确认</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_upkeep_panel(token, key, library, agent_home=agent_home)
     elif view == "handoff":
         heading = "跨客户端会话交接包"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">Session Handoff · 一键接力</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_handoff_panel(token, key, library)
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_sync_hub_html(token, key, libraries, agent_home=agent_home)
     elif view == "conflicts":
         heading = f"同步冲突对比与合并 · {library.label}"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">行级 Diff · 双方内容完整保留</span></div>'
         detail_toolbar = (
             f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=key, view="sync_hub"))}#detail-title">共享与同步</a>'
             f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
@@ -3093,7 +3029,6 @@ def render(
         reader = render_conflicts_view_html(token, key, library)
     elif view == "index":
         heading = "MEMORY.md · 记忆维护规则与总索引"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">权威入口文件</span></div>'
         detail_submeta = f'<p class="detail-path"><code>{escape(str(library.index))}</code></p>'
         edit_idx_href = query(**link_params, view="edit_index") + "#detail-title"
         toggle_href = query(**link_params, view="index", raw="" if raw_mode else "1") + "#detail-title"
@@ -3180,8 +3115,8 @@ def render(
                   {verify_btn}
                   {share_btn}
                   <button class="btn btn-ghost btn-compact" type="button" data-copy-target="copy-markdown-source">复制正文</button>
-                  <details class="action-menu">
-                    <summary class="btn btn-ghost btn-compact">更多 ▾</summary>
+                  <details class="action-menu" data-safe-menu>
+                    <summary class="btn btn-ghost btn-compact"><span>更多</span><span class="reicon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></span></summary>
                     <div class="action-menu-pop">
                       <a class="action-menu-item" href="{escape(toggle_href)}">{"阅读视图" if raw_mode else "查看源码"}</a>
                       {archive_btn}
@@ -3236,7 +3171,6 @@ def render(
             )
     else:
         heading = "记忆库概览"
-        detail_badges = '<div class="detail-badges"><span class="meta-chip">L0–L4 分层记忆工作台</span></div>'
         reader = "" if DESKTOP else render_overview(
             topics, entries, key, root=library.root, token=token, readonly=library.is_readonly
         )
@@ -3271,7 +3205,7 @@ def render(
     new_btn_html = (
         ""
         if library.is_readonly
-        else f'<a class="btn btn-primary" href="{escape(new_link)}"><span aria-hidden="true">＋</span> 新建记忆</a>'
+        else f'<a class="btn btn-primary" href="{escape(new_link)}">新建记忆</a>'
     )
     topbar_cta = f'<a class="btn btn-ghost" href="{escape(index_link)}">查看 MEMORY.md 规范</a>{new_btn_html}'
 

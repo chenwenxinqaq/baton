@@ -664,6 +664,87 @@
     trigger.addEventListener("click", () => openPalette());
   }
 
+  // 7b. Desktop menus: open delay, close delay, and Safe Triangle (安全三角区) intent protection.
+  const OPEN_DELAY_MS = 120;
+  const CLOSE_DELAY_MS = 220;
+  const pointInTriangle = (px, py, ax, ay, bx, by, cx, cy) => {
+    const d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    const d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+    const d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+    const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+    const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(hasNeg && hasPos);
+  };
+
+  let pointerX = 0;
+  let pointerY = 0;
+  document.addEventListener("pointermove", (e) => {
+    pointerX = e.clientX;
+    pointerY = e.clientY;
+  }, { passive: true });
+
+  for (const menu of document.querySelectorAll("details.action-menu")) {
+    const summary = menu.querySelector("summary");
+    const pop = menu.querySelector(".action-menu-pop");
+    if (!summary || !pop) continue;
+    let openTimer = 0;
+    let closeTimer = 0;
+    let exitPoint = null;
+
+    const clearTimers = () => {
+      if (openTimer) { window.clearTimeout(openTimer); openTimer = 0; }
+      if (closeTimer) { window.clearTimeout(closeTimer); closeTimer = 0; }
+    };
+
+    const isInsideSafeTriangle = () => {
+      if (!menu.open || !exitPoint) return false;
+      const rect = pop.getBoundingClientRect();
+      if (!rect.width && !rect.height) return false;
+      const edgeX = exitPoint.x <= rect.left ? rect.left : (exitPoint.x >= rect.right ? rect.right : rect.left);
+      return (
+        pointInTriangle(pointerX, pointerY, exitPoint.x, exitPoint.y, edgeX, rect.top - 8, edgeX, rect.bottom + 8) ||
+        pointInTriangle(pointerX, pointerY, exitPoint.x, exitPoint.y, rect.left, rect.top - 8, rect.right, rect.top - 8)
+      );
+    };
+
+    const scheduleClose = () => {
+      clearTimers();
+      closeTimer = window.setTimeout(function checkClose() {
+        if (menu.matches(":hover") || pop.matches(":hover")) return;
+        if (isInsideSafeTriangle()) {
+          closeTimer = window.setTimeout(checkClose, 80);
+          return;
+        }
+        menu.removeAttribute("open");
+        exitPoint = null;
+      }, CLOSE_DELAY_MS);
+    };
+
+    summary.addEventListener("pointerenter", () => {
+      clearTimers();
+      if (!menu.open) {
+        openTimer = window.setTimeout(() => {
+          for (const other of document.querySelectorAll("details.action-menu[open]")) {
+            if (other !== menu) other.removeAttribute("open");
+          }
+          menu.setAttribute("open", "");
+        }, OPEN_DELAY_MS);
+      }
+    });
+    summary.addEventListener("pointerleave", (e) => {
+      exitPoint = { x: e.clientX, y: e.clientY };
+      scheduleClose();
+    });
+    pop.addEventListener("pointerenter", () => {
+      clearTimers();
+      exitPoint = null;
+    });
+    pop.addEventListener("pointerleave", () => {
+      exitPoint = null;
+      scheduleClose();
+    });
+  }
+
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       for (const menu of document.querySelectorAll("details.action-menu[open]")) {

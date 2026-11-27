@@ -1707,16 +1707,14 @@ class Handler(BaseHTTPRequestHandler):
   <main class="sync-progress">
     <section class="sync-progress-card" aria-labelledby="sync-progress-title">
       <header class="sync-progress-header">
-        <span class="sync-progress-icon" aria-hidden="true"><svg viewBox="0 0 24 24">{NAV_ICONS['sync']}</svg></span>
+        <span class="reicon sync-progress-icon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{NAV_ICONS['sync']}</svg></span>
         <div>
           <h1 id="sync-progress-title">{title}</h1>
-          <p>完成后会自动显示结果。</p>
         </div>
       </header>
       <div class="sync-progress-track" role="progressbar" aria-labelledby="sync-progress-title"></div>
       <aside class="sync-progress-help" aria-labelledby="sync-auth-title">
         <h2 id="sync-auth-title">GitHub 授权</h2>
-        <p>如果浏览器打开了 GitHub 授权页，请完成授权后回到这里。</p>
       </aside>
       <div class="sync-progress-actions">
         <a class="btn btn-ghost" href="{progress_url}">查看最新状态</a>
