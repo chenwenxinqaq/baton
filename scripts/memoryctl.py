@@ -2594,6 +2594,33 @@ def main():
     p_up_rst.add_argument("suggestion_id", nargs="?", default="", help="Optional single suggestion id (omit to clear all).")
     p_up_rst.add_argument("--library", default="personal", help="Target library id (defaults to personal).")
 
+    p_ho = sub.add_parser("handoff", help="Export, inspect, claim, or complete cross-client session handoff packs.")
+    ho_sub = p_ho.add_subparsers(dest="handoff_cmd", required=True)
+    p_ho_create = ho_sub.add_parser("create", help="Create a cross-client handoff pack for an unfinished task.")
+    p_ho_create.add_argument("--title", required=True, help="Single-line task title.")
+    p_ho_create.add_argument("--summary", default=None, help="Verified findings and current task context.")
+    p_ho_create.add_argument("--summary-file", default=None, help="Read summary text from file, or '-' for stdin.")
+    p_ho_create.add_argument("--next-step", action="append", default=[], help="Remaining step (repeatable).")
+    p_ho_create.add_argument("--file", action="append", default=[], help="Key file path (repeatable).")
+    p_ho_create.add_argument("--ref", action="append", default=[], help="Related memory entry ref (repeatable).")
+    p_ho_create.add_argument("--from-client", default="", help="Originating client name (e.g. Codex).")
+    p_ho_create.add_argument("--to-client", default="", help="Target client name (e.g. Claude Code).")
+    p_ho_create.add_argument("--workspace", default="", help="Working directory path.")
+    p_ho_create.add_argument("--markdown", action="store_true", help="Print the ready-to-paste Markdown briefing instead of JSON.")
+    p_ho_list = ho_sub.add_parser("list", help="List active (or all) session handoff packs.")
+    p_ho_list.add_argument("--all", action="store_true", help="Include completed handoffs.")
+    p_ho_read = ho_sub.add_parser("read", help="Read one handoff pack (defaults to the newest active one).")
+    p_ho_read.add_argument("handoff_id", nargs="?", default="", help="Optional handoff id.")
+    p_ho_read.add_argument("--markdown", action="store_true", help="Print only the Markdown briefing.")
+    p_ho_claim = ho_sub.add_parser("claim", help="Claim an open handoff pack for a receiving client.")
+    p_ho_claim.add_argument("handoff_id", nargs="?", default="", help="Optional handoff id (defaults to newest active).")
+    p_ho_claim.add_argument("--client", default="", help="Receiving client name.")
+    p_ho_claim.add_argument("--markdown", action="store_true", help="Print only the Markdown briefing.")
+    p_ho_done = ho_sub.add_parser("complete", help="Mark a handoff pack as completed.")
+    p_ho_done.add_argument("handoff_id", help="Handoff id.")
+    p_ho_del = ho_sub.add_parser("delete", help="Delete a handoff pack.")
+    p_ho_del.add_argument("handoff_id", help="Handoff id.")
+
     sub.add_parser("version", help="Print the installed Unified Memory version and runtime location.")
     p_upg = sub.add_parser("upgrade", help="Check for or apply verified standalone CLI upgrades from GitHub Releases.")
     p_upg.add_argument("--check", action="store_true", help="Only check for a newer release without modifying files.")
@@ -2844,6 +2871,55 @@ def main():
             parser.exit(1, f"{exc}\n")
         finally:
             ws.shutdown()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "handoff":
+        sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
+        from server import MemoryStore
+        import handoff
+        store = MemoryStore(MEMORY_ROOT)
+        try:
+            if args.handoff_cmd == "create":
+                if args.summary is not None and args.summary_file is not None:
+                    raise ValueError("Pass either --summary or --summary-file, not both.")
+                if args.summary is None and args.summary_file is None:
+                    raise ValueError("Provide either --summary or --summary-file.")
+                if args.summary is not None:
+                    summary = args.summary
+                else:
+                    summary = sys.stdin.read() if args.summary_file == "-" else Path(args.summary_file).read_text(encoding="utf-8")
+                result = handoff.create_handoff(
+                    store.root,
+                    title=args.title,
+                    summary=summary,
+                    next_steps=args.next_step,
+                    files=args.file,
+                    memory_refs=args.ref,
+                    source_client=args.from_client or "CLI",
+                    target_client=args.to_client,
+                    workspace=args.workspace,
+                    store=store,
+                )
+                if args.markdown:
+                    print(result["briefing"], end="")
+                    return
+            elif args.handoff_cmd == "list":
+                result = {"handoffs": handoff.list_handoffs(store.root, include_done=args.all)}
+            elif args.handoff_cmd == "read":
+                result = handoff.read_handoff(store.root, args.handoff_id, store=store)
+                if args.markdown:
+                    print(result["briefing"], end="")
+                    return
+            elif args.handoff_cmd == "claim":
+                result = handoff.claim_handoff(store.root, args.handoff_id, client=args.client or "CLI", store=store)
+                if args.markdown:
+                    print(result["briefing"], end="")
+                    return
+            elif args.handoff_cmd == "complete":
+                result = handoff.complete_handoff(store.root, args.handoff_id)
+            else:
+                result = handoff.delete_handoff(store.root, args.handoff_id)
+        except (ValueError, OSError) as exc:
+            parser.exit(1, f"{exc}\n")
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "version":
         import cli_updater

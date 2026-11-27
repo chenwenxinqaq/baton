@@ -29,6 +29,7 @@ from library_paths import (
     unlock_file,
 )
 import audit_log
+import handoff
 import l0_guard
 import memory_lint
 import secret_guard
@@ -2913,6 +2914,42 @@ TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "memory_handoff",
+        "description": "Create, list, read, claim, or complete a cross-client session handoff pack so unfinished work (verified findings, next steps, key files, and memory refs) can be picked up seamlessly in another AI client (e.g. Codex -> Claude Code).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "list", "read", "claim", "complete"],
+                    "default": "list",
+                    "description": "Operation to perform on the local session handoff queue.",
+                },
+                "handoff_id": {"type": "string", "default": "", "description": "Handoff pack id (optional for read/claim to pick the newest active pack)."},
+                "title": {"type": "string", "default": "", "description": "Single-line task title (required when action='create')."},
+                "summary": {"type": "string", "default": "", "description": "Verified findings, root cause, and current state (required when action='create')."},
+                "next_steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Concrete remaining steps for the receiving client.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relevant absolute or workspace-relative file paths.",
+                },
+                "memory_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Related memory entry refs (e.g. projects/foo.md) the receiving client should read.",
+                },
+                "target_client": {"type": "string", "default": "", "description": "Intended receiving client (e.g. Claude Code, Codex, Cursor)."},
+                "workspace": {"type": "string", "default": "", "description": "Working directory path for the task."},
+                "include_done": {"type": "boolean", "default": False, "description": "Include completed handoffs when action='list'."},
+            },
+        },
+    },
 ]
 
 
@@ -3106,6 +3143,40 @@ def _handle_tool_call(store, name, args):
         if isinstance(store, WorkspaceStore):
             kwargs["library"] = args.get("library", "personal")
         data = store.archive_entry(**kwargs)
+    elif name == "memory_handoff":
+        personal = store._resolve_single_store("personal") if isinstance(store, WorkspaceStore) else store
+        action = str(args.get("action") or "list").strip().lower()
+        hid = str(args.get("handoff_id") or "").strip()
+        if action == "create":
+            data = handoff.create_handoff(
+                personal.root,
+                title=args.get("title", ""),
+                summary=args.get("summary", ""),
+                next_steps=args.get("next_steps") or (),
+                files=args.get("files") or (),
+                memory_refs=args.get("memory_refs") or (),
+                source_client=CLIENT_NAME,
+                target_client=args.get("target_client", ""),
+                workspace=args.get("workspace", ""),
+                store=personal,
+            )
+        elif action == "list":
+            data = {
+                "handoffs": handoff.list_handoffs(
+                    personal.root,
+                    include_done=bool(args.get("include_done", False)),
+                )
+            }
+        elif action == "read":
+            data = handoff.read_handoff(personal.root, hid, store=personal)
+        elif action == "claim":
+            data = handoff.claim_handoff(personal.root, hid, client=CLIENT_NAME, store=personal)
+        elif action == "complete":
+            if not hid:
+                raise ValueError("handoff_id is required when action='complete'.")
+            data = handoff.complete_handoff(personal.root, hid)
+        else:
+            raise ValueError(f"Unsupported handoff action: {action}")
     else:
         raise ValueError(f"Unknown tool: {name}")
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}, data

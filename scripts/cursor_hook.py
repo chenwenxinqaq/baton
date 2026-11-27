@@ -31,6 +31,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_log  # noqa: E402
+import handoff  # noqa: E402
 from library_paths import global_state_dir, resolve_libraries  # noqa: E402
 
 NUDGE_MARKER = "【记忆沉淀检查】"
@@ -199,6 +200,9 @@ def build_context(memory_root):
     shared_note = _shared_libraries_summary(memory_root)
     if shared_note:
         lines.append(shared_note)
+    handoff_note = handoff.active_handoff_hint(memory_root)
+    if handoff_note:
+        lines.append(handoff_note)
     digest = index_digest(memory_root)
     if digest:
         lines.append("当前库索引摘录：")

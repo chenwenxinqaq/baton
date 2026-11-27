@@ -21,6 +21,7 @@ if str(APP) not in sys.path:
 
 from library_paths import ALL_LAYERS, data_root  # noqa: E402
 import audit_log  # noqa: E402
+import handoff  # noqa: E402
 import l0_guard  # noqa: E402
 import memory_import  # noqa: E402
 import server as mcp_server  # noqa: E402
@@ -325,11 +326,20 @@ def desktop_status_strip(key, library):
             chips.append(f'<a class="chip-warn" href="{l0_href}">! {l0_cnt} 条 L0 约束待确认</a>')
     except Exception:
         pass
+    try:
+        ho_cnt = handoff.count_active(library.root)
+        if ho_cnt and library.role == "personal":
+            ho_href = escape(query(library=key, view="handoff"))
+            chips.append(f'<a class="meta-chip" href="{ho_href}">交接包 {ho_cnt}</a>')
+    except Exception:
+        pass
     href = escape(query(library=key, view="activity"))
     upkeep_href = escape(query(library=key, view="upkeep"))
+    handoff_href = escape(query(library=key, view="handoff"))
+    handoff_link = f'<a href="{handoff_href}">会话交接</a> · ' if key == "primary" else ""
     return (
         f'<div class="desk-status check-chips">{"".join(chips)}'
-        f'<a href="{upkeep_href}">整理日报</a> · <a href="{href}">查看读写动态 →</a></div>'
+        f'{handoff_link}<a href="{upkeep_href}">整理日报</a> · <a href="{href}">查看读写动态 →</a></div>'
     )
 
 
@@ -1413,6 +1423,88 @@ def render_upkeep_panel(token, key, library, agent_home=None):
     )
 
 
+_HANDOFF_STATUS_LABELS = {"open": "待接力", "claimed": "已接手", "done": "已结单"}
+
+
+def render_handoff_panel(token, key, library):
+    """Render the Cross-client Session Handoff hub with one-click copyable briefings."""
+    items = handoff.list_handoffs(library.root, include_done=True, limit=20)
+    active_cnt = sum(1 for it in items if it.get("status") != "done")
+    cards = []
+    for idx, item in enumerate(items, 1):
+        hid = item["id"]
+        status = item.get("status", "open")
+        status_label = _HANDOFF_STATUS_LABELS.get(status, status)
+        briefing = handoff.render_briefing(item, store=library.store)
+        copy_id = f"handoff-briefing-{idx}"
+        meta_parts = [
+            f"{item.get('source_client') or '当前客户端'} → {item.get('target_client') or '任意客户端'}",
+            f"编号 {hid}",
+            f"更新于 {(item.get('updated_at') or '')[:19].replace('T', ' ')}",
+        ]
+        if item.get("claimed_by"):
+            meta_parts.append(f"接手方：{item['claimed_by']}")
+        actions = [
+            f'<button class="btn btn-primary btn-compact" type="button" data-copy-target="{copy_id}">复制交接包</button>'
+        ]
+        if status != "done":
+            actions.append(
+                '<form method="post" action="/handoff#feedback">'
+                f'{hidden("csrf", token)}{hidden("library", key)}{hidden("op", "complete")}{hidden("handoff_id", hid)}'
+                '<button class="btn btn-secondary btn-compact" type="submit">标记结单</button>'
+                "</form>"
+            )
+        actions.append(
+            '<form method="post" action="/handoff#feedback">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("op", "delete")}{hidden("handoff_id", hid)}'
+            '<button class="btn btn-ghost btn-compact" type="submit">删除</button>'
+            "</form>"
+        )
+        cards.append(
+            f"""
+        <article class="conflict-card">
+          <div class="conflict-card-head">
+            <div>
+              <strong><span class="meta-chip">{escape(status_label)}</span> {escape(item.get("title") or hid)}</strong>
+              <p class="hub-card-path">{escape(" · ".join(meta_parts))}</p>
+            </div>
+            <div class="conflict-quick-actions">{"".join(actions)}</div>
+          </div>
+          <pre class="markdown-raw">{escape(briefing)}</pre>
+          <textarea id="{copy_id}" hidden readonly>{escape(briefing)}</textarea>
+        </article>"""
+        )
+    cards_html = (
+        "".join(cards)
+        if cards
+        else '<p class="act-meta">还没有会话交接包。可在下方新建，或在 Codex / Claude Code 中直接让 AI 调用 <code>memory_handoff(action="create", ...)</code> 导出当前任务快照。</p>'
+    )
+    create_form = f"""
+      <details class="activity-usage" {"open" if not active_cnt else ""}>
+        <summary><strong>新建跨客户端会话交接包</strong>（例如把 Codex 排查的根因交给 Claude Code 写修复）</summary>
+        <form class="edit-form" method="post" action="/handoff#feedback">
+          {hidden("csrf", token)}{hidden("library", key)}{hidden("op", "create")}
+          <label>任务标题 <input type="text" name="title" maxlength="{handoff.MAX_TITLE_CHARS}" required placeholder="例如：修复自动更新器签名校验边界"></label>
+          <label>来源客户端 <input type="text" name="source_client" value="Codex" placeholder="Codex / Claude Code / Cursor"></label>
+          <label>目标客户端 <input type="text" name="target_client" value="Claude Code" placeholder="Claude Code / Codex / Cursor（可留空）"></label>
+          <label>工作目录（可选） <input type="text" name="workspace" placeholder="/path/to/repo"></label>
+          <label>已验证结论与当前上下文 <textarea name="summary" rows="6" required placeholder="写清已确认根因、已做改动、未解决现象与约束边界"></textarea></label>
+          <label>待完成步骤（每行一条，可选） <textarea name="next_steps" rows="4" placeholder="补齐回归单测&#10;运行打包冒烟并提交"></textarea></label>
+          <label>关键文件路径（每行一条，可选） <textarea name="files" rows="3" placeholder="/path/to/file.py"></textarea></label>
+          <label>关联记忆路径（每行一条，可选） <textarea name="memory_refs" rows="2" placeholder="projects/example.md"></textarea></label>
+          <button class="btn btn-primary" type="submit">生成交接包</button>
+        </form>
+      </details>"""
+    return (
+        '<section class="l0-review-panel">'
+        f'<p class="act-meta">当前有 <strong>{active_cnt} 个</strong> 进行中的交接包（共 {len(items)} 个）。'
+        '另一个客户端开启新会话时会在 SessionStart 自动看到接力提示，也可点击「复制交接包」一键粘贴过去，'
+        '或运行 <code>umem handoff read --markdown</code> 直接输出。</p>'
+        f'{create_form}{cards_html}'
+        "</section>"
+    )
+
+
 def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
     """Render native modal dialog to promote/share a personal topic into a writable shared library."""
     if not writable_shared_libs:
@@ -1899,7 +1991,8 @@ def _ref_link(ref, key, event_library=""):
 _TOOL_LABELS = {"memory_search": "搜索", "memory_read": "读取", "memory_list": "列表", "memory_upsert": "写入",
                 "memory_archive": "归档", "memory_libraries": "库列表", "memory_history": "历史版本",
     "memory_lint": "体检",
-                "memory_restore": "恢复版本"}
+                "memory_restore": "恢复版本",
+                "memory_handoff": "会话交接"}
 
 
 def _usage_section(today, week):
@@ -2980,6 +3073,11 @@ def render(
         detail_badges = '<div class="detail-badges"><span class="meta-chip">Sleep-time Upkeep · 逐条确认</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_upkeep_panel(token, key, library, agent_home=agent_home)
+    elif view == "handoff":
+        heading = "跨客户端会话交接包"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">Session Handoff · 一键接力</span></div>'
+        detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
+        reader = render_handoff_panel(token, key, library)
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'

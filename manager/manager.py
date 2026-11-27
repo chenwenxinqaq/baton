@@ -44,6 +44,7 @@ from library_paths import (  # noqa: E402
     unavailable_issue,
 )
 import audit_log  # noqa: E402
+import handoff  # noqa: E402
 import memory_import  # noqa: E402
 import secret_guard  # noqa: E402
 import server as mcp_server  # noqa: E402
@@ -105,6 +106,7 @@ from views import (  # noqa: E402
     render_conflicts_view_html,
     render_delete_dialog_html,
     render_detail_timestamps_html,
+    render_handoff_panel,
     render_index_editor_html,
     render_l0_review,
     render_layer_checkboxes,
@@ -1168,10 +1170,11 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import", "l0_review", "upkeep"}
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import", "l0_review", "upkeep", "handoff"}
                                 | ({"activity"} if DESKTOP else set()))
                 or (view == "memory_import" and (key != "primary" or tab != "memory" or import_client not in memory_import.CLIENTS))
                 or (view == "l0_review" and (key != "primary" or tab != "memory"))
+                or (view == "handoff" and (key != "primary" or tab != "memory"))
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -1214,6 +1217,9 @@ class Handler(BaseHTTPRequestHandler):
             "upkeep_applied": "整理建议已应用（原内容已在本机回收站保留历史版本备份）。",
             "upkeep_dismissed": "已忽略该条整理建议（条目内容变化后会重新评估）。",
             "upkeep_reset": "已恢复所有被忽略的整理建议。",
+            "handoff_created": "会话交接包已生成，可一键复制或在目标客户端直接接力。",
+            "handoff_completed": "会话交接包已标记结单。",
+            "handoff_deleted": "会话交接包已删除。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -1268,6 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
             "/memory_import",
             "/l0_review",
             "/upkeep",
+            "/handoff",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
@@ -1306,6 +1313,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/upkeep":
             self.handle_upkeep(fields)
+            return
+        if self.path == "/handoff":
+            self.handle_handoff(fields)
             return
         if self.path in {
             "/agent",
@@ -1449,6 +1459,42 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.SEE_OTHER, "", location=target)
         except (ValueError, OSError) as exc:
             self.page(HTTPStatus.CONFLICT, key=key, view="upkeep", error=f"操作未完成：{exc}")
+
+    def handle_handoff(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.libraries or key != "primary":
+            self.page(HTTPStatus.BAD_REQUEST, error="会话交接包仅支持个人记忆库。")
+            return
+        library = self.libraries[key]
+        op = fields.get("op", "").strip()
+        hid = fields.get("handoff_id", "").strip()
+        try:
+            if op == "create":
+                handoff.create_handoff(
+                    library.root,
+                    title=fields.get("title", ""),
+                    summary=fields.get("summary", ""),
+                    next_steps=fields.get("next_steps", ""),
+                    files=fields.get("files", ""),
+                    memory_refs=fields.get("memory_refs", ""),
+                    source_client=fields.get("source_client", ""),
+                    target_client=fields.get("target_client", ""),
+                    workspace=fields.get("workspace", ""),
+                    store=library.store,
+                )
+                notice = "handoff_created"
+            elif op == "complete":
+                handoff.complete_handoff(library.root, hid)
+                notice = "handoff_completed"
+            elif op == "delete":
+                handoff.delete_handoff(library.root, hid)
+                notice = "handoff_deleted"
+            else:
+                raise InvalidEntry("未知的会话交接操作。")
+            target = query(library=key, view="handoff", notice=notice) + "#feedback"
+            self.respond(HTTPStatus.SEE_OTHER, "", location=target)
+        except (ValueError, OSError) as exc:
+            self.page(HTTPStatus.CONFLICT, key=key, view="handoff", error=f"操作未完成：{exc}")
 
     def start_sync_action(self, key, read_only, tab, return_view):
         library = self.libraries[key]
