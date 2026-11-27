@@ -217,6 +217,15 @@ class VersionHistoryUITests(unittest.TestCase):
         self.assertIn("methods/base-guide.md", links_html)
         self.assertIn("projects/rollout-plan.md", links_html)
 
+        shared_links_html = manager_mod.render_topic_links_html(
+            "team-mymem",
+            [{"ref": "team-mymem:methods/base-guide.md", "title": "基础指南"}],
+            [{"ref": "team-mymem:projects/rollout-plan.md", "title": "上线计划"}],
+        )
+        self.assertIn("library=team-mymem&amp;topic=methods%2Fbase-guide.md#detail-title", shared_links_html)
+        self.assertIn("library=team-mymem&amp;topic=projects%2Frollout-plan.md#detail-title", shared_links_html)
+        self.assertNotIn("topic=team-mymem%3A", shared_links_html)
+
         writable_lint = manager_mod._lint_section("primary", self.root, token="tok", readonly=False, return_view="activity")
         self.assertIn('action="/verify_topic#feedback"', writable_lint)
         self.assertIn("今日核实", writable_lint)

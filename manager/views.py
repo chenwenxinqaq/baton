@@ -668,13 +668,24 @@ def render_topic_links_html(library_key, links, backlinks):
         return ""
 
     def _pill_list(items):
-        return "".join(
-            f'<a class="link-pill" href="{escape(query(library=library_key, topic=item["ref"]) + "#detail-title")}">'
-            f'<span class="link-pill-title">{escape(item.get("title") or item["ref"])}</span>'
-            f'<code>{escape(item["ref"])}</code></a>'
-            for item in items
-            if item.get("ref")
-        )
+        pills = []
+        for item in items:
+            raw_ref = str(item.get("ref") or "").strip()
+            if not raw_ref:
+                continue
+            ref_lib, sep, rel_path = raw_ref.partition(":") if ":" in raw_ref else ("", "", raw_ref)
+            target_lib = ("primary" if ref_lib == "personal" else ref_lib) if sep and ref_lib else library_key
+            if rel_path.startswith("user-managed/") and rel_path.endswith(".md"):
+                href = query(library=target_lib, entry=Path(rel_path).stem) + "#detail-title"
+            else:
+                href = query(library=target_lib, topic=rel_path) + "#detail-title"
+            display_path = rel_path if target_lib == library_key else raw_ref
+            pills.append(
+                f'<a class="link-pill" href="{escape(href)}">'
+                f'<span class="link-pill-title">{escape(item.get("title") or display_path)}</span>'
+                f'<code>{escape(display_path)}</code></a>'
+            )
+        return "".join(pills)
 
     blocks = []
     if links:
@@ -2674,6 +2685,10 @@ def render(
 
     requested_topic_path = topic_path
     if topic_path:
+        # Tolerate library-qualified refs belonging to the active library (e.g. team-mymem:methods/foo.md).
+        ref_lib, sep, rel_part = topic_path.partition(":") if ":" in topic_path else ("", "", "")
+        if sep and ((ref_lib == key) or (key == "primary" and ref_lib == "personal")):
+            topic_path = rel_part
         try:
             topic_path = library._canonical_topic_path(topic_path, topics)
         except ValueError:
