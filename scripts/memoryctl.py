@@ -2576,6 +2576,24 @@ def main():
     p_l0_rej = l0_sub.add_parser("reject", help="Reject and discard one pending L0 proposal.")
     p_l0_rej.add_argument("proposal_id", help="Proposal id (e.g. l0-...).")
 
+    p_upkeep = sub.add_parser("upkeep", help="Generate or apply Sleep-time Upkeep / Morning Note suggestions.")
+    upkeep_sub = p_upkeep.add_subparsers(dest="upkeep_cmd", required=True)
+    p_up_rep = upkeep_sub.add_parser("report", help="Generate the Morning Note JSON with merge/archive/trim suggestions.")
+    p_up_rep.add_argument("--library", default="personal", help="Target library id (defaults to personal).")
+    p_up_rep.add_argument("--stale-days", type=int, default=90, help="Flag L3 snapshots older than this many days.")
+    p_up_rep.add_argument("--all", action="store_true", help="Include previously dismissed suggestions.")
+    p_up_app = upkeep_sub.add_parser("apply", help="Apply one suggestion from the Morning Note.")
+    p_up_app.add_argument("suggestion_id", help="Suggestion id (e.g. upkeep-merge-...).")
+    p_up_app.add_argument("--library", default="personal", help="Target library id (defaults to personal).")
+    p_up_app.add_argument("--stale-days", type=int, default=90, help="Stale-snapshot threshold used when resolving the suggestion.")
+    p_up_dis = upkeep_sub.add_parser("dismiss", help="Dismiss one suggestion until its underlying files change.")
+    p_up_dis.add_argument("suggestion_id", help="Suggestion id.")
+    p_up_dis.add_argument("--library", default="personal", help="Target library id (defaults to personal).")
+    p_up_dis.add_argument("--fingerprint", default="", help="Optional content fingerprint from report.")
+    p_up_rst = upkeep_sub.add_parser("reset", help="Clear dismissed suggestions so they appear again.")
+    p_up_rst.add_argument("suggestion_id", nargs="?", default="", help="Optional single suggestion id (omit to clear all).")
+    p_up_rst.add_argument("--library", default="personal", help="Target library id (defaults to personal).")
+
     sub.add_parser("version", help="Print the installed Unified Memory version and runtime location.")
     p_upg = sub.add_parser("upgrade", help="Check for or apply verified standalone CLI upgrades from GitHub Releases.")
     p_upg.add_argument("--check", action="store_true", help="Only check for a newer release without modifying files.")
@@ -2801,6 +2819,31 @@ def main():
                 result = store.reject_l0_proposal(args.proposal_id)
         except (ValueError, OSError) as exc:
             parser.exit(1, f"{exc}\n")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "upkeep":
+        sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
+        from server import WorkspaceStore
+        import upkeep
+        scheduler = async_sync.DetachedSyncScheduler() if args.upkeep_cmd == "apply" else None
+        ws = WorkspaceStore(MEMORY_ROOT, async_scheduler=scheduler)
+        try:
+            store = ws._resolve_single_store(args.library or "personal")
+            if args.upkeep_cmd == "report":
+                result = upkeep.public_morning_note(
+                    store,
+                    stale_days=args.stale_days,
+                    include_dismissed=args.all,
+                )
+            elif args.upkeep_cmd == "apply":
+                result = upkeep.apply_suggestion(store, args.suggestion_id, stale_days=args.stale_days)
+            elif args.upkeep_cmd == "dismiss":
+                result = upkeep.dismiss_suggestion(store.root, args.suggestion_id, fingerprint=args.fingerprint)
+            else:
+                result = upkeep.reset_dismissed(store.root, args.suggestion_id)
+        except (ValueError, OSError) as exc:
+            parser.exit(1, f"{exc}\n")
+        finally:
+            ws.shutdown()
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "version":
         import cli_updater

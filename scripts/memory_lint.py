@@ -128,28 +128,39 @@ def lint_entries(entries, index=None, now=None, stale_days=STALE_DAYS):
     return findings
 
 
-def _duplicate_findings(entries):
-    """Pairs of active entries whose title and summary describe one topic."""
-    out = []
+def find_duplicate_pairs(entries):
+    """Return ``(entry_a, entry_b, overlap)`` tuples for active entries on the same topic."""
+    pairs = []
     profiles = []
     for entry in entries:
         if entry.get("layer") == "L4" or entry.get("status") == "archived":
             continue
         tokens = topic_tokens(f"{entry.get('title', '')} {entry.get('description', '')}")
         if len(tokens) >= 4:
-            profiles.append((entry["path"], entry.get("title", ""), tokens))
+            profiles.append((entry, tokens))
     for i in range(len(profiles)):
         for j in range(i + 1, len(profiles)):
-            a_path, a_title, a_tok = profiles[i]
-            b_path, b_title, b_tok = profiles[j]
+            a_entry, a_tok = profiles[i]
+            b_entry, b_tok = profiles[j]
             shared = len(a_tok & b_tok)
             overlap = shared / min(len(a_tok), len(b_tok))
             if overlap >= DUPLICATE_OVERLAP:
-                out.append(_finding(
-                    "duplicate-topic", "warning", a_path,
-                    f"和「{b_title or b_path}」（{b_path}）讲的像是同一个主题（重合度 {overlap:.0%}）",
-                    "合成一篇，旧的那篇归档",
-                ))
+                pairs.append((a_entry, b_entry, overlap))
+    return sorted(pairs, key=lambda item: (item[0]["path"], item[1]["path"]))
+
+
+def _duplicate_findings(entries):
+    """Pairs of active entries whose title and summary describe one topic."""
+    out = []
+    for a_entry, b_entry, overlap in find_duplicate_pairs(entries):
+        a_path = a_entry["path"]
+        b_path = b_entry["path"]
+        b_title = b_entry.get("title", "")
+        out.append(_finding(
+            "duplicate-topic", "warning", a_path,
+            f"和「{b_title or b_path}」（{b_path}）讲的像是同一个主题（重合度 {overlap:.0%}）",
+            "合成一篇，旧的那篇归档",
+        ))
     return sorted(out, key=lambda f: f["ref"])
 
 

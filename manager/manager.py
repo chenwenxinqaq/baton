@@ -48,6 +48,7 @@ import memory_import  # noqa: E402
 import secret_guard  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
+import upkeep  # noqa: E402
 from async_sync import AsyncSyncScheduler, record_external_result  # noqa: E402
 from markdown_render import (  # noqa: E402
     INLINE_TOKEN_RE,
@@ -120,6 +121,7 @@ from views import (  # noqa: E402
     render_sync_hub_html,
     render_topic_links_html,
     render_topic_versions_html,
+    render_upkeep_panel,
     skill_entry_link,
     top_hit_citations,
     topic_read_error,
@@ -1166,7 +1168,7 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import", "l0_review"}
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import", "l0_review", "upkeep"}
                                 | ({"activity"} if DESKTOP else set()))
                 or (view == "memory_import" and (key != "primary" or tab != "memory" or import_client not in memory_import.CLIENTS))
                 or (view == "l0_review" and (key != "primary" or tab != "memory"))
@@ -1209,6 +1211,9 @@ class Handler(BaseHTTPRequestHandler):
             "memory_import_approved": "已将确认后的记忆归入个人记忆库。",
             "l0_approved": "L0 操作约束已确认生效并写入 constraints/。",
             "l0_rejected": "已拒绝并丢弃该条 L0 约束提案，现有约束未改动。",
+            "upkeep_applied": "整理建议已应用（原内容已在本机回收站保留历史版本备份）。",
+            "upkeep_dismissed": "已忽略该条整理建议（条目内容变化后会重新评估）。",
+            "upkeep_reset": "已恢复所有被忽略的整理建议。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -1262,6 +1267,7 @@ class Handler(BaseHTTPRequestHandler):
             "/share_topic",
             "/memory_import",
             "/l0_review",
+            "/upkeep",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
@@ -1297,6 +1303,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/l0_review":
             self.handle_l0_review(fields)
+            return
+        if self.path == "/upkeep":
+            self.handle_upkeep(fields)
             return
         if self.path in {
             "/agent",
@@ -1408,6 +1417,38 @@ class Handler(BaseHTTPRequestHandler):
             raise InvalidEntry("未知的 L0 审核操作。")
         except (ValueError, OSError) as exc:
             self.page(HTTPStatus.CONFLICT, key=key, view="l0_review", error=f"操作未完成：{exc}")
+
+    def handle_upkeep(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.libraries:
+            self.page(HTTPStatus.BAD_REQUEST, error="记忆库不存在。")
+            return
+        library = self.libraries[key]
+        op = fields.get("op", "").strip()
+        suggestion_id = fields.get("suggestion_id", "").strip()
+        fingerprint = fields.get("fingerprint", "").strip()
+        agent_home = getattr(self.server, "agent_home", None)
+        try:
+            if op == "apply":
+                upkeep.apply_suggestion(
+                    library.store,
+                    suggestion_id,
+                    expected_fingerprint=fingerprint,
+                    audit_home=agent_home,
+                )
+                notice = "upkeep_applied"
+            elif op == "dismiss":
+                upkeep.dismiss_suggestion(library.root, suggestion_id, fingerprint=fingerprint)
+                notice = "upkeep_dismissed"
+            elif op == "reset_dismissed":
+                upkeep.reset_dismissed(library.root, suggestion_id)
+                notice = "upkeep_reset"
+            else:
+                raise InvalidEntry("未知的整理日报操作。")
+            target = query(library=key, view="upkeep", notice=notice) + "#feedback"
+            self.respond(HTTPStatus.SEE_OTHER, "", location=target)
+        except (ValueError, OSError) as exc:
+            self.page(HTTPStatus.CONFLICT, key=key, view="upkeep", error=f"操作未完成：{exc}")
 
     def start_sync_action(self, key, read_only, tab, return_view):
         library = self.libraries[key]

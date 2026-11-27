@@ -25,6 +25,7 @@ import l0_guard  # noqa: E402
 import memory_import  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
+import upkeep  # noqa: E402
 from async_sync import is_stale_active  # noqa: E402
 from markdown_render import (  # noqa: E402
     hidden,
@@ -325,7 +326,11 @@ def desktop_status_strip(key, library):
     except Exception:
         pass
     href = escape(query(library=key, view="activity"))
-    return f'<div class="desk-status check-chips">{"".join(chips)}<a href="{href}">查看读写动态 →</a></div>'
+    upkeep_href = escape(query(library=key, view="upkeep"))
+    return (
+        f'<div class="desk-status check-chips">{"".join(chips)}'
+        f'<a href="{upkeep_href}">整理日报</a> · <a href="{href}">查看读写动态 →</a></div>'
+    )
 
 
 def topic_read_error(library, topic_path, exc):
@@ -1311,6 +1316,103 @@ def render_l0_review(token, key, library):
     )
 
 
+UPKEEP_KIND_LABELS = {
+    "merge_duplicate": "合并重复",
+    "archive_stale": "归档过期",
+    "trim_oversized": "精简超长",
+    "rebuild_index": "修复索引",
+}
+
+
+def render_upkeep_panel(token, key, library, agent_home=None):
+    """Render the Sleep-time Upkeep / Morning Note review queue with apply/dismiss actions."""
+    note = upkeep.public_morning_note(library.store, audit_home=agent_home)
+    suggestions = note.get("suggestions") or []
+    dismissed_cnt = note.get("dismissed_count", 0)
+    pending_l0 = note.get("pending_l0_count", 0)
+
+    header_chips = [
+        f'<span class="meta-chip">条目 {note.get("entries_count", 0)} 篇</span>',
+        f'<span class="meta-chip">近 7 天查询 {note.get("recent_reads_7d", 0)} · 写入 {note.get("recent_writes_7d", 0)}</span>',
+    ]
+    if pending_l0 and key == "primary":
+        l0_href = escape(query(library=key, view="l0_review"))
+        header_chips.append(f'<a class="chip-warn" href="{l0_href}">! {pending_l0} 条 L0 约束待确认</a>')
+
+    reset_btn = ""
+    if dismissed_cnt:
+        reset_btn = (
+            '<form class="inline-form" method="post" action="/upkeep#feedback">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("op", "reset_dismissed")}'
+            f'<button class="btn btn-ghost btn-compact" type="submit">恢复已忽略（{dismissed_cnt}）</button>'
+            "</form>"
+        )
+
+    if not suggestions:
+        return (
+            '<section class="activity-usage">'
+            '<div class="usage-head"><h3>记忆整理日报</h3>'
+            f'<span class="usage-hint">当前库状态整洁，暂无待整理项 {reset_btn}</span></div>'
+            f'<div class="check-chips">{"".join(header_chips)}</div>'
+            '<p class="act-meta">整理日报会结合记忆体检与近 7 天读取日志，识别重复主题、过期快照与超长条目，'
+            '并生成可逐条「应用」或「忽略」的预览 Diff。</p>'
+            "</section>"
+        )
+
+    cards = []
+    for idx, item in enumerate(suggestions, 1):
+        kind = item["kind"]
+        kind_label = UPKEEP_KIND_LABELS.get(kind, kind)
+        diff_html = _render_diff_box(item.get("diff", ""), empty_msg="") if item.get("diff") else ""
+        links = []
+        if item.get("target_path"):
+            links.append(_ref_link(item["target_path"], key))
+        if item.get("secondary_path") and kind == "merge_duplicate":
+            links.append(f'← {_ref_link(item["secondary_path"], key)}')
+        links_html = f'<p class="hub-card-path">{" ".join(links)}</p>' if links else ""
+        apply_btn = ""
+        if item.get("can_apply") and not library.is_readonly:
+            apply_btn = (
+                '<form method="post" action="/upkeep#feedback">'
+                f'{hidden("csrf", token)}{hidden("library", key)}{hidden("op", "apply")}'
+                f'{hidden("suggestion_id", item["id"])}{hidden("fingerprint", item.get("fingerprint", ""))}'
+                '<button class="btn btn-primary btn-compact" type="submit">应用</button>'
+                "</form>"
+            )
+        dismiss_btn = (
+            '<form method="post" action="/upkeep#feedback">'
+            f'{hidden("csrf", token)}{hidden("library", key)}{hidden("op", "dismiss")}'
+            f'{hidden("suggestion_id", item["id"])}{hidden("fingerprint", item.get("fingerprint", ""))}'
+            '<button class="btn btn-ghost btn-compact" type="submit">忽略</button>'
+            "</form>"
+        )
+        cards.append(
+            f"""
+        <article class="conflict-card">
+          <div class="conflict-card-head">
+            <div>
+              <strong><span class="meta-chip">{escape(kind_label)}</span> #{idx} {escape(item["title"])}</strong>
+              {links_html}
+              <p class="act-meta">{escape(item["reason"])}</p>
+            </div>
+            <div class="conflict-quick-actions">
+              {apply_btn}
+              {dismiss_btn}
+            </div>
+          </div>
+          {diff_html}
+        </article>"""
+        )
+    return (
+        '<section class="l0-review-panel">'
+        f'<div class="usage-head"><div class="check-chips">{"".join(header_chips)}</div>{reset_btn}</div>'
+        f'<p class="act-meta">本次扫描发现 <strong>{len(suggestions)} 条</strong> 可执行整理建议。'
+        '所有「应用」操作都会自动在本地回收站保留原文件备份，可随时通过历史版本恢复。</p>'
+        f'{"".join(cards)}'
+        "</section>"
+    )
+
+
 def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
     """Render native modal dialog to promote/share a personal topic into a writable shared library."""
     if not writable_shared_libs:
@@ -2005,9 +2107,14 @@ def _lint_section(key, root, token="", readonly=False, return_view="", return_me
         lint_cmd = "umem lint" if key == "primary" else f"umem lint --library {key}"
         more = f'<li class="act-meta">还有 {len(findings) - 8} 条，运行 <code>{escape(lint_cmd)}</code> 看全部</li>'
     section_cls = "activity-usage lint-urgent" if urgent else "activity-usage"
+    upkeep_link = (
+        f'<a class="btn btn-ghost btn-compact" href="{escape(query(library=key, view="upkeep"))}">整理日报 →</a>'
+        if not readonly
+        else ""
+    )
     html_out = (
         f'<section class="{section_cls}"><div class="usage-head"><h3>记忆库体检</h3>'
-        f'<span class="usage-hint">{escape(chips)} {rebuild_btn}</span></div>'
+        f'<span class="usage-hint">{escape(chips)} {rebuild_btn} {upkeep_link}</span></div>'
         f'<ul class="lint-list" role="list">{"".join(rows)}{more}</ul></section>'
     )
     return (html_out, urgent) if return_meta else html_out
@@ -2868,6 +2975,11 @@ def render(
         detail_badges = '<div class="detail-badges"><span class="layer-badge layer-L0">L0 · 写保护</span></div>'
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
         reader = render_l0_review(token, key, library)
+    elif view == "upkeep":
+        heading = f"记忆整理日报 · {library.label}"
+        detail_badges = '<div class="detail-badges"><span class="meta-chip">Sleep-time Upkeep · 逐条确认</span></div>'
+        detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
+        reader = render_upkeep_panel(token, key, library, agent_home=agent_home)
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'

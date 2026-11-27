@@ -51,6 +51,7 @@ PUBLIC_FILES = (
     "scripts/audit_log.py",
     "scripts/cursor_hook.py",
     "scripts/secret_guard.py",
+    "scripts/upkeep.py",
     "skills/unified-memory/SKILL.md",
     "templates/entry.md",
     "templates/incident.md",
