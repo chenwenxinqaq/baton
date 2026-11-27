@@ -29,6 +29,7 @@ from library_paths import (
     unlock_file,
 )
 import audit_log
+import l0_guard
 import memory_lint
 import secret_guard
 import sync_git
@@ -886,19 +887,27 @@ class MemoryStore:
             return []
         out = []
         for hit in hits:
-            if Path(hit.get("path", "")).stem == name:
+            if name and Path(hit.get("path", "")).stem == name:
                 continue
             if (hit.get("score") or 0) < 8:
                 continue
             out.append({
                 "ref": hit.get("ref", ""),
+                "path": hit.get("path", ""),
                 "layer": hit.get("layer", ""),
                 "title": hit.get("title", ""),
+                "description": hit.get("description", ""),
                 "updated_at": hit.get("updated_at", ""),
             })
             if len(out) >= limit:
                 break
         return out
+
+    def similar_entries(self, query, exclude_name="", limit=3):
+        """Public helper to suggest existing entries that overlap a draft or import candidate."""
+        if not str(query or "").strip():
+            return []
+        return self._similar_entries(str(query).strip(), exclude_name, limit=limit)
 
     @staticmethod
     def _check_expected_updated(expected_updated_at, old_meta=None, target=None):
@@ -1546,7 +1555,8 @@ class MemoryStore:
         return links[:limit], backlinks[:limit]
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False,
-                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None):
+                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None,
+                     require_l0_approval=False, client_name=""):
         """Create or update a memory entry under lock, backing up previous versions to trash.
 
         ``expected_updated_at`` turns the write into a compare-and-set: if the entry
@@ -1706,14 +1716,17 @@ class MemoryStore:
             existing_body = ""
             existing_is_target = False
             prior_timestamps = []
+            stage_only = bool(require_l0_approval and layer == "L0")
             for current in current_paths:
                 old_meta, old_body = parse_frontmatter(current.read_text(encoding="utf-8"))
                 if previous is None:
                     self._check_expected_updated(expected_updated_at, old_meta, current)
                 created, updated, _, updated_epoch = file_timestamps(current, old_meta)
                 prior_timestamps.append((updated_epoch, updated))
-                backup_hint = name if current == target else f"migrated-{name}"
-                backup = self._backup_to_trash(current, backup_hint)
+                backup = ""
+                if not stage_only:
+                    backup_hint = name if current == target else f"migrated-{name}"
+                    backup = self._backup_to_trash(current, backup_hint)
                 if previous is None:
                     previous = self._previous_receipt(old_meta, old_body, backup)
                     preserved_created = created
@@ -1768,6 +1781,50 @@ class MemoryStore:
                 formatted_body = f"{base_body}\n\n{body}"
             else:
                 formatted_body = body if body.lstrip().startswith("# ") else f"# {effective_title}\n\n{body}"
+
+            if stage_only:
+                action = "update" if current_paths else "create"
+                base_updated_at = str(existing_meta.get("updated_at") or "").strip() if previous is not None else ""
+                proposal = l0_guard.stage_proposal(
+                    self.root,
+                    name=name,
+                    title=effective_title,
+                    description=effective_desc,
+                    body=formatted_body,
+                    topic_type=resolved_type,
+                    action=action,
+                    client=client_name or CLIENT_NAME,
+                    mode=mode,
+                    section=resolved_section or section,
+                    base_updated_at=base_updated_at,
+                    verified_at=eff_verified,
+                    valid_until=eff_valid_until,
+                    migrated_from=[stale_rel for _, stale_rel in stale_files],
+                )
+                res = {
+                    **self._result_metadata(),
+                    "ref": self._entry_ref(rel_path),
+                    "path": rel_path,
+                    "indexed": False,
+                    "status": "pending_approval",
+                    "pending_approval": True,
+                    "proposal_id": proposal["id"],
+                    "action": action,
+                    "mode": mode,
+                    "updated_at": proposal["updated_at"],
+                    "notice": (
+                        "L0 constraint writes require human confirmation before taking effect. "
+                        f"Proposal {proposal['id']} has been staged; ask the user to review and approve it "
+                        f"in Unified Memory or run `umem l0 approve {proposal['id']}`."
+                    ),
+                }
+                if resolved_section:
+                    res["section"] = resolved_section
+                    res["section_action"] = section_action
+                if related and previous is None and not stale_files:
+                    res["related"] = related
+                return res
+
             content = format_topic_markdown(
                 name,
                 effective_desc,
@@ -1845,6 +1902,48 @@ class MemoryStore:
             except OSError:
                 pass
             raise
+
+    def list_l0_proposals(self):
+        return l0_guard.list_proposals(self.root)
+
+    def approve_l0_proposal(self, proposal_id, revision="", *, title=None, description=None, body=None):
+        """Approve one staged L0 constraint proposal and write it into constraints/."""
+        if self.mode == "ro":
+            raise ValueError(f"Library '{self.library_id}' is read-only.")
+        if "L0" not in self.allowed_layers:
+            raise ValueError(f"Layer L0 is not allowed in library '{self.library_id}'.")
+        with l0_guard.queue_lock(self.root):
+            proposal = l0_guard.read_proposal(self.root, proposal_id)
+            if revision and revision != proposal.get("revision"):
+                raise ValueError("该 L0 提案内容已更新，请刷新后重新核对。")
+            eff_title = proposal["title"] if title is None else str(title).strip()
+            eff_desc = proposal["description"] if description is None else str(description).strip()
+            eff_body = proposal["body"] if body is None else str(body).strip()
+            res = self.upsert_entry(
+                layer="L0",
+                name=proposal["name"],
+                title=eff_title,
+                description=eff_desc,
+                body=eff_body,
+                topic_type=proposal.get("topic_type") or "feedback",
+                mode="replace",
+                verified_at=proposal.get("verified_at") or None,
+                valid_until=proposal.get("valid_until") or None,
+                require_l0_approval=False,
+            )
+            (l0_guard.queue_dir(self.root) / f"{proposal['id']}.json").unlink(missing_ok=True)
+            res["approved_proposal"] = proposal["id"]
+            return res
+
+    def reject_l0_proposal(self, proposal_id):
+        """Discard one staged L0 constraint proposal without modifying the library."""
+        removed = l0_guard.delete_proposal(self.root, proposal_id)
+        return {
+            **self._result_metadata(),
+            "rejected_proposal": removed["id"],
+            "name": removed["name"],
+            "target_path": removed.get("target_path") or f"constraints/{removed['name']}.md",
+        }
 
     def save_topic_entry(
         self,
@@ -2629,7 +2728,8 @@ class WorkspaceStore:
         return result
 
     def upsert_entry(self, layer, name, title="", description="", body="", topic_type="", user_managed=False, library="personal",
-                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None):
+                     expected_updated_at="", mode="replace", section="", verified_at=None, valid_until=None,
+                     require_l0_approval=False, client_name=""):
         store = self._resolve_single_store(library or "personal")
         return store.upsert_entry(
             layer=layer,
@@ -2644,6 +2744,8 @@ class WorkspaceStore:
             section=section,
             verified_at=verified_at,
             valid_until=valid_until,
+            require_l0_approval=require_l0_approval,
+            client_name=client_name,
         )
 
     def archive_entry(self, name, user_managed=False, library="personal"):
@@ -2966,6 +3068,8 @@ def _handle_tool_call(store, name, args):
             expected_updated_at=args.get("expected_updated_at", "") or "",
             mode=args.get("mode", "replace") or "replace",
             section=args.get("section", "") or "",
+            require_l0_approval=l0_guard.l0_guard_enabled(),
+            client_name=CLIENT_NAME,
         )
         if "verified_at" in args and args["verified_at"] is not None:
             kwargs["verified_at"] = args["verified_at"]

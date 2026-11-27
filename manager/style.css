@@ -2213,3 +2213,37 @@
   background: var(--surface);
   overflow-x: auto;
 }
+.merge-suggestions {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--warn-bd, var(--line));
+  border-radius: var(--radius-md);
+  background: var(--warn-bg, var(--surface-subtle));
+}
+.merge-suggestions legend {
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0 0.35rem;
+}
+.merge-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+.l0-review-panel {
+  display: grid;
+  gap: 0.9rem;
+}
+.l0-edit-details {
+  margin-top: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--line);
+}
+.l0-edit-details summary {
+  cursor: pointer;
+  font-size: 0.84rem;
+  color: var(--text-secondary);
+}

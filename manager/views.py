@@ -21,6 +21,7 @@ if str(APP) not in sys.path:
 
 from library_paths import ALL_LAYERS, data_root  # noqa: E402
 import audit_log  # noqa: E402
+import l0_guard  # noqa: E402
 import memory_import  # noqa: E402
 import server as mcp_server  # noqa: E402
 import sync_git  # noqa: E402
@@ -314,6 +315,13 @@ def desktop_status_strip(key, library):
             chips.append(f'<span class="chip-warn">! 体检 {err_cnt} 项需要修复</span>')
         elif warn_cnt:
             chips.append(f'<span class="chip-warn">! 体检 {warn_cnt} 项待复核</span>')
+    except Exception:
+        pass
+    try:
+        l0_cnt = l0_guard.count_proposals(library.root)
+        if l0_cnt and library.role == "personal":
+            l0_href = escape(query(library=key, view="l0_review"))
+            chips.append(f'<a class="chip-warn" href="{l0_href}">! {l0_cnt} 条 L0 约束待确认</a>')
     except Exception:
         pass
     href = escape(query(library=key, view="activity"))
@@ -1118,12 +1126,47 @@ def render_memory_import(token, library, client, selected, q, draft):
         origin = " · ".join(part for part in (item["source"], item.get("source_detail"), item["source_date"], item["thread_id"]) if part)
         if item.get("previously_approved"):
             origin += f' · 此前已归入 {item["previously_approved"]}，来源之后有改动；确认后会更新该条目'
+        similar_html = ""
+        selected_merge = draft.get("merge_target", "")
+        if not item.get("previously_approved"):
+            try:
+                similar = [
+                    hit
+                    for hit in library.store.similar_entries(f"{title} {description}", exclude_name=item["id"], limit=3)
+                    if hit.get("path") and not hit["path"].startswith("user-managed/")
+                ]
+            except Exception:
+                similar = []
+            if similar:
+                sim_opts = [
+                    f'<label class="merge-option">'
+                    f'<input type="radio" name="merge_target" value=""{" checked" if not selected_merge else ""}>'
+                    f'<span>作为新条目归层（默认）</span></label>'
+                ]
+                for hit in similar:
+                    h_path = hit["path"]
+                    h_href = escape(query(topic=h_path) + "#detail-title")
+                    h_layer = escape(hit.get("layer", ""))
+                    h_title = escape(hit.get("title") or h_path)
+                    checked = " checked" if selected_merge == h_path else ""
+                    sim_opts.append(
+                        f'<label class="merge-option">'
+                        f'<input type="radio" name="merge_target" value="{escape(h_path)}"{checked}>'
+                        f'<span>合并追加到已有条目：<a href="{h_href}" target="_blank" rel="noopener">{h_title}</a>'
+                        f' <code>{escape(h_path)}</code> ({h_layer})</span></label>'
+                    )
+                similar_html = (
+                    '<fieldset class="merge-suggestions">'
+                    '<legend>发现近似已有条目（可直接合并，避免同主题重复建篇）</legend>'
+                    f'{"".join(sim_opts)}</fieldset>'
+                )
         form = f"""
           <form class="edit-form" method="post" action="/memory_import">
             {hidden("csrf", token)}{hidden("op", "approve")}{hidden("client", client)}{hidden("import_id", item["id"])}
             {hidden("revision", memory_import.revision(item))}
             <h2>确认并归层</h2>
             <p>{escape(origin)}</p>
+            {similar_html}
             <label>标题 <input type="text" name="title" maxlength="{MAX_TITLE_CHARS}" required value="{escape(title)}"></label>
             <label>检索摘要 <input type="text" name="description" maxlength="{MAX_DESC_CHARS}" value="{escape(description)}"></label>
             <label>正文 <textarea name="body" rows="14" required>{escape(body)}</textarea></label>
@@ -1176,6 +1219,96 @@ def render_memory_import(token, library, client, selected, q, draft):
         {listing}
       </section>
     """
+
+
+def _render_diff_box(diff_text, empty_msg="与当前生效版本无差异。"):
+    lines = diff_text.splitlines() if diff_text else []
+    if not lines:
+        return f'<p class="field-hint">{escape(empty_msg)}</p>'
+    rows = []
+    for line in lines:
+        if line.startswith("+++") or line.startswith("---"):
+            cls = "diff-meta"
+        elif line.startswith("@@"):
+            cls = "diff-hunk"
+        elif line.startswith("+"):
+            cls = "diff-add"
+        elif line.startswith("-"):
+            cls = "diff-del"
+        else:
+            cls = "diff-ctx"
+        rows.append(f'<div class="diff-line {cls}">{escape(line)}</div>')
+    return f'<div class="diff-view">{"".join(rows)}</div>'
+
+
+def render_l0_review(token, key, library):
+    """Render the pending L0 constraint approval queue to guard against unintended agent writes."""
+    proposals = l0_guard.list_proposals(library.root)
+    if not proposals:
+        return (
+            '<section class="activity-usage">'
+            '<div class="usage-head"><h3>L0 操作约束待确认区</h3>'
+            '<span class="usage-hint">当前没有待确认的 L0 约束修改</span></div>'
+            '<p class="act-meta">默认开启 L0 写保护：AI 客户端通过 <code>memory_upsert</code> 写入 L0 约束时，'
+            '会先进入本机待确认区，经你核对 Diff 并点击「确认生效」后才会写入 <code>constraints/</code>。'
+            '人工在桌面端编辑或执行 <code>umem write</code> 仍直接生效。</p>'
+            '</section>'
+        )
+    cards = []
+    for idx, item in enumerate(proposals, 1):
+        diff_html = _render_diff_box(l0_guard.proposal_diff(library.root, item))
+        action_label = "更新已有约束" if item.get("action") == "update" else "新建 L0 约束"
+        meta_parts = [
+            f"来源客户端：{item.get('client') or 'AI 客户端'}",
+            action_label,
+            f"目标：{item.get('target_path') or ('constraints/' + item['name'] + '.md')}",
+            f"提议时间：{(item.get('updated_at') or '')[:19].replace('T', ' ')}",
+        ]
+        cards.append(
+            f"""
+        <article class="conflict-card">
+          <div class="conflict-card-head">
+            <div>
+              <strong>提案 #{idx}：{escape(item.get("title") or item["name"])}</strong>
+              <p class="hub-card-path">{escape(" · ".join(meta_parts))}</p>
+            </div>
+            <div class="conflict-quick-actions">
+              <form method="post" action="/l0_review#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("proposal_id", item["id"])}{hidden("revision", item.get("revision", ""))}
+                {hidden("op", "approve")}
+                <button class="btn btn-primary btn-compact" type="submit">确认生效</button>
+              </form>
+              <form method="post" action="/l0_review#feedback">
+                {hidden("csrf", token)}{hidden("library", key)}
+                {hidden("proposal_id", item["id"])}{hidden("revision", item.get("revision", ""))}
+                {hidden("op", "reject")}
+                <button class="btn btn-ghost btn-compact" type="submit">拒绝丢弃</button>
+              </form>
+            </div>
+          </div>
+          {diff_html}
+          <details class="l0-edit-details">
+            <summary>修订后再确认生效</summary>
+            <form class="edit-form" method="post" action="/l0_review#feedback">
+              {hidden("csrf", token)}{hidden("library", key)}
+              {hidden("proposal_id", item["id"])}{hidden("revision", item.get("revision", ""))}
+              {hidden("op", "approve")}
+              <label>标题 <input type="text" name="title" maxlength="{MAX_TITLE_CHARS}" required value="{escape(item.get('title') or '')}"></label>
+              <label>检索摘要 <input type="text" name="description" maxlength="{MAX_DESC_CHARS}" value="{escape(item.get('description') or '')}"></label>
+              <label>正文 <textarea name="body" rows="8" required>{escape(item.get('body') or '')}</textarea></label>
+              <button class="btn btn-primary btn-compact" type="submit">保存修订并生效</button>
+            </form>
+          </details>
+        </article>"""
+        )
+    return (
+        '<section class="l0-review-panel">'
+        f'<p class="act-meta">共有 <strong>{len(proposals)} 条</strong> AI 提议的 L0 操作约束等待确认。'
+        '核对下方 Diff 确认无误后点击「确认生效」，或点击「拒绝丢弃」直接忽略。</p>'
+        f'{"".join(cards)}'
+        '</section>'
+    )
 
 
 def render_share_dialog_html(token, key, topic_entry, writable_shared_libs):
@@ -1954,11 +2087,27 @@ def render_activity_panel(key, agent_home=None, root=None, token="", readonly=Fa
     lint_section, lint_urgent = _lint_section(
         key, root, token=token, readonly=readonly, return_view=return_view, return_meta=True
     )
+    l0_banner = ""
+    if root and not readonly:
+        try:
+            l0_proposals = l0_guard.list_proposals(root)
+        except Exception:
+            l0_proposals = []
+        if l0_proposals:
+            l0_href = escape(query(library=key, view="l0_review"))
+            names = "、".join(escape(p.get("title") or p["name"]) for p in l0_proposals[:3])
+            l0_banner = (
+                '<section class="activity-usage lint-urgent">'
+                '<div class="usage-head"><h3>L0 约束待确认</h3>'
+                f'<span class="usage-hint">{len(l0_proposals)} 条 AI 提议尚未生效 '
+                f'<a class="btn btn-primary btn-compact" href="{l0_href}">立即核对 Diff →</a></span></div>'
+                f'<p class="act-meta">待审条目：{names}</p></section>'
+            )
     checkpoint_note = f' · 阶段提醒 {summary["checkpoints_today"]} 次' if summary.get("checkpoints_today") else ""
     ordered_sections = (
-        f"{lint_section}{trend_section}{usage_section}"
+        f"{l0_banner}{lint_section}{trend_section}{usage_section}"
         if lint_urgent
-        else f"{trend_section}{usage_section}{lint_section}"
+        else f"{l0_banner}{trend_section}{usage_section}{lint_section}"
     )
 
     return f"""
@@ -2714,6 +2863,11 @@ def render(
         heading = f"{memory_import.CLIENTS[import_client]} 待确认记忆"
         detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(query(view="clients"))}">返回客户端接入</a>'
         reader = render_memory_import(token, library, import_client, topic_path, q, import_draft or {})
+    elif view == "l0_review":
+        heading = "L0 操作约束待确认区"
+        detail_badges = '<div class="detail-badges"><span class="layer-badge layer-L0">L0 · 写保护</span></div>'
+        detail_toolbar = f'<a class="btn btn-ghost btn-compact" href="{escape(home_link)}">返回记忆库</a>'
+        reader = render_l0_review(token, key, library)
     elif view == "sync_hub":
         heading = "共享记忆库与 Git 同步中心"
         detail_badges = '<div class="detail-badges"><span class="meta-chip">个人跨机同步 · 团队共享挂载</span></div>'

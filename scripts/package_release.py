@@ -40,6 +40,7 @@ PUBLIC_FILES = (
     "manager/views.py",
     "mcp/server.py",
     "scripts/library_paths.py",
+    "scripts/l0_guard.py",
     "scripts/memory_import.py",
     "scripts/memory_lint.py",
     "scripts/memoryctl.py",

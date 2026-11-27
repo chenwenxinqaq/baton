@@ -2568,6 +2568,14 @@ def main():
     p_lint.add_argument("--library", default="personal", help="Library id, or '*' for every mounted library.")
     p_lint.add_argument("--stale-days", type=int, default=90, help="Flag L3 snapshots older than this (default 90).")
 
+    p_l0 = sub.add_parser("l0", help="Review, approve, or reject pending AI-proposed L0 constraints.")
+    l0_sub = p_l0.add_subparsers(dest="l0_cmd", required=True)
+    l0_sub.add_parser("list", help="List pending L0 constraint proposals waiting for human confirmation.")
+    p_l0_app = l0_sub.add_parser("approve", help="Approve one pending L0 proposal and write it to constraints/.")
+    p_l0_app.add_argument("proposal_id", help="Proposal id (e.g. l0-...).")
+    p_l0_rej = l0_sub.add_parser("reject", help="Reject and discard one pending L0 proposal.")
+    p_l0_rej.add_argument("proposal_id", help="Proposal id (e.g. l0-...).")
+
     sub.add_parser("version", help="Print the installed Unified Memory version and runtime location.")
     p_upg = sub.add_parser("upgrade", help="Check for or apply verified standalone CLI upgrades from GitHub Releases.")
     p_upg.add_argument("--check", action="store_true", help="Only check for a newer release without modifying files.")
@@ -2779,6 +2787,21 @@ def main():
         report = audit_log.usage_stats(audit_log.read_events(since=since))
         report["days"] = args.days
         print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.command == "l0":
+        sys.path.insert(0, str(FRAMEWORK_ROOT / "mcp"))
+        from server import MemoryStore
+        scheduler = async_sync.DetachedSyncScheduler() if args.l0_cmd == "approve" else None
+        store = MemoryStore(MEMORY_ROOT, async_scheduler=scheduler)
+        try:
+            if args.l0_cmd == "list":
+                result = {"proposals": store.list_l0_proposals()}
+            elif args.l0_cmd == "approve":
+                result = store.approve_l0_proposal(args.proposal_id)
+            else:
+                result = store.reject_l0_proposal(args.proposal_id)
+        except (ValueError, OSError) as exc:
+            parser.exit(1, f"{exc}\n")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "version":
         import cli_updater
         info = cli_updater.inspect_install_target()

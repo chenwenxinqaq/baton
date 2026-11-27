@@ -105,6 +105,7 @@ from views import (  # noqa: E402
     render_delete_dialog_html,
     render_detail_timestamps_html,
     render_index_editor_html,
+    render_l0_review,
     render_layer_checkboxes,
     render_layer_radios,
     render_library_sync_bar,
@@ -936,7 +937,7 @@ def _strip_import_provenance(body):
     return cleaned if cleaned.strip() else body.strip()
 
 
-def approve_import(library, client, import_id, revision, draft):
+def approve_import(library, client, import_id, revision, draft, merge_target=""):
     """File one reviewed candidate into the library, record its receipt, return the topic path."""
     with memory_import.review_lock(library.root, client):
         item = memory_import.read_candidate(library.root, client, import_id)
@@ -944,14 +945,44 @@ def approve_import(library, client, import_id, revision, draft):
             raise InvalidEntry("导入原文已更新，请重新核对。")
         # Browsers submit textarea content with CRLF line endings.
         normalized_body = _strip_import_provenance(draft["body"].replace("\r\n", "\n").replace("\r", "\n"))
-        draft = dict(draft, body=normalized_body)
-        validate_common_fields(**draft)
+        merge_target = str(merge_target or "").strip()
         original_date = item["source_date"] or "未知"
         session = f'，会话 {item["thread_id"]}' if item["thread_id"] else ""
         provenance = f'> 来源：{item["source"]}，原日期 {original_date}{session}'
-        body = f'{draft["body"]}\n\n{provenance}'
         # Recover a completed save if the prior process stopped before recording its receipt.
         _, index = library.read_index()
+        if merge_target:
+            if merge_target not in index:
+                raise InvalidEntry("所选合并目标已不在索引中，请刷新后重试。")
+            current = library.read_topic(merge_target, index)
+            validate_common_fields(
+                current.layer,
+                current.title,
+                current.description,
+                normalized_body,
+                body_limit=MAX_BODY_CHARS,
+            )
+            merged_body = current.body
+            if provenance not in merged_body.splitlines():
+                addition = f"## 导入补充 · {draft['title'] or item['title']}\n\n{normalized_body}\n\n{provenance}"
+                merged_body = f"{merged_body.rstrip()}\n\n{addition}"
+            saved = library.save_topic(
+                current.path,
+                current.revision,
+                current.layer,
+                current.title,
+                current.description,
+                merged_body,
+                entry_type=current.entry_type,
+                verified_at=current.verified_at,
+                valid_until=current.valid_until,
+                body_limit=max(MAX_BODY_CHARS, len(merged_body) + 16),
+            )
+            memory_import.mark_approved(library.root, client, item, saved)
+            return saved
+        draft = dict(draft, body=normalized_body)
+        validate_common_fields(**draft)
+        body = f'{draft["body"]}\n\n{provenance}'
         saved = next(
             (path for path in index if Path(path).stem == item["id"]
              and provenance in library.read_markdown(library.root / path).splitlines()),
@@ -1135,9 +1166,10 @@ class Handler(BaseHTTPRequestHandler):
                 or sort_by not in {"updated", "created", "index"}
                 or (cat and cat not in SKILL_CATS)
                 or sk_state not in {"all", "enabled", "disabled"}
-                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import"}
+                or view not in ({"", "new", "edit", "edit_topic", "index", "edit_index", "sync_hub", "conflicts", "clients", "memory_import", "l0_review"}
                                 | ({"activity"} if DESKTOP else set()))
                 or (view == "memory_import" and (key != "primary" or tab != "memory" or import_client not in memory_import.CLIENTS))
+                or (view == "l0_review" and (key != "primary" or tab != "memory"))
             ):
                 raise InvalidEntry("筛选条件无效。")
             name = params.get("entry", [""])[0]
@@ -1175,6 +1207,8 @@ class Handler(BaseHTTPRequestHandler):
             "conflict_resolved": "冲突已解决并清理冲突副本。",
             "topic_shared": "已将该个人记忆分享到目标共享库。",
             "memory_import_approved": "已将确认后的记忆归入个人记忆库。",
+            "l0_approved": "L0 操作约束已确认生效并写入 constraints/。",
+            "l0_rejected": "已拒绝并丢弃该条 L0 约束提案，现有约束未改动。",
         }
         notice = notices.get(params.get("notice", [""])[0], "")
         self.page(
@@ -1227,6 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
             "/restore_version",
             "/share_topic",
             "/memory_import",
+            "/l0_review",
         }
         if self.path not in allowed_routes:
             self.respond(HTTPStatus.NOT_FOUND, "", "text/plain; charset=utf-8")
@@ -1259,6 +1294,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/memory_import":
             self.handle_memory_import(fields)
+            return
+        if self.path == "/l0_review":
+            self.handle_l0_review(fields)
             return
         if self.path in {
             "/agent",
@@ -1320,12 +1358,56 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if op != "approve":
                 raise InvalidEntry("未知的记忆导入操作。")
-            draft = {name: fields.get(name, "").strip() for name in ("layer", "title", "description", "body")}
-            saved = approve_import(library, client, selected, fields.get("revision", ""), draft)
+            draft = {name: fields.get(name, "").strip() for name in ("layer", "title", "description", "body", "merge_target")}
+            saved = approve_import(
+                library,
+                client,
+                selected,
+                fields.get("revision", ""),
+                {k: v for k, v in draft.items() if k != "merge_target"},
+                merge_target=draft.get("merge_target", ""),
+            )
             target = query(topic=saved, notice="memory_import_approved") + "#detail-title"
             self.respond(HTTPStatus.SEE_OTHER, "", location=target)
         except (ValueError, OSError) as exc:
             self.page(HTTPStatus.CONFLICT, view="memory_import", topic_path=selected, error=str(exc), import_draft=draft, import_client=client)
+
+    def handle_l0_review(self, fields):
+        key = fields.get("library", "primary")
+        if key not in self.libraries or key != "primary":
+            self.page(HTTPStatus.BAD_REQUEST, error="L0 待确认区仅支持个人记忆库。")
+            return
+        library = self.libraries[key]
+        proposal_id = fields.get("proposal_id", "").strip()
+        revision = fields.get("revision", "").strip()
+        op = fields.get("op", "").strip()
+        try:
+            if op == "approve":
+                title = fields["title"].strip() if "title" in fields else None
+                description = fields["description"].strip() if "description" in fields else None
+                body = (
+                    fields["body"].replace("\r\n", "\n").replace("\r", "\n").strip()
+                    if "body" in fields
+                    else None
+                )
+                res = library.store.approve_l0_proposal(
+                    proposal_id,
+                    revision=revision,
+                    title=title,
+                    description=description,
+                    body=body,
+                )
+                target = query(library=key, topic=res["path"], notice="l0_approved") + "#detail-title"
+                self.respond(HTTPStatus.SEE_OTHER, "", location=target)
+                return
+            if op == "reject":
+                library.store.reject_l0_proposal(proposal_id)
+                target = query(library=key, view="l0_review", notice="l0_rejected") + "#feedback"
+                self.respond(HTTPStatus.SEE_OTHER, "", location=target)
+                return
+            raise InvalidEntry("未知的 L0 审核操作。")
+        except (ValueError, OSError) as exc:
+            self.page(HTTPStatus.CONFLICT, key=key, view="l0_review", error=f"操作未完成：{exc}")
 
     def start_sync_action(self, key, read_only, tab, return_view):
         library = self.libraries[key]
