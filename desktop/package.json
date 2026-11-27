@@ -2,7 +2,7 @@
   "name": "unified-memory-desktop",
   "productName": "Unified Memory",
   "description": "Personal memory workspace",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "private": true,
   "main": "main.cjs",
   "engines": {
