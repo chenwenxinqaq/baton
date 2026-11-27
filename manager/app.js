@@ -288,19 +288,31 @@
   }
 
   async function copyText(text) {
+    const str = String(text ?? "");
+    if (window.umemDesktop && typeof window.umemDesktop.copyText === "function") {
+      const ok = await window.umemDesktop.copyText(str);
+      if (ok) return;
+    }
     if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-      return;
+      try {
+        await navigator.clipboard.writeText(str);
+        return;
+      } catch {
+        // Fall through to execCommand fallback if Clipboard API permission is denied.
+      }
     }
     const area = document.createElement("textarea");
-    area.value = text;
+    area.value = str;
     area.setAttribute("readonly", "");
     area.style.position = "fixed";
     area.style.opacity = "0";
     document.body.appendChild(area);
     area.select();
-    document.execCommand("copy");
+    const copied = document.execCommand("copy");
     area.remove();
+    if (!copied) {
+      throw new Error("clipboard copy failed");
+    }
   }
 
   for (const btn of document.querySelectorAll("[data-copy-target]")) {

@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('umemDesktop', {
   openReleasePage: url => ipcRenderer.invoke('umem:update-open-page', url),
   openUpdateLog: () => ipcRenderer.invoke('umem:update-open-log'),
   dismissNotice: () => ipcRenderer.invoke('umem:update-dismiss-notice'),
+  copyText: text => ipcRenderer.invoke('umem:copy-text', String(text ?? '')),
   onUpdateState: listener => {
     if (typeof listener !== 'function') return () => {};
     const wrapped = (_event, state) => listener(state);

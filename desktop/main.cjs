@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, nativeTheme, net, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, nativeTheme, net, session, shell } = require('electron');
 const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -353,6 +353,10 @@ function registerUpdateIpc() {
     return true;
   }));
   ipcMain.handle('umem:update-dismiss-notice', wrap(() => ensureUpdater().setNotice(null)));
+  ipcMain.handle('umem:copy-text', wrap((text) => {
+    clipboard.writeText(String(text ?? ''));
+    return true;
+  }));
 }
 
 function backendSettings() {
@@ -525,8 +529,18 @@ async function launch() {
   app.setAboutPanelOptions({ applicationName: 'Unified Memory', applicationVersion: app.getVersion(),
     credits: REPO_URL, website: REPO_URL });
   const isolated = session.fromPartition('memory-workspace');
-  isolated.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-  isolated.setPermissionCheckHandler(() => false);
+  const allowClipboardWrite = (permission, requestingOrigin) => {
+    if (permission !== 'clipboard-sanitized-write') return false;
+    if (!origin || !requestingOrigin) return false;
+    try { return new URL(requestingOrigin).origin === origin; } catch { return false; }
+  };
+  isolated.setPermissionRequestHandler((wc, permission, callback, details) => {
+    const reqOrigin = (details && details.requestingUrl) || (wc && wc.getURL ? wc.getURL() : '');
+    callback(allowClipboardWrite(permission, reqOrigin));
+  });
+  isolated.setPermissionCheckHandler((_wc, permission, requestingOrigin) => (
+    allowClipboardWrite(permission, requestingOrigin)
+  ));
   origin = await startBackend();
   // The renderer only needs resources from this instance's loopback port.
   isolated.webRequest.onBeforeRequest({ urls: ['http://*/*','https://*/*'] }, (details, callback) => {
