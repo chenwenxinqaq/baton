@@ -38,6 +38,11 @@ class PublicFrameworkTests(unittest.TestCase):
         })
         return env
 
+    def launcher_path(self, name="umem-mcp"):
+        if sys.platform == "darwin":
+            return self.home / "Library/Application Support/Unified Memory/bin" / name
+        return self.home / ".local/share/unified-memory/bin" / name
+
     def cli(self, *args, root=None):
         output = subprocess.check_output([sys.executable, str(CODE / "scripts/memoryctl.py"), *args],
                                          env=self.environment(root), cwd=self.home, text=True)
@@ -94,7 +99,7 @@ class PublicFrameworkTests(unittest.TestCase):
                 "deepseek": "managed",
             },
         )
-        launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
+        launcher = self.launcher_path()
         self.assertIn(str(launcher), config.read_text())  # clients never point at the source tree / app bundle
         self.assertNotIn(str(CODE / "mcp/server.py"), config.read_text())
         self.assertIn(f"FW={CODE}", launcher.read_text())
@@ -962,7 +967,7 @@ class PublicFrameworkTests(unittest.TestCase):
         self.assertEqual(cursor()["state"], "drifted")  # legacy direct paths are flagged, not accepted
         self.cli("connect", "cursor")
         self.assertEqual(cursor()["state"], "managed")
-        launcher = self.home / "Library/Application Support/Unified Memory/bin/umem-mcp"
+        launcher = self.launcher_path()
         entry = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"]["unified_memory"]
         self.assertEqual(entry["command"], str(launcher))
         stop_hooks = json.loads((self.home / ".cursor/hooks.json").read_text())["hooks"]["stop"]
@@ -1005,7 +1010,7 @@ class PublicFrameworkTests(unittest.TestCase):
                     self.assertRegex(page, r'<body class="desk(?: [^"]*)?">')
                     self.assertIn("读写动态", page)  # desktop navigation present on every page
                     self.assertIn(expected, page)
-            self.assertTrue((self.home / "Library/Application Support/Unified Memory/bin/umem-mcp").is_file())
+            self.assertTrue(self.launcher_path().is_file())
             with urlopen(address + "style.css", timeout=5) as response:
                 self.assertIn(".rail", response.read().decode())  # desktop stylesheet appended
             process.stdin.close()  # the window owns stdin: EOF must stop the backend
