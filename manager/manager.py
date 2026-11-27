@@ -1944,11 +1944,23 @@ class Handler(BaseHTTPRequestHandler):
                 targets = memoryctl.resolve_targets(target, home=agent_home)
                 if op == "connect":
                     for aid, spec in targets:
-                        memoryctl.connect_agent(aid, spec)
+                        try:
+                            memoryctl.connect_agent(aid, spec)
+                        except (RuntimeError, ValueError, OSError) as exc:
+                            msg = str(exc)
+                            if spec["name"] not in msg:
+                                raise RuntimeError(f"{spec['name']}：{msg}") from exc
+                            raise
                     notice = f"{target}_connected" if target in {"claude-desktop", "workbuddy", "deepseek"} else "connected"
                 elif op == "disconnect":
                     for aid, spec in targets:
-                        memoryctl.disconnect_agent(aid, spec)
+                        try:
+                            memoryctl.disconnect_agent(aid, spec)
+                        except (RuntimeError, ValueError, OSError) as exc:
+                            msg = str(exc)
+                            if spec["name"] not in msg:
+                                raise RuntimeError(f"{spec['name']}：{msg}") from exc
+                            raise
                     notice = "disconnected"
                 else:
                     raise InvalidEntry("不支持的控制操作。")

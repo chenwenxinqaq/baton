@@ -309,14 +309,32 @@ def discover_hub_skills(skills_dir=None):
     return items
 
 
+def _read_json_object(path, label, *, allow_empty=True):
+    """Read a JSON object from *path*, treating empty/whitespace-only files as {} when allowed."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label}编码无效，请检查 {path}") from exc
+    stripped = raw.lstrip("\ufeff").strip()
+    if not stripped:
+        if allow_empty:
+            return {}
+        raise ValueError(f"{label}为空，请检查 {path}")
+    try:
+        data = json.loads(stripped)
+    except ValueError as exc:
+        raise ValueError(f"{label}格式无效，请检查 {path}（{exc}）") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{label}必须是 JSON 对象，请检查 {path}")
+    return data
+
+
 def resource_catalog(skills_dir):
     """Read optional, locally configured resource folders for each skill."""
     path = skills_dir / "resources.json"
     if not path.is_file():
         return {}
-    catalog = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(catalog, dict):
-        raise ValueError("skills/resources.json must map skill names to folder lists.")
+    catalog = _read_json_object(path, "技能资源配置（skills/resources.json）")
     for owner, folders in catalog.items():
         if not isinstance(folders, list) or not all(
             isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
@@ -714,9 +732,9 @@ def load_restore(agent_id):
     if not path.is_file():
         legacy = LEGACY_STATE_DIR / "restore" / f"{agent_id}.json"
         if legacy.is_file():
-            return json.loads(legacy.read_text(encoding="utf-8"))
+            return _read_json_object(legacy, f"{agent_id} 接入状态记录")
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return _read_json_object(path, f"{agent_id} 接入状态记录")
 
 
 def save_restore(agent_id, payload):
@@ -772,7 +790,10 @@ def read_dsh_patch(path):
     if block:
         second_line = block[0].splitlines()[1].lstrip()
         if second_line.startswith(DSH_EMPTY):
-            empty_sequence = json.loads(second_line[len(DSH_EMPTY):])
+            try:
+                empty_sequence = json.loads(second_line[len(DSH_EMPTY):])
+            except ValueError as exc:
+                raise ValueError(f"DeepSeek Harness 的空配置记录格式无效，请核对 {path}") from exc
             if not isinstance(empty_sequence, str) or not re.fullmatch(r" *\[ *\](?:[ \t]+#[^\r\n]*|[ \t]*)(?:\r?\n)?", empty_sequence):
                 raise ValueError(f"DeepSeek Harness 的空配置记录格式无效，请核对 {path}")
     return bom, text, block, empty_sequence
@@ -848,11 +869,9 @@ def is_our_mcp_entry(command, args):
 def read_json_mcp(path):
     if not path.exists():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        raise ValueError(f"MCP 配置格式无效，请检查 {path}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+    data = _read_json_object(path, "MCP 配置")
+    servers = data.get("mcpServers")
+    if servers is not None and not isinstance(servers, dict):
         raise ValueError(f"MCP 配置及 mcpServers 必须是 JSON 对象，请检查 {path}")
     return data
 
@@ -1030,10 +1049,14 @@ def restore_skills_dir(agent_id, target_skills_dir, restore, changes):
 def inspect_agy_plugin(agent_id, spec):
     """Inspect Antigravity plugin bundle state."""
     detected = any(p.exists() for p in spec["detect_paths"])
-    restore = load_restore(agent_id)
     pdir = spec["plugin_dir"]
     expected = desired_agy_plugin_files()
     issues = []
+    try:
+        restore = load_restore(agent_id)
+    except ValueError as exc:
+        restore = {}
+        issues.append(str(exc))
 
     rule_path = pdir / "rules" / "unified-memory.md"
     mcp_path = pdir / "mcp_config.json"
@@ -1178,10 +1201,12 @@ def inspect_cursor_hooks(hooks_path):
     if not hooks_path.is_file():
         return "missing", []
     try:
-        data = json.loads(hooks_path.read_text(encoding="utf-8"))
-    except ValueError:
-        return "drifted", [f"{hooks_path} is not valid JSON"]
+        data = _read_json_object(hooks_path, "Cursor hooks 配置")
+    except ValueError as exc:
+        return "drifted", [str(exc)]
     hooks = data.get("hooks") or {}
+    if not isinstance(hooks, dict):
+        return "drifted", [f"{hooks_path} hooks must be a JSON object"]
     desired = desired_cursor_hooks()
     found, exact = 0, 0
     for event, want in desired.items():
@@ -1203,11 +1228,9 @@ def inspect_nested_hooks(agent_id, spec):
     if not hooks_path.is_file():
         return "missing", []
     try:
-        data = json.loads(hooks_path.read_text(encoding="utf-8"))
-    except ValueError:
-        return "drifted", [f"{hooks_path} is not valid JSON"]
-    if not isinstance(data, dict):
-        return "drifted", [f"{hooks_path} root must be a JSON object"]
+        data = _read_json_object(hooks_path, f"{spec['name']} hooks 配置")
+    except ValueError as exc:
+        return "drifted", [str(exc)]
     hooks = data.get("hooks")
     if hooks is None:
         return "missing", []
@@ -1240,11 +1263,13 @@ def inspect_agent_hooks(agent_id, spec):
 def apply_cursor_hooks(hooks_path, restore, changes):
     """Merge managed hook entries into ~/.cursor/hooks.json, preserving unrelated hooks."""
     existed = hooks_path.is_file()
-    data = json.loads(hooks_path.read_text(encoding="utf-8")) if existed else {}
+    data = _read_json_object(hooks_path, "Cursor hooks 配置") if existed else {}
     if "cursor_hooks_file_existed" not in restore:
         restore["cursor_hooks_file_existed"] = existed
     data.setdefault("version", 1)
     hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError(f"Cursor hooks 配置中的 hooks 必须是 JSON 对象，请检查 {hooks_path}")
     original = json.dumps(data, sort_keys=True)
     for event, want in desired_cursor_hooks().items():
         kept = [e for e in (hooks.get(event) or []) if not _is_our_hook(e)]
@@ -1259,9 +1284,7 @@ def apply_nested_hooks(agent_id, spec, restore, changes):
     """Merge managed hook entries into Claude Code / Codex JSON hooks, preserving unrelated config."""
     hooks_path = spec["hooks_path"]
     existed = hooks_path.is_file()
-    data = json.loads(hooks_path.read_text(encoding="utf-8")) if existed else {}
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{hooks_path} must be a JSON object")
+    data = _read_json_object(hooks_path, f"{spec['name']} hooks 配置") if existed else {}
     if "hooks_file_existed" not in restore:
         restore["hooks_file_existed"] = existed
     if "hooks_key_existed" not in restore:
@@ -1291,8 +1314,10 @@ def remove_cursor_hooks(hooks_path, restore, changes):
     if not hooks_path.is_file():
         return
     try:
-        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+        data = _read_json_object(hooks_path, "Cursor hooks 配置")
     except ValueError:
+        return
+    if not isinstance(data.get("hooks", {}), dict):
         return
     hooks = data.get("hooks") or {}
     touched = False
@@ -1321,10 +1346,10 @@ def remove_nested_hooks(agent_id, spec, restore, changes):
     if not hooks_path.is_file():
         return
     try:
-        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+        data = _read_json_object(hooks_path, f"{spec['name']} hooks 配置")
     except ValueError:
         return
-    if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+    if not isinstance(data.get("hooks"), dict):
         return
     hooks = data["hooks"]
     touched = False
@@ -1361,8 +1386,12 @@ def inspect_agent(agent_id, spec):
         return inspect_agy_plugin(agent_id, spec)
 
     detected = any(p.exists() for p in spec["detect_paths"])
-    restore = load_restore(agent_id)
     issues = []
+    try:
+        restore = load_restore(agent_id)
+    except ValueError as exc:
+        restore = {}
+        issues.append(str(exc))
     inst_path = spec.get("instructions")
     if inst_path is None:
         inst_state = None
@@ -1495,9 +1524,9 @@ def _cleanup_legacy_agy_loose_files(spec, changes):
 
     mcp_json = spec["legacy_mcp_json"]
     if mcp_json.is_file():
-        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+        data = _read_json_object(mcp_json, "Antigravity 旧版 MCP 配置")
         servers = data.get("mcpServers") or {}
-        if "unified-memory" in servers:
+        if isinstance(servers, dict) and "unified-memory" in servers:
             del servers["unified-memory"]
             atomic_write(mcp_json, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
             changes.append(f"migrated unified-memory out of loose {mcp_json} into plugin")

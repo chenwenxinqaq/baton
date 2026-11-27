@@ -277,6 +277,57 @@ class PublicFrameworkTests(unittest.TestCase):
             finally:
                 manager.terminate()
 
+    def test_connect_all_tolerates_empty_json_configs_and_reports_corrupt_path(self):
+        from urllib.error import HTTPError
+
+        (self.home / ".cursor").mkdir(parents=True, exist_ok=True)
+        (self.home / ".cursor/hooks.json").write_text("", encoding="utf-8")
+        (self.home / ".cursor/mcp.json").write_text("   \n", encoding="utf-8")
+        (self.home / ".claude").mkdir(parents=True, exist_ok=True)
+        (self.home / ".claude/settings.json").write_text("\ufeff\n", encoding="utf-8")
+        (self.home / ".codex").mkdir(parents=True, exist_ok=True)
+        (self.home / ".codex/hooks.json").write_text("", encoding="utf-8")
+        (self.home / ".workbuddy").mkdir(parents=True, exist_ok=True)
+        (self.home / ".workbuddy/mcp.json").write_text("", encoding="utf-8")
+        (self.home / ".gemini/config").mkdir(parents=True, exist_ok=True)
+        (self.home / ".gemini/config/mcp_config.json").write_text("", encoding="utf-8")
+        (self.library / "skills/resources.json").write_text("", encoding="utf-8")
+        restore_dir = self.home / ".local/state/unified-memory/global/restore"
+        restore_dir.mkdir(parents=True, exist_ok=True)
+        (restore_dir / "cursor.json").write_text("", encoding="utf-8")
+
+        command = [sys.executable, str(CODE / "manager/manager.py"), "--port", "0"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=self.environment()) as manager:
+            try:
+                base = manager.stdout.readline().strip().rstrip("/")
+                with urlopen(base + "/?view=clients", timeout=5) as response:
+                    page = response.read().decode()
+                csrf = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+
+                def connect_all():
+                    data = urlencode(dict(csrf=csrf, target="all", op="connect")).encode()
+                    with urlopen(Request(base + "/agent", data=data, headers={"Origin": base}), timeout=10) as resp:
+                        return resp.read().decode()
+
+                html = connect_all()
+                self.assertNotIn("操作未完成", html)
+                self.assertIn("unified_memory", (self.home / ".workbuddy/mcp.json").read_text(encoding="utf-8"))
+                self.assertIn("hooks", json.loads((self.home / ".cursor/hooks.json").read_text(encoding="utf-8")))
+                self.assertIn("hooks", json.loads((self.home / ".codex/hooks.json").read_text(encoding="utf-8")))
+
+                # Genuinely corrupt hooks.json must report the exact client and file path, never bare JSONDecodeError.
+                broken = self.home / ".cursor/hooks.json"
+                broken.write_text("{broken", encoding="utf-8")
+                with self.assertRaises(HTTPError) as error:
+                    connect_all()
+                self.assertEqual(error.exception.code, 409)
+                body = error.exception.read().decode()
+                self.assertIn("Cursor", body)
+                self.assertIn(str(broken), body)
+                self.assertIn("格式无效", body)
+            finally:
+                manager.terminate()
+
     def test_claude_desktop_one_click_connect_and_disconnect(self):
         config = self.home / "Library/Application Support/Claude-3p/claude_desktop_config.json"
         env = {**self.environment(), "CLAUDE_DESKTOP_CONFIG": str(config)}
